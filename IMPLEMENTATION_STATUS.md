@@ -25,10 +25,16 @@ Updated: 2026-08-21
    weighted title, alias, heading, body, category, and caption fields; atomic derived
    index replacement during capture; wiki filters and bounded ranked queries; and CLI
    `search`/`show` commands with human-readable or JSON output and exact-source mode.
+8. Bounded complete-history enumeration with opaque MediaWiki continuation, reuse of
+   already captured revision bodies, immutable metadata consistency checks, and
+   durable historical inserts that do not move the current page head or search index;
+   newest-first local history queries; deterministic exact-source and normalized
+   reading diffs with line alignment and word-level spans; and CLI `history`, `diff`,
+   and `show --revision` commands with human-readable or JSON output.
 
 ## Next backlog item
 
-8. Add revision enumeration, history, and local diff.
+9. Add resumable sync jobs, overlap checkpoints, and structured status.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening

@@ -7,8 +7,10 @@ use std::process::ExitCode;
 use std::str;
 
 use serde_json::json;
-use wikisync_content::{to_markdown, to_plain_text};
-use wikisync_core::{PageTitle, WikiId};
+use wikisync_content::{
+    ContentDiff, DiffLine, DiffMode, DiffTag, diff as content_diff, to_markdown, to_plain_text,
+};
+use wikisync_core::{PageTitle, RevisionId, WikiId};
 use wikisync_search::{
     MAX_SEARCH_RESULTS, SearchError, SearchIndex, SearchQuery, SqliteSearchIndex,
 };
@@ -18,7 +20,9 @@ const USAGE: &str = "WikiSyncer offline reader
 
 Usage:
   wikisync --library <path> search [--wiki <id>] [--limit <count>] [--json] <query>
-  wikisync --library <path> show [--wiki <id>] [--json] [--source] <title>
+  wikisync --library <path> show [--wiki <id>] [--revision <id>] [--json] [--source] <title>
+  wikisync --library <path> history [--wiki <id>] [--json] <title>
+  wikisync --library <path> diff [--wiki <id>] [--reading] [--json] <from-revision> <to-revision>
   wikisync --help
   wikisync --version
 
@@ -62,9 +66,22 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                 Command::Show {
                     title,
                     wiki_id,
+                    revision_id,
                     json,
                     source,
-                } => show(&library, &title, wiki_id, json, source),
+                } => show(&library, &title, wiki_id, revision_id, json, source),
+                Command::History {
+                    title,
+                    wiki_id,
+                    json,
+                } => history(&library, &title, wiki_id, json),
+                Command::Diff {
+                    from,
+                    to,
+                    wiki_id,
+                    reading,
+                    json,
+                } => revision_diff(&library, from, to, wiki_id, reading, json),
             }
         }
     }
@@ -129,17 +146,24 @@ fn show(
     library: &Library,
     title: &PageTitle,
     wiki_id: Option<WikiId>,
+    selected_revision: Option<RevisionId>,
     json_output: bool,
     exact_source: bool,
 ) -> Result<(), CliError> {
     let matches = library.pages_by_title(title, wiki_id)?;
     let page = unique_page(matches, title, wiki_id)?;
-    let revision_id = page
-        .current_revision_id
+    let revision_id = selected_revision
+        .or(page.current_revision_id)
         .ok_or_else(|| CliError::data("captured page has no current revision"))?;
     let revision = library
         .revision(page.wiki_id, revision_id)?
-        .ok_or_else(|| CliError::data("page head points to a missing revision"))?;
+        .ok_or_else(|| CliError::message(format!("revision {revision_id} was not found")))?;
+    if revision.page_id != page.page_id {
+        return Err(CliError::message(format!(
+            "revision {revision_id} does not belong to page {}",
+            page.page_id
+        )));
+    }
     let source = canonical_source(library, &revision)?;
     let (format, body) = if exact_source {
         ("wikitext", source)
@@ -179,10 +203,202 @@ fn show(
     Ok(())
 }
 
+fn history(
+    library: &Library,
+    title: &PageTitle,
+    wiki_id: Option<WikiId>,
+    json_output: bool,
+) -> Result<(), CliError> {
+    let page = unique_page(library.pages_by_title(title, wiki_id)?, title, wiki_id)?;
+    let revisions = library.revisions_for_page(page.wiki_id, page.page_id)?;
+    if json_output {
+        write_json(&json!({
+            "wiki_id": page.wiki_id.get(),
+            "page_id": page.page_id.get(),
+            "title": page.title.as_str(),
+            "current_revision_id": page.current_revision_id.map(|id| id.get()),
+            "revisions": revisions.iter().map(revision_json).collect::<Vec<_>>(),
+        }))?;
+    } else {
+        println!(
+            "History: {}  [wiki {}, page {}]",
+            page.title, page.wiki_id, page.page_id
+        );
+        for revision in revisions {
+            let current = if page.current_revision_id == Some(revision.revision_id) {
+                " *"
+            } else {
+                ""
+            };
+            let author = revision.author.as_deref().unwrap_or("hidden");
+            println!(
+                "{}  {}  {}{}",
+                revision.revision_id, revision.timestamp, author, current
+            );
+            if let Some(comment) = revision.comment.as_deref()
+                && !comment.is_empty()
+            {
+                println!("  {comment}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn revision_diff(
+    library: &Library,
+    from_id: RevisionId,
+    to_id: RevisionId,
+    wiki_id: Option<WikiId>,
+    reading: bool,
+    json_output: bool,
+) -> Result<(), CliError> {
+    let (from_wiki, from) = unique_revision(library, from_id, wiki_id)?;
+    let (to_wiki, to) = unique_revision(library, to_id, wiki_id)?;
+    if from_wiki != to_wiki {
+        return Err(CliError::message(
+            "diff revisions must belong to the same wiki",
+        ));
+    }
+    if from.page_id != to.page_id {
+        return Err(CliError::message(
+            "diff revisions must belong to the same page",
+        ));
+    }
+    let older = canonical_source(library, &from)?;
+    let newer = canonical_source(library, &to)?;
+    let mode = if reading {
+        DiffMode::Reading
+    } else {
+        DiffMode::ExactSource
+    };
+    let comparison = content_diff(&older, &newer, mode);
+
+    if json_output {
+        write_json(&json!({
+            "wiki_id": from_wiki.get(),
+            "page_id": from.page_id.get(),
+            "from_revision_id": from.revision_id.get(),
+            "to_revision_id": to.revision_id.get(),
+            "mode": comparison.mode.as_str(),
+            "has_changes": comparison.has_changes(),
+            "lines": comparison.lines.iter().map(diff_line_json).collect::<Vec<_>>(),
+        }))?;
+    } else {
+        print_human_diff(&from, &to, &comparison)?;
+    }
+    Ok(())
+}
+
+fn revision_json(revision: &StoredRevision) -> serde_json::Value {
+    json!({
+        "revision_id": revision.revision_id.get(),
+        "parent_revision_id": revision.parent_id.map(|id| id.get()),
+        "revision_time": revision.timestamp,
+        "author": revision.author,
+        "author_id": revision.author_id,
+        "comment": revision.comment,
+        "minor": revision.minor,
+        "source_size": revision.source_size,
+        "upstream_sha1": revision.upstream_sha1,
+        "content_model": revision.content_model,
+        "content_object_id": revision.content_object_id.to_string(),
+        "captured_at": revision.captured_at,
+    })
+}
+
+fn diff_line_json(line: &DiffLine) -> serde_json::Value {
+    json!({
+        "tag": line.tag.as_str(),
+        "old_line": line.old_line,
+        "new_line": line.new_line,
+        "spans": line.spans.iter().map(|span| json!({
+            "tag": span.tag.as_str(),
+            "text": span.text,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn print_human_diff(
+    from: &StoredRevision,
+    to: &StoredRevision,
+    comparison: &ContentDiff,
+) -> Result<(), CliError> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    writeln!(
+        output,
+        "--- revision {} ({})",
+        from.revision_id,
+        comparison.mode.as_str()
+    )?;
+    writeln!(output, "+++ revision {}", to.revision_id)?;
+    for line in &comparison.lines {
+        let prefix = match line.tag {
+            DiffTag::Equal => ' ',
+            DiffTag::Delete => '-',
+            DiffTag::Insert => '+',
+        };
+        write!(output, "{prefix}")?;
+        let ends_in_newline = line
+            .spans
+            .last()
+            .is_some_and(|span| span.text.ends_with('\n'));
+        for (index, span) in line.spans.iter().enumerate() {
+            let mut text = span.text.as_str();
+            if index + 1 == line.spans.len() && ends_in_newline {
+                text = text.strip_suffix('\n').expect("checked line ending");
+                text = text.strip_suffix('\r').unwrap_or(text);
+            }
+            match span.tag {
+                DiffTag::Delete if line.tag == DiffTag::Delete => {
+                    write!(output, "[-{text}-]")?;
+                }
+                DiffTag::Insert if line.tag == DiffTag::Insert => {
+                    write!(output, "{{+{text}+}}")?;
+                }
+                _ => write!(output, "{text}")?,
+            }
+        }
+        writeln!(output)?;
+        if !ends_in_newline {
+            writeln!(output, "\\ No newline at end of revision")?;
+        }
+    }
+    Ok(())
+}
+
 fn canonical_source(library: &Library, revision: &StoredRevision) -> Result<String, CliError> {
     let bytes = library.read_object(revision.content_object_id)?;
     String::from_utf8(bytes)
         .map_err(|_| CliError::data("canonical wikitext object is not valid UTF-8"))
+}
+
+fn unique_revision(
+    library: &Library,
+    revision_id: RevisionId,
+    wiki_id: Option<WikiId>,
+) -> Result<(WikiId, StoredRevision), CliError> {
+    if let Some(wiki_id) = wiki_id {
+        return library
+            .revision(wiki_id, revision_id)?
+            .map(|revision| (wiki_id, revision))
+            .ok_or_else(|| {
+                CliError::message(format!(
+                    "revision {revision_id} was not found in wiki {wiki_id}"
+                ))
+            });
+    }
+    let mut matches = library.revisions_by_id(revision_id)?;
+    match matches.len() {
+        0 => Err(CliError::message(format!(
+            "revision {revision_id} was not found"
+        ))),
+        1 => Ok(matches.remove(0)),
+        count => Err(CliError::message(format!(
+            "revision {revision_id} matched {count} wikis; use --wiki <id> to select one source"
+        ))),
+    }
 }
 
 fn unique_page(
@@ -257,8 +473,21 @@ enum Command {
     Show {
         title: PageTitle,
         wiki_id: Option<WikiId>,
+        revision_id: Option<RevisionId>,
         json: bool,
         source: bool,
+    },
+    History {
+        title: PageTitle,
+        wiki_id: Option<WikiId>,
+        json: bool,
+    },
+    Diff {
+        from: RevisionId,
+        to: RevisionId,
+        wiki_id: Option<WikiId>,
+        reading: bool,
+        json: bool,
     },
 }
 
@@ -284,7 +513,7 @@ fn parse(
             }
             Some("--help" | "-h") => return Ok(Action::Help),
             Some("--version" | "-V") => return Ok(Action::Version),
-            Some("search" | "show") => break argument,
+            Some("search" | "show" | "history" | "diff") => break argument,
             Some(value) => return Err(CliError::usage(format!("unknown command {value:?}"))),
             None => return Err(CliError::usage("arguments must be valid UTF-8")),
         }
@@ -302,6 +531,8 @@ fn parse(
     let command = match command.to_str() {
         Some("search") => parse_search(values)?,
         Some("show") => parse_show(values)?,
+        Some("history") => parse_history(values)?,
+        Some("diff") => parse_diff(values)?,
         _ => unreachable!("validated command"),
     };
     Ok(Action::Command { library, command })
@@ -347,6 +578,7 @@ fn parse_search(values: Vec<String>) -> Result<Command, CliError> {
 
 fn parse_show(values: Vec<String>) -> Result<Command, CliError> {
     let mut wiki_id = None;
+    let mut revision_id = None;
     let mut json = false;
     let mut source = false;
     let mut title = Vec::new();
@@ -354,6 +586,9 @@ fn parse_show(values: Vec<String>) -> Result<Command, CliError> {
     while let Some(value) = values.next() {
         match value.as_str() {
             "--wiki" => wiki_id = Some(parse_wiki(required_value(&mut values, "--wiki")?)?),
+            "--revision" => {
+                revision_id = Some(parse_revision(required_value(&mut values, "--revision")?)?)
+            }
             "--json" => json = true,
             "--source" => source = true,
             value if value.starts_with('-') => {
@@ -367,8 +602,62 @@ fn parse_show(values: Vec<String>) -> Result<Command, CliError> {
     Ok(Command::Show {
         title,
         wiki_id,
+        revision_id,
         json,
         source,
+    })
+}
+
+fn parse_history(values: Vec<String>) -> Result<Command, CliError> {
+    let mut wiki_id = None;
+    let mut json = false;
+    let mut title = Vec::new();
+    let mut values = values.into_iter();
+    while let Some(value) = values.next() {
+        match value.as_str() {
+            "--wiki" => wiki_id = Some(parse_wiki(required_value(&mut values, "--wiki")?)?),
+            "--json" => json = true,
+            value if value.starts_with('-') => {
+                return Err(CliError::usage(format!("unknown history option {value:?}")));
+            }
+            _ => title.push(value),
+        }
+    }
+    let title = PageTitle::new(title.join(" "))
+        .map_err(|error| CliError::usage(format!("history requires a valid title: {error}")))?;
+    Ok(Command::History {
+        title,
+        wiki_id,
+        json,
+    })
+}
+
+fn parse_diff(values: Vec<String>) -> Result<Command, CliError> {
+    let mut wiki_id = None;
+    let mut reading = false;
+    let mut json = false;
+    let mut revisions = Vec::new();
+    let mut values = values.into_iter();
+    while let Some(value) = values.next() {
+        match value.as_str() {
+            "--wiki" => wiki_id = Some(parse_wiki(required_value(&mut values, "--wiki")?)?),
+            "--reading" => reading = true,
+            "--json" => json = true,
+            value if value.starts_with('-') => {
+                return Err(CliError::usage(format!("unknown diff option {value:?}")));
+            }
+            _ => revisions.push(parse_revision(value)?),
+        }
+    }
+    if revisions.len() != 2 {
+        return Err(CliError::usage("diff requires exactly two revision IDs"));
+    }
+    Ok(Command::Diff {
+        from: revisions[0],
+        to: revisions[1],
+        wiki_id,
+        reading,
+        json,
     })
 }
 
@@ -386,6 +675,13 @@ fn parse_wiki(value: String) -> Result<WikiId, CliError> {
         .parse::<u64>()
         .map_err(|_| CliError::usage("--wiki requires a positive integer"))?;
     WikiId::new(value).map_err(|error| CliError::usage(error.to_string()))
+}
+
+fn parse_revision(value: String) -> Result<RevisionId, CliError> {
+    let value = value
+        .parse::<u64>()
+        .map_err(|_| CliError::usage("revision ID must be a positive integer"))?;
+    RevisionId::new(value).map_err(|error| CliError::usage(error.to_string()))
 }
 
 #[derive(Debug)]
@@ -479,6 +775,69 @@ mod tests {
                     limit: 7,
                     json: true,
                 }
+            }
+        );
+    }
+
+    #[test]
+    fn parses_history_show_revision_and_reading_diff() {
+        let history = parse([
+            "--library",
+            "/tmp/wiki",
+            "history",
+            "--wiki",
+            "2",
+            "Rust",
+            "language",
+            "--json",
+        ])
+        .expect("history parse");
+        assert_eq!(
+            history,
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::History {
+                    title: PageTitle::new("Rust language").expect("title"),
+                    wiki_id: Some(WikiId::new(2).expect("wiki")),
+                    json: true,
+                },
+            }
+        );
+
+        let show = parse(["--library", "/tmp/wiki", "show", "--revision", "41", "Rust"])
+            .expect("show parse");
+        assert!(matches!(
+            show,
+            Action::Command {
+                command: Command::Show {
+                    revision_id: Some(id),
+                    ..
+                },
+                ..
+            } if id == RevisionId::new(41).expect("revision")
+        ));
+
+        let comparison = parse([
+            "--library",
+            "/tmp/wiki",
+            "diff",
+            "--reading",
+            "--json",
+            "40",
+            "41",
+        ])
+        .expect("diff parse");
+        assert_eq!(
+            comparison,
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::Diff {
+                    from: RevisionId::new(40).expect("from"),
+                    to: RevisionId::new(41).expect("to"),
+                    wiki_id: None,
+                    reading: true,
+                    json: true,
+                },
             }
         );
     }

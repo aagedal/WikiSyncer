@@ -4,8 +4,11 @@
 //! versioned, rebuildable reading representations; changing observable output must
 //! therefore introduce a new [`TransformerVersion`].
 
+mod diff;
 mod inline;
 mod render;
+
+pub use diff::{ContentDiff, DiffLine, DiffMode, DiffSpan, DiffTag, diff};
 
 use std::fmt;
 

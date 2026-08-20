@@ -1,0 +1,28 @@
+{
+  "batchcomplete": true,
+  "query": {
+    "pages": [
+      {
+        "pageid": 25357340,
+        "ns": 0,
+        "title": "Rust (programming language)",
+        "revisions": [
+          {
+            "revid": 1300000000,
+            "parentid": 0,
+            "timestamp": "2026-08-18T10:00:00Z",
+            "comment": "Initial fixture text",
+            "size": 34,
+            "slots": {
+              "main": {
+                "contentmodel": "wikitext",
+                "contentformat": "text/x-wiki",
+                "content": "== Rust ==\nA programming language."
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

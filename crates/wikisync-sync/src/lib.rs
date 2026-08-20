@@ -6,9 +6,9 @@ use std::str;
 
 use sha1::{Digest, Sha1};
 use wikisync_core::{CollectionId, PageId, PageTitle, RevisionId, TitleSelection, WikiId};
-use wikisync_mediawiki::{ClientError, MediaWikiClient, TitleResolution};
+use wikisync_mediawiki::{ClientError, MediaWikiClient, RevisionOrder, TitleResolution};
 use wikisync_search::{SearchDocument, SearchError, SearchIndex, SqliteSearchIndex};
-use wikisync_store::{CurrentRevisionCapture, Library, ObjectId, StoreError};
+use wikisync_store::{CurrentRevisionCapture, Library, ObjectId, RevisionCapture, StoreError};
 
 /// Result of resolving and capturing one explicit-title selection.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,6 +30,19 @@ pub struct CapturedPage {
     pub content_object_id: ObjectId,
     /// Whether this revision was newly attached to the library.
     pub newly_captured: bool,
+}
+
+/// Result of walking and capturing a page's complete available public history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryCaptureReport {
+    /// Number of bounded MediaWiki revision-list responses consumed.
+    pub batches: usize,
+    /// Number of revision metadata records enumerated.
+    pub revisions_enumerated: usize,
+    /// Number of canonical revision bodies newly captured.
+    pub revisions_captured: usize,
+    /// Number of already durable revisions whose content was not downloaded again.
+    pub revisions_reused: usize,
 }
 
 /// Resolves explicit titles and captures each available current revision.
@@ -134,6 +147,93 @@ pub async fn capture_explicit_titles(
     Ok(report)
 }
 
+/// Enumerates and captures all available public revisions for one captured page.
+///
+/// MediaWiki continuation is consumed one bounded response at a time. Existing local
+/// revisions are validated against the enumerated page, parent, and timestamp and do
+/// not trigger another content request. Historical inserts never move the stored page
+/// head or replace its current search document.
+pub async fn capture_revision_history(
+    client: &MediaWikiClient,
+    library: &mut Library,
+    wiki_id: WikiId,
+    page_id: PageId,
+) -> Result<HistoryCaptureReport, CaptureError> {
+    if library.page(wiki_id, page_id)?.is_none() {
+        return Err(StoreError::PageNotFound { wiki_id, page_id }.into());
+    }
+
+    let mut report = HistoryCaptureReport {
+        batches: 0,
+        revisions_enumerated: 0,
+        revisions_captured: 0,
+        revisions_reused: 0,
+    };
+    let mut continuation = None;
+    loop {
+        let batch = client
+            .revision_batch(page_id, RevisionOrder::NewestFirst, continuation.as_ref())
+            .await?;
+        report.batches += 1;
+        report.revisions_enumerated += batch.revisions.len();
+
+        for metadata in batch.revisions {
+            if let Some(existing) = library.revision(wiki_id, metadata.revision_id)? {
+                if existing.page_id != page_id
+                    || existing.parent_id != metadata.parent_id
+                    || existing.timestamp != metadata.timestamp
+                {
+                    return Err(CaptureError::RevisionMetadataConflict {
+                        revision_id: metadata.revision_id,
+                    });
+                }
+                report.revisions_reused += 1;
+                continue;
+            }
+
+            let content = client
+                .revision_content(page_id, metadata.revision_id)
+                .await?;
+            if content.metadata.parent_id != metadata.parent_id
+                || content.metadata.timestamp != metadata.timestamp
+            {
+                return Err(CaptureError::RevisionMetadataConflict {
+                    revision_id: metadata.revision_id,
+                });
+            }
+            validate_content(&content.metadata, &content.source)?;
+            let model = content
+                .metadata
+                .content_model
+                .as_deref()
+                .expect("validated content model");
+            library.capture_revision(
+                wiki_id,
+                page_id,
+                &RevisionCapture {
+                    revision_id: content.metadata.revision_id,
+                    parent_id: content.metadata.parent_id,
+                    timestamp: &content.metadata.timestamp,
+                    author: content.metadata.user.as_deref(),
+                    author_id: content.metadata.user_id,
+                    comment: content.metadata.comment.as_deref(),
+                    minor: content.metadata.minor,
+                    upstream_sha1: content.metadata.sha1.as_deref(),
+                    content_model: model,
+                    source: &content.source,
+                },
+            )?;
+            report.revisions_captured += 1;
+        }
+
+        continuation = batch.continuation;
+        if continuation.is_none() {
+            break;
+        }
+    }
+    Ok(report)
+}
+
 fn validate_content(
     metadata: &wikisync_mediawiki::RevisionMetadata,
     source: &[u8],
@@ -218,6 +318,11 @@ pub enum CaptureError {
         /// Revision returned with source content.
         actual: RevisionId,
     },
+    /// Enumerated immutable identity disagreed with an existing local revision.
+    RevisionMetadataConflict {
+        /// Conflicting remote revision identity.
+        revision_id: RevisionId,
+    },
     /// The main slot did not declare a content model.
     MissingContentModel(RevisionId),
     /// This slice captures canonical wikitext only.
@@ -267,6 +372,10 @@ impl fmt::Display for CaptureError {
             Self::RevisionIdentityChanged { expected, actual } => write!(
                 formatter,
                 "resolved revision {expected}, but source content belonged to {actual}"
+            ),
+            Self::RevisionMetadataConflict { revision_id } => write!(
+                formatter,
+                "enumerated metadata for revision {revision_id} conflicts with the captured revision"
             ),
             Self::MissingContentModel(revision_id) => {
                 write!(

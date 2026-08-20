@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use wikisync_core::{CollectionId, PageId, PageTitle, RevisionId, WikiId};
 
 const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
@@ -206,6 +206,31 @@ pub struct CurrentRevisionCapture<'a> {
     pub source: &'a [u8],
 }
 
+/// Metadata and canonical bytes for an additional revision of a captured page.
+#[derive(Clone, Debug)]
+pub struct RevisionCapture<'a> {
+    /// Stable remote revision identity.
+    pub revision_id: RevisionId,
+    /// Parent revision, absent for the first revision in page history.
+    pub parent_id: Option<RevisionId>,
+    /// MediaWiki UTC timestamp string.
+    pub timestamp: &'a str,
+    /// Public author name or IP, when available.
+    pub author: Option<&'a str>,
+    /// Public registered-user ID, when available.
+    pub author_id: Option<u64>,
+    /// Public edit comment, when available.
+    pub comment: Option<&'a str>,
+    /// Whether the edit is marked minor.
+    pub minor: bool,
+    /// Upstream MediaWiki SHA-1, when public.
+    pub upstream_sha1: Option<&'a str>,
+    /// Declared main-slot content model.
+    pub content_model: &'a str,
+    /// Exact canonical UTF-8 main-slot bytes.
+    pub source: &'a [u8],
+}
+
 /// Persisted page head metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredPage {
@@ -232,8 +257,24 @@ pub struct StoredRevision {
     pub parent_id: Option<RevisionId>,
     /// MediaWiki UTC timestamp string.
     pub timestamp: String,
+    /// Public author name or IP, when available.
+    pub author: Option<String>,
+    /// Public registered-user ID, when available.
+    pub author_id: Option<u64>,
+    /// Public edit comment, when available.
+    pub comment: Option<String>,
+    /// Whether MediaWiki marked the edit minor.
+    pub minor: bool,
+    /// Uncompressed canonical source length.
+    pub source_size: u64,
+    /// Upstream MediaWiki SHA-1, when public.
+    pub upstream_sha1: Option<String>,
+    /// Declared main-slot content model.
+    pub content_model: String,
     /// Immutable logical content identity.
     pub content_object_id: ObjectId,
+    /// Local Unix timestamp at which this revision was first captured.
+    pub captured_at: u64,
 }
 
 /// One WikiSyncer library and its writer connection.
@@ -400,12 +441,18 @@ impl Library {
         let collection_id = to_sql_integer(collection_id.get())?;
         let page_id = to_sql_integer(capture.page_id.get())?;
         let revision_id = to_sql_integer(capture.revision_id.get())?;
-        let parent_id = capture
-            .parent_id
-            .map(|id| to_sql_integer(id.get()))
-            .transpose()?;
-        let author_id = capture.author_id.map(to_sql_integer).transpose()?;
-        let source_size = to_sql_integer(capture.source.len() as u64)?;
+        let revision = RevisionCapture {
+            revision_id: capture.revision_id,
+            parent_id: capture.parent_id,
+            timestamp: capture.timestamp,
+            author: capture.author,
+            author_id: capture.author_id,
+            comment: capture.comment,
+            minor: capture.minor,
+            upstream_sha1: capture.upstream_sha1,
+            content_model: capture.content_model,
+            source: capture.source,
+        };
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -454,47 +501,7 @@ impl Library {
                 last_observed_at = excluded.last_observed_at",
             params![wiki_id, page_id, capture.title.as_str(), now],
         )?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO revisions (
-                wiki_id, revision_id, page_id, parent_revision_id, revision_time,
-                author_name, author_id, comment, is_minor, source_size,
-                upstream_sha1, content_model, content_object_id, captured_at
-             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
-             )",
-            params![
-                wiki_id,
-                revision_id,
-                page_id,
-                parent_id,
-                capture.timestamp,
-                capture.author,
-                author_id,
-                capture.comment,
-                capture.minor,
-                source_size,
-                capture.upstream_sha1,
-                capture.content_model,
-                object.id.to_string(),
-                now,
-            ],
-        )?;
-        let existing: (i64, Option<i64>, String, String) = transaction.query_row(
-            "SELECT page_id, parent_revision_id, revision_time, content_object_id
-             FROM revisions WHERE wiki_id = ?1 AND revision_id = ?2",
-            params![wiki_id, revision_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
-        if existing
-            != (
-                page_id,
-                parent_id,
-                capture.timestamp.to_owned(),
-                object.id.to_string(),
-            )
-        {
-            return Err(StoreError::ConflictingRevision(capture.revision_id));
-        }
+        insert_revision(&transaction, wiki_id, page_id, &revision, object.id, now)?;
         transaction.execute(
             "INSERT OR IGNORE INTO collection_pages (
                 collection_id, wiki_id, page_id, inclusion_reason, added_at
@@ -504,6 +511,49 @@ impl Library {
         transaction.execute(
             "DELETE FROM unresolved_titles WHERE collection_id = ?1 AND title = ?2",
             params![collection_id, capture.title.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(object)
+    }
+
+    /// Makes one additional revision of an already captured page durable.
+    ///
+    /// This does not move the page head or update the current-page search index.
+    /// Repetition is idempotent and conflicting immutable revision identity is
+    /// rejected.
+    pub fn capture_revision(
+        &mut self,
+        wiki_id: WikiId,
+        page_id: PageId,
+        capture: &RevisionCapture<'_>,
+    ) -> Result<StoredObject, StoreError> {
+        if self.page(wiki_id, page_id)?.is_none() {
+            return Err(StoreError::PageNotFound { wiki_id, page_id });
+        }
+        let object = self.put_bytes(ObjectKind::Wikitext, capture.source)?;
+        let now = unix_time()?;
+        let raw_wiki_id = to_sql_integer(wiki_id.get())?;
+        let raw_page_id = to_sql_integer(page_id.get())?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let page_exists: bool = transaction.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM pages WHERE wiki_id = ?1 AND page_id = ?2
+             )",
+            params![raw_wiki_id, raw_page_id],
+            |row| row.get(0),
+        )?;
+        if !page_exists {
+            return Err(StoreError::PageNotFound { wiki_id, page_id });
+        }
+        insert_revision(
+            &transaction,
+            raw_wiki_id,
+            raw_page_id,
+            capture,
+            object.id,
+            now,
         )?;
         transaction.commit()?;
         Ok(object)
@@ -629,36 +679,70 @@ impl Library {
     ) -> Result<Option<StoredRevision>, StoreError> {
         self.connection
             .query_row(
-                "SELECT page_id, parent_revision_id, revision_time, content_object_id
+                "SELECT wiki_id, revision_id, page_id, parent_revision_id,
+                        revision_time, author_name, author_id, comment, is_minor,
+                        source_size, upstream_sha1, content_model, content_object_id,
+                        captured_at
                  FROM revisions WHERE wiki_id = ?1 AND revision_id = ?2",
                 params![
                     to_sql_integer(wiki_id.get())?,
                     to_sql_integer(revision_id.get())?
                 ],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, Option<i64>>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
+                revision_row,
             )
             .optional()?
-            .map(|(page_id, parent_id, timestamp, object_id)| {
-                Ok(StoredRevision {
-                    revision_id,
-                    page_id: sql_id(page_id, "invalid stored page ID")?,
-                    parent_id: parent_id
-                        .map(|value| sql_id(value, "invalid stored parent revision ID"))
-                        .transpose()?,
-                    timestamp,
-                    content_object_id: object_id
-                        .parse()
-                        .map_err(|_| StoreError::CorruptMetadata("invalid stored object ID"))?,
-                })
-            })
+            .map(|row| stored_revision(row).map(|(_, revision)| revision))
             .transpose()
+    }
+
+    /// Lists every captured revision for a page, newest first.
+    pub fn revisions_for_page(
+        &self,
+        wiki_id: WikiId,
+        page_id: PageId,
+    ) -> Result<Vec<StoredRevision>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT wiki_id, revision_id, page_id, parent_revision_id,
+                    revision_time, author_name, author_id, comment, is_minor,
+                    source_size, upstream_sha1, content_model, content_object_id,
+                    captured_at
+             FROM revisions
+             WHERE wiki_id = ?1 AND page_id = ?2
+             ORDER BY revision_time DESC, revision_id DESC",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    to_sql_integer(wiki_id.get())?,
+                    to_sql_integer(page_id.get())?
+                ],
+                revision_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|row| stored_revision(row).map(|(_, revision)| revision))
+            .collect()
+    }
+
+    /// Finds revisions with a remote ID across configured wikis.
+    ///
+    /// Remote revision IDs are unique only within a wiki, so callers should report
+    /// ambiguity instead of silently selecting the first match.
+    pub fn revisions_by_id(
+        &self,
+        revision_id: RevisionId,
+    ) -> Result<Vec<(WikiId, StoredRevision)>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT wiki_id, revision_id, page_id, parent_revision_id,
+                    revision_time, author_name, author_id, comment, is_minor,
+                    source_size, upstream_sha1, content_model, content_object_id,
+                    captured_at
+             FROM revisions WHERE revision_id = ?1 ORDER BY wiki_id",
+        )?;
+        let rows = statement
+            .query_map([to_sql_integer(revision_id.get())?], revision_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(stored_revision).collect()
     }
 
     /// Stores an in-memory canonical object.
@@ -890,6 +974,143 @@ impl Library {
     }
 }
 
+fn insert_revision(
+    transaction: &Transaction<'_>,
+    wiki_id: i64,
+    page_id: i64,
+    capture: &RevisionCapture<'_>,
+    object_id: ObjectId,
+    captured_at: i64,
+) -> Result<(), StoreError> {
+    let revision_id = to_sql_integer(capture.revision_id.get())?;
+    let parent_id = capture
+        .parent_id
+        .map(|id| to_sql_integer(id.get()))
+        .transpose()?;
+    let author_id = capture.author_id.map(to_sql_integer).transpose()?;
+    let source_size = to_sql_integer(capture.source.len() as u64)?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO revisions (
+            wiki_id, revision_id, page_id, parent_revision_id, revision_time,
+            author_name, author_id, comment, is_minor, source_size,
+            upstream_sha1, content_model, content_object_id, captured_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+         )",
+        params![
+            wiki_id,
+            revision_id,
+            page_id,
+            parent_id,
+            capture.timestamp,
+            capture.author,
+            author_id,
+            capture.comment,
+            capture.minor,
+            source_size,
+            capture.upstream_sha1,
+            capture.content_model,
+            object_id.to_string(),
+            captured_at,
+        ],
+    )?;
+    let existing: (i64, Option<i64>, String, String) = transaction.query_row(
+        "SELECT page_id, parent_revision_id, revision_time, content_object_id
+         FROM revisions WHERE wiki_id = ?1 AND revision_id = ?2",
+        params![wiki_id, revision_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if existing
+        != (
+            page_id,
+            parent_id,
+            capture.timestamp.to_owned(),
+            object_id.to_string(),
+        )
+    {
+        return Err(StoreError::ConflictingRevision(capture.revision_id));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct RevisionRow {
+    wiki_id: i64,
+    revision_id: i64,
+    page_id: i64,
+    parent_id: Option<i64>,
+    timestamp: String,
+    author: Option<String>,
+    author_id: Option<i64>,
+    comment: Option<String>,
+    minor: bool,
+    source_size: i64,
+    upstream_sha1: Option<String>,
+    content_model: String,
+    object_id: String,
+    captured_at: i64,
+}
+
+fn revision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RevisionRow> {
+    Ok(RevisionRow {
+        wiki_id: row.get(0)?,
+        revision_id: row.get(1)?,
+        page_id: row.get(2)?,
+        parent_id: row.get(3)?,
+        timestamp: row.get(4)?,
+        author: row.get(5)?,
+        author_id: row.get(6)?,
+        comment: row.get(7)?,
+        minor: row.get(8)?,
+        source_size: row.get(9)?,
+        upstream_sha1: row.get(10)?,
+        content_model: row.get(11)?,
+        object_id: row.get(12)?,
+        captured_at: row.get(13)?,
+    })
+}
+
+fn stored_revision(row: RevisionRow) -> Result<(WikiId, StoredRevision), StoreError> {
+    let wiki_id = sql_id(row.wiki_id, "invalid stored wiki ID")?;
+    let revision_id = sql_id(row.revision_id, "invalid stored revision ID")?;
+    let page_id = sql_id(row.page_id, "invalid stored page ID")?;
+    let parent_id = row
+        .parent_id
+        .map(|value| sql_id(value, "invalid stored parent revision ID"))
+        .transpose()?;
+    let author_id = row
+        .author_id
+        .map(|value| {
+            u64::try_from(value).map_err(|_| StoreError::CorruptMetadata("invalid author ID"))
+        })
+        .transpose()?;
+    let source_size = u64::try_from(row.source_size)
+        .map_err(|_| StoreError::CorruptMetadata("negative revision source size"))?;
+    let captured_at = u64::try_from(row.captured_at)
+        .map_err(|_| StoreError::CorruptMetadata("negative revision capture time"))?;
+    Ok((
+        wiki_id,
+        StoredRevision {
+            revision_id,
+            page_id,
+            parent_id,
+            timestamp: row.timestamp,
+            author: row.author,
+            author_id,
+            comment: row.comment,
+            minor: row.minor,
+            source_size,
+            upstream_sha1: row.upstream_sha1,
+            content_model: row.content_model,
+            content_object_id: row
+                .object_id
+                .parse()
+                .map_err(|_| StoreError::CorruptMetadata("invalid stored object ID"))?,
+            captured_at,
+        },
+    ))
+}
+
 fn object_hasher(kind: ObjectKind, length: u64) -> blake3::Hasher {
     let mut hasher = blake3::Hasher::new();
     hasher.update(OBJECT_DOMAIN);
@@ -1038,6 +1259,13 @@ pub enum StoreError {
     CorruptMetadata(&'static str),
     /// A collection was used with a different wiki than the one it belongs to.
     CollectionWikiMismatch,
+    /// Historical content was supplied for a page not yet present in the library.
+    PageNotFound {
+        /// Source wiki identity.
+        wiki_id: WikiId,
+        /// Stable remote page identity.
+        page_id: PageId,
+    },
     /// An existing remote revision was observed with different immutable identity data.
     ConflictingRevision(RevisionId),
     /// The database was created by a newer application schema.
@@ -1071,6 +1299,12 @@ impl fmt::Display for StoreError {
             Self::CorruptMetadata(message) => write!(formatter, "corrupt metadata: {message}"),
             Self::CollectionWikiMismatch => {
                 formatter.write_str("collection does not belong to the requested wiki")
+            }
+            Self::PageNotFound { wiki_id, page_id } => {
+                write!(
+                    formatter,
+                    "page {page_id} from wiki {wiki_id} is not captured"
+                )
             }
             Self::ConflictingRevision(revision_id) => write!(
                 formatter,
@@ -1391,6 +1625,110 @@ mod tests {
                 .expect("canonical source"),
             capture.source
         );
+    }
+
+    #[test]
+    fn historical_revisions_are_listed_newest_first_without_moving_the_head() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Systems languages")
+            .expect("create collection");
+        let title = PageTitle::new("Rust (programming language)").expect("title");
+        let page_id = PageId::new(25_357_340).expect("page ID");
+        let head_id = RevisionId::new(1_300_000_001).expect("revision ID");
+        library
+            .capture_current_revision(
+                wiki_id,
+                collection_id,
+                &CurrentRevisionCapture {
+                    page_id,
+                    namespace: 0,
+                    title: &title,
+                    revision_id: head_id,
+                    parent_id: Some(RevisionId::new(1_300_000_000).expect("parent")),
+                    timestamp: "2026-08-19T12:34:56Z",
+                    author: Some("Fixture editor"),
+                    author_id: Some(42),
+                    comment: Some("Improve the history section"),
+                    minor: true,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: b"New source",
+                },
+            )
+            .expect("capture head");
+        let older_id = RevisionId::new(1_300_000_000).expect("older revision");
+        let older = RevisionCapture {
+            revision_id: older_id,
+            parent_id: None,
+            timestamp: "2026-08-18T10:00:00Z",
+            author: None,
+            author_id: None,
+            comment: Some("Initial text"),
+            minor: false,
+            upstream_sha1: None,
+            content_model: "wikitext",
+            source: b"Old source",
+        };
+        library
+            .capture_revision(wiki_id, page_id, &older)
+            .expect("capture history");
+        library
+            .capture_revision(wiki_id, page_id, &older)
+            .expect("repeat history capture");
+
+        let history = library
+            .revisions_for_page(wiki_id, page_id)
+            .expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].revision_id, head_id);
+        assert_eq!(history[1].revision_id, older_id);
+        assert_eq!(history[1].comment.as_deref(), Some("Initial text"));
+        assert_eq!(
+            library
+                .page(wiki_id, page_id)
+                .expect("page")
+                .expect("captured page")
+                .current_revision_id,
+            Some(head_id)
+        );
+        assert_eq!(
+            library
+                .revisions_by_id(older_id)
+                .expect("revision matches")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn historical_capture_rejects_unknown_pages_before_writing_an_object() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let page_id = PageId::new(25_357_340).expect("page ID");
+        let revision = RevisionCapture {
+            revision_id: RevisionId::new(1_300_000_000).expect("revision"),
+            parent_id: None,
+            timestamp: "2026-08-18T10:00:00Z",
+            author: None,
+            author_id: None,
+            comment: None,
+            minor: false,
+            upstream_sha1: None,
+            content_model: "wikitext",
+            source: b"Unattached source",
+        };
+
+        assert!(matches!(
+            library.capture_revision(wiki_id, page_id, &revision),
+            Err(StoreError::PageNotFound { .. })
+        ));
+        assert_eq!(table_count(&library, "content_objects"), 0);
     }
 
     fn migration_count(library: &Library) -> u32 {
