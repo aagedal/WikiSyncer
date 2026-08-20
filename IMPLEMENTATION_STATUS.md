@@ -41,10 +41,15 @@ Updated: 2026-08-21
     Content Security Policy and response headers, sanitized derived HTML, same-wiki
     local article links, provenance notices, CLI `serve`, and an in-process crawl
     proving every loaded resource remains local or embedded.
+11. An end-to-end offline vertical-slice test that captures a current revision and its
+    complete fixture history, shuts down the MediaWiki source, proves that it is no
+    longer reachable, and then exercises the real CLI search, current and historical
+    show, history, and reading-diff commands plus the local reader from only the
+    durable library.
 
 ## Next backlog item
 
-11. Prove the complete offline vertical slice.
+12. Implement verified, restartable packfiles and bounded delta reconstruction.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening

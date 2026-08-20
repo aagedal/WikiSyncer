@@ -22,3 +22,11 @@ wikisync-core = { path = "../../crates/wikisync-core" }
 wikisync-search = { path = "../../crates/wikisync-search" }
 wikisync-store = { path = "../../crates/wikisync-store" }
 wikisync-web = { path = "../../crates/wikisync-web" }
+
+[dev-dependencies]
+axum = "0.8"
+tempfile = "3.20"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
+wikisync-mediawiki = { path = "../../crates/wikisync-mediawiki" }
+wikisync-sync = { path = "../../crates/wikisync-sync" }
