@@ -1,0 +1,29 @@
+<!-- This comment is local transformer metadata and must not be rendered. -->
+== Rust ==
+'''Rust''' is a [[systems programming language]] &amp; practical tool.
+It emphasizes {{small|performance}} and {{Unknown infobox
+| answer = 42
+}}.
+
+=== Features ===
+* Memory safety
+** [[Ownership (computer science)|Ownership]]
+# First step
+# Second step
+: A quote with ''emphasis''.<ref name="guide">See [https://doc.rust-lang.org/book/ the official guide].</ref>
+
+{| class="wikitable"
+|+ Release channels
+! Channel !! Purpose
+|-
+| Stable || Production use
+|-
+| Nightly || [[Experiment|experiments]]
+|}
+
+ File-style preformatted text
+
+[[File:Rustacean-flat-happy.svg|thumb|Ferris, the Rust mascot]]
+
+[[Category:Systems programming languages]]
+External docs: [https://www.rust-lang.org/ Rust documentation].

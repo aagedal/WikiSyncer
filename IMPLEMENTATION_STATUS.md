@@ -17,11 +17,14 @@ Updated: 2026-08-20
    source retrieval, content-model/size/MediaWiki SHA-1 validation, schema migration
    2 for wiki/page/revision/collection metadata, missing-title observations, and
    idempotent durable capture.
+6. Deterministic normalized plain text and minimal Markdown with output-specific
+   transformer versions, conservative structural/inline wikitext handling, readable
+   placeholders for unsupported templates, malformed-input bounds, and golden article
+   fixtures.
 
 ## Next backlog item
 
-6. Add normalized plain text, minimal Markdown, and deterministic transformer
-   versions.
+7. Add FTS indexing and CLI search/show.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening
