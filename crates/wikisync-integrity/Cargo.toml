@@ -1,0 +1,12 @@
+[package]
+name = "wikisync-integrity"
+description = "Content hashing, manifests, signatures, and verification for WikiSyncer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+

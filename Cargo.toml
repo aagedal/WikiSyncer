@@ -1,0 +1,30 @@
+[workspace]
+members = [
+    "apps/wikisync-cli",
+    "apps/wikisync-gui",
+    "apps/wikisyncd",
+    "crates/wikisync-content",
+    "crates/wikisync-core",
+    "crates/wikisync-integrity",
+    "crates/wikisync-mediawiki",
+    "crates/wikisync-search",
+    "crates/wikisync-store",
+    "crates/wikisync-sync",
+    "crates/wikisync-web",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+repository = "https://github.com/aagedal/WikiSyncer"
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
