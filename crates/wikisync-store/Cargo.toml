@@ -14,4 +14,5 @@ workspace = true
 blake3 = "1.8"
 rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3.20"
+wikisync-core = { path = "../wikisync-core" }
 zstd = "0.13"

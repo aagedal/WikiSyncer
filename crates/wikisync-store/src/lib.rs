@@ -13,8 +13,10 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use wikisync_core::{CollectionId, PageId, PageTitle, RevisionId, WikiId};
 
 const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
+const MIGRATION_2: &str = include_str!("../migrations/0002_capture.sql");
 const OBJECT_DOMAIN: &[u8] = b"wikisync-object-v1\0";
 const DATABASE_NAME: &str = "library.sqlite3";
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
@@ -172,6 +174,65 @@ pub struct StoredObject {
     pub uncompressed_length: u64,
 }
 
+/// Metadata and canonical bytes committed for a page's observed current revision.
+#[derive(Clone, Debug)]
+pub struct CurrentRevisionCapture<'a> {
+    /// Stable remote page identity.
+    pub page_id: PageId,
+    /// MediaWiki namespace number.
+    pub namespace: i32,
+    /// Canonical title returned by MediaWiki.
+    pub title: &'a PageTitle,
+    /// Stable remote revision identity.
+    pub revision_id: RevisionId,
+    /// Parent revision, which need not be captured by a current-and-future policy.
+    pub parent_id: Option<RevisionId>,
+    /// MediaWiki UTC timestamp string.
+    pub timestamp: &'a str,
+    /// Public author name or IP, when available.
+    pub author: Option<&'a str>,
+    /// Public registered-user ID, when available.
+    pub author_id: Option<u64>,
+    /// Public edit comment, when available.
+    pub comment: Option<&'a str>,
+    /// Whether the edit is marked minor.
+    pub minor: bool,
+    /// Upstream MediaWiki SHA-1, when public.
+    pub upstream_sha1: Option<&'a str>,
+    /// Declared main-slot content model.
+    pub content_model: &'a str,
+    /// Exact canonical UTF-8 main-slot bytes.
+    pub source: &'a [u8],
+}
+
+/// Persisted page head metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredPage {
+    /// Stable remote page identity.
+    pub page_id: PageId,
+    /// MediaWiki namespace number.
+    pub namespace: i32,
+    /// Most recently observed canonical title.
+    pub title: PageTitle,
+    /// Most recently captured head revision.
+    pub current_revision_id: Option<RevisionId>,
+}
+
+/// Persisted canonical revision reference.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredRevision {
+    /// Stable remote revision identity.
+    pub revision_id: RevisionId,
+    /// Stable owning page identity.
+    pub page_id: PageId,
+    /// Parent revision identity, whether or not that revision is captured locally.
+    pub parent_id: Option<RevisionId>,
+    /// MediaWiki UTC timestamp string.
+    pub timestamp: String,
+    /// Immutable logical content identity.
+    pub content_object_id: ObjectId,
+}
+
 /// One WikiSyncer library and its writer connection.
 #[derive(Debug)]
 pub struct Library {
@@ -214,6 +275,303 @@ impl Library {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Registers a MediaWiki source, returning the existing identity on repetition.
+    pub fn register_wiki(
+        &mut self,
+        api_endpoint: &str,
+        language_code: &str,
+    ) -> Result<WikiId, StoreError> {
+        if api_endpoint.trim().is_empty() || language_code.trim().is_empty() {
+            return Err(StoreError::InvalidConfig(
+                "wiki endpoint and language code must be non-empty",
+            ));
+        }
+        let now = unix_time()?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO wikis (api_endpoint, language_code, created_at)
+             VALUES (?1, ?2, ?3)",
+            params![api_endpoint, language_code, now],
+        )?;
+        let raw_id: i64 = self.connection.query_row(
+            "SELECT wiki_id FROM wikis WHERE api_endpoint = ?1",
+            [api_endpoint],
+            |row| row.get(0),
+        )?;
+        sql_id(raw_id, "invalid wiki ID")
+    }
+
+    /// Creates or reopens an explicit-title, current-and-future collection.
+    pub fn create_explicit_collection(
+        &mut self,
+        wiki_id: WikiId,
+        name: &str,
+    ) -> Result<CollectionId, StoreError> {
+        if name.trim().is_empty() {
+            return Err(StoreError::InvalidConfig(
+                "collection name must be non-empty",
+            ));
+        }
+        let now = unix_time()?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO collections (
+                wiki_id, name, rule_kind, history_policy, created_at
+             ) VALUES (?1, ?2, 'explicit-titles', 'current-and-future', ?3)",
+            params![to_sql_integer(wiki_id.get())?, name, now],
+        )?;
+        let raw_id: i64 = self.connection.query_row(
+            "SELECT collection_id FROM collections WHERE wiki_id = ?1 AND name = ?2",
+            params![to_sql_integer(wiki_id.get())?, name],
+            |row| row.get(0),
+        )?;
+        sql_id(raw_id, "invalid collection ID")
+    }
+
+    /// Records a title that MediaWiki currently reports as missing.
+    pub fn record_missing_title(
+        &mut self,
+        collection_id: CollectionId,
+        title: &PageTitle,
+        namespace: i32,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO unresolved_titles (
+                collection_id, title, namespace, last_observed_at
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(collection_id, title) DO UPDATE SET
+                namespace = excluded.namespace,
+                last_observed_at = excluded.last_observed_at",
+            params![
+                to_sql_integer(collection_id.get())?,
+                title.as_str(),
+                namespace,
+                unix_time()?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Lists the currently unresolved explicit titles for a collection.
+    pub fn unresolved_titles(
+        &self,
+        collection_id: CollectionId,
+    ) -> Result<Vec<PageTitle>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT title FROM unresolved_titles
+             WHERE collection_id = ?1 ORDER BY title",
+        )?;
+        let raw_titles = statement
+            .query_map([to_sql_integer(collection_id.get())?], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        raw_titles
+            .into_iter()
+            .map(|title| {
+                PageTitle::new(title)
+                    .map_err(|_| StoreError::CorruptMetadata("invalid unresolved page title"))
+            })
+            .collect()
+    }
+
+    /// Makes canonical bytes durable, then atomically records their page and revision.
+    ///
+    /// Repeating the same capture is idempotent. Conflicting immutable metadata for
+    /// an existing remote revision is rejected instead of silently rewritten.
+    pub fn capture_current_revision(
+        &mut self,
+        wiki_id: WikiId,
+        collection_id: CollectionId,
+        capture: &CurrentRevisionCapture<'_>,
+    ) -> Result<StoredObject, StoreError> {
+        let object = self.put_bytes(ObjectKind::Wikitext, capture.source)?;
+        let now = unix_time()?;
+        let wiki_id = to_sql_integer(wiki_id.get())?;
+        let collection_id = to_sql_integer(collection_id.get())?;
+        let page_id = to_sql_integer(capture.page_id.get())?;
+        let revision_id = to_sql_integer(capture.revision_id.get())?;
+        let parent_id = capture
+            .parent_id
+            .map(|id| to_sql_integer(id.get()))
+            .transpose()?;
+        let author_id = capture.author_id.map(to_sql_integer).transpose()?;
+        let source_size = to_sql_integer(capture.source.len() as u64)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let owns_collection: bool = transaction.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM collections
+                WHERE collection_id = ?1 AND wiki_id = ?2
+             )",
+            params![collection_id, wiki_id],
+            |row| row.get(0),
+        )?;
+        if !owns_collection {
+            return Err(StoreError::CollectionWikiMismatch);
+        }
+
+        transaction.execute(
+            "INSERT INTO pages (
+                wiki_id, page_id, namespace, current_title, current_revision_id,
+                current_revision_time, state, first_captured_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?7)
+             ON CONFLICT(wiki_id, page_id) DO UPDATE SET
+                namespace = excluded.namespace,
+                current_title = excluded.current_title,
+                current_revision_id = excluded.current_revision_id,
+                current_revision_time = excluded.current_revision_time,
+                state = 'active',
+                updated_at = excluded.updated_at
+             WHERE pages.current_revision_time IS NULL
+                OR excluded.current_revision_time >= pages.current_revision_time",
+            params![
+                wiki_id,
+                page_id,
+                capture.namespace,
+                capture.title.as_str(),
+                revision_id,
+                capture.timestamp,
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO page_titles (
+                wiki_id, page_id, title, first_observed_at, last_observed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(wiki_id, page_id, title) DO UPDATE SET
+                last_observed_at = excluded.last_observed_at",
+            params![wiki_id, page_id, capture.title.as_str(), now],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO revisions (
+                wiki_id, revision_id, page_id, parent_revision_id, revision_time,
+                author_name, author_id, comment, is_minor, source_size,
+                upstream_sha1, content_model, content_object_id, captured_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+             )",
+            params![
+                wiki_id,
+                revision_id,
+                page_id,
+                parent_id,
+                capture.timestamp,
+                capture.author,
+                author_id,
+                capture.comment,
+                capture.minor,
+                source_size,
+                capture.upstream_sha1,
+                capture.content_model,
+                object.id.to_string(),
+                now,
+            ],
+        )?;
+        let existing: (i64, Option<i64>, String, String) = transaction.query_row(
+            "SELECT page_id, parent_revision_id, revision_time, content_object_id
+             FROM revisions WHERE wiki_id = ?1 AND revision_id = ?2",
+            params![wiki_id, revision_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        if existing
+            != (
+                page_id,
+                parent_id,
+                capture.timestamp.to_owned(),
+                object.id.to_string(),
+            )
+        {
+            return Err(StoreError::ConflictingRevision(capture.revision_id));
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO collection_pages (
+                collection_id, wiki_id, page_id, inclusion_reason, added_at
+             ) VALUES (?1, ?2, ?3, 'explicit-title', ?4)",
+            params![collection_id, wiki_id, page_id, now],
+        )?;
+        transaction.execute(
+            "DELETE FROM unresolved_titles WHERE collection_id = ?1 AND title = ?2",
+            params![collection_id, capture.title.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(object)
+    }
+
+    /// Looks up a captured page by stable remote identity.
+    pub fn page(&self, wiki_id: WikiId, page_id: PageId) -> Result<Option<StoredPage>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT namespace, current_title, current_revision_id
+                 FROM pages WHERE wiki_id = ?1 AND page_id = ?2",
+                params![
+                    to_sql_integer(wiki_id.get())?,
+                    to_sql_integer(page_id.get())?
+                ],
+                |row| {
+                    let raw_revision: Option<i64> = row.get(2)?;
+                    Ok((
+                        row.get::<_, i32>(0)?,
+                        row.get::<_, String>(1)?,
+                        raw_revision,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(namespace, title, revision_id)| {
+                Ok(StoredPage {
+                    page_id,
+                    namespace,
+                    title: PageTitle::new(title)
+                        .map_err(|_| StoreError::CorruptMetadata("invalid stored page title"))?,
+                    current_revision_id: revision_id
+                        .map(|value| sql_id(value, "invalid stored revision ID"))
+                        .transpose()?,
+                })
+            })
+            .transpose()
+    }
+
+    /// Looks up a captured revision and its logical content identity.
+    pub fn revision(
+        &self,
+        wiki_id: WikiId,
+        revision_id: RevisionId,
+    ) -> Result<Option<StoredRevision>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT page_id, parent_revision_id, revision_time, content_object_id
+                 FROM revisions WHERE wiki_id = ?1 AND revision_id = ?2",
+                params![
+                    to_sql_integer(wiki_id.get())?,
+                    to_sql_integer(revision_id.get())?
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(page_id, parent_id, timestamp, object_id)| {
+                Ok(StoredRevision {
+                    revision_id,
+                    page_id: sql_id(page_id, "invalid stored page ID")?,
+                    parent_id: parent_id
+                        .map(|value| sql_id(value, "invalid stored parent revision ID"))
+                        .transpose()?,
+                    timestamp,
+                    content_object_id: object_id
+                        .parse()
+                        .map_err(|_| StoreError::CorruptMetadata("invalid stored object ID"))?,
+                })
+            })
+            .transpose()
     }
 
     /// Stores an in-memory canonical object.
@@ -496,7 +854,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
          ) STRICT;",
     )?;
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > 1 {
+    if version > 2 {
         return Err(StoreError::UnsupportedSchemaVersion(version));
     }
     if version == 0 {
@@ -510,7 +868,27 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
         transaction.pragma_update(None, "user_version", 1)?;
         transaction.commit()?;
     }
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 1 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(MIGRATION_2)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (2, 'capture', ?1)",
+            [unix_time()?],
+        )?;
+        transaction.pragma_update(None, "user_version", 2)?;
+        transaction.commit()?;
+    }
     Ok(())
+}
+
+fn sql_id<T>(value: i64, message: &'static str) -> Result<T, StoreError>
+where
+    T: TryFrom<u64>,
+{
+    let value = u64::try_from(value).map_err(|_| StoreError::CorruptMetadata(message))?;
+    T::try_from(value).map_err(|_| StoreError::CorruptMetadata(message))
 }
 
 fn unix_time() -> Result<i64, StoreError> {
@@ -559,6 +937,10 @@ pub enum StoreError {
     HashMismatch(ObjectId),
     /// Stored metadata violated a library invariant.
     CorruptMetadata(&'static str),
+    /// A collection was used with a different wiki than the one it belongs to.
+    CollectionWikiMismatch,
+    /// An existing remote revision was observed with different immutable identity data.
+    ConflictingRevision(RevisionId),
     /// The database was created by a newer application schema.
     UnsupportedSchemaVersion(u32),
     /// A `u64` value cannot be represented by SQLite's signed integer.
@@ -588,6 +970,13 @@ impl fmt::Display for StoreError {
             Self::ObjectNotFound(id) => write!(formatter, "object {id} was not found"),
             Self::HashMismatch(id) => write!(formatter, "object {id} failed hash verification"),
             Self::CorruptMetadata(message) => write!(formatter, "corrupt metadata: {message}"),
+            Self::CollectionWikiMismatch => {
+                formatter.write_str("collection does not belong to the requested wiki")
+            }
+            Self::ConflictingRevision(revision_id) => write!(
+                formatter,
+                "revision {revision_id} conflicts with its previously captured identity"
+            ),
             Self::UnsupportedSchemaVersion(version) => {
                 write!(
                     formatter,
@@ -637,13 +1026,13 @@ mod tests {
     #[test]
     fn migration_is_applied_once_and_keeps_locations_separate() {
         let (directory, library) = test_library();
-        assert_eq!(library.schema_version().expect("schema version"), 1);
-        assert_eq!(migration_count(&library), 1);
+        assert_eq!(library.schema_version().expect("schema version"), 2);
+        assert_eq!(migration_count(&library), 2);
 
         drop(library);
         let reopened = Library::open(directory.path()).expect("reopen library");
-        assert_eq!(reopened.schema_version().expect("schema version"), 1);
-        assert_eq!(migration_count(&reopened), 1);
+        assert_eq!(reopened.schema_version().expect("schema version"), 2);
+        assert_eq!(migration_count(&reopened), 2);
 
         let logical_columns: Vec<String> = reopened
             .connection()
@@ -671,6 +1060,41 @@ mod tests {
             wikitext.to_string().parse::<ObjectId>().expect("parse ID"),
             wikitext
         );
+    }
+
+    #[test]
+    fn version_one_library_upgrades_to_capture_schema() {
+        let directory = tempfile::tempdir().expect("temporary library");
+        let database = directory.path().join(DATABASE_NAME);
+        let connection = Connection::open(database).expect("open version one database");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY NOT NULL CHECK (version > 0),
+                    name TEXT NOT NULL,
+                    applied_at INTEGER NOT NULL
+                 ) STRICT;",
+            )
+            .expect("migration table");
+        connection
+            .execute_batch(MIGRATION_1)
+            .expect("migration one");
+        connection
+            .execute(
+                "INSERT INTO schema_migrations (version, name, applied_at)
+                 VALUES (1, 'initial', 0)",
+                [],
+            )
+            .expect("migration record");
+        connection
+            .pragma_update(None, "user_version", 1)
+            .expect("schema version");
+        drop(connection);
+
+        let upgraded = Library::open(directory.path()).expect("upgrade library");
+        assert_eq!(upgraded.schema_version().expect("schema version"), 2);
+        assert_eq!(migration_count(&upgraded), 2);
+        assert_eq!(table_count(&upgraded, "revisions"), 0);
     }
 
     #[test]
@@ -761,6 +1185,65 @@ mod tests {
         assert_eq!(
             reopened.read_object(adopted.id).expect("read adopted"),
             bytes
+        );
+    }
+
+    #[test]
+    fn current_revision_capture_is_idempotent_and_preserves_identity() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Systems languages")
+            .expect("create collection");
+        let title = PageTitle::new("Rust (programming language)").expect("title");
+        let page_id = PageId::new(25_357_340).expect("page ID");
+        let revision_id = RevisionId::new(1_300_000_001).expect("revision ID");
+        let capture = CurrentRevisionCapture {
+            page_id,
+            namespace: 0,
+            title: &title,
+            revision_id,
+            parent_id: Some(RevisionId::new(1_300_000_000).expect("parent ID")),
+            timestamp: "2026-08-19T12:34:56Z",
+            author: Some("Fixture editor"),
+            author_id: Some(42),
+            comment: Some("Improve the history section"),
+            minor: true,
+            upstream_sha1: Some("mz6rzjalvs99ygh9s19aseznld8m1pu"),
+            content_model: "wikitext",
+            source: b"== Rust ==\nA systems programming language.",
+        };
+
+        let first = library
+            .capture_current_revision(wiki_id, collection_id, &capture)
+            .expect("capture revision");
+        let second = library
+            .capture_current_revision(wiki_id, collection_id, &capture)
+            .expect("repeat capture");
+        assert_eq!(first, second);
+        assert_eq!(table_count(&library, "pages"), 1);
+        assert_eq!(table_count(&library, "revisions"), 1);
+        assert_eq!(table_count(&library, "collection_pages"), 1);
+        assert_eq!(
+            library
+                .page(wiki_id, page_id)
+                .expect("page query")
+                .expect("stored page")
+                .current_revision_id,
+            Some(revision_id)
+        );
+        let revision = library
+            .revision(wiki_id, revision_id)
+            .expect("revision query")
+            .expect("stored revision");
+        assert_eq!(revision.content_object_id, first.id);
+        assert_eq!(
+            library
+                .read_object(revision.content_object_id)
+                .expect("canonical source"),
+            capture.source
         );
     }
 

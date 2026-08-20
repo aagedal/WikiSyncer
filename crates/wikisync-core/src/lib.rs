@@ -49,6 +49,7 @@ macro_rules! numeric_id {
 }
 
 numeric_id!(WikiId, "wiki ID");
+numeric_id!(CollectionId, "collection ID");
 numeric_id!(PageId, "MediaWiki page ID");
 numeric_id!(RevisionId, "MediaWiki revision ID");
 

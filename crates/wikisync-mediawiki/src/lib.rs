@@ -294,6 +294,67 @@ impl MediaWikiClient {
         })
     }
 
+    /// Fetches the canonical main-slot source for one known page revision.
+    ///
+    /// The caller supplies both identities so a malformed or surprising response
+    /// cannot silently attach another page's content to the requested page. The
+    /// response remains subject to the configured decompressed JSON body bound.
+    pub async fn revision_content(
+        &self,
+        page_id: PageId,
+        revision_id: RevisionId,
+    ) -> Result<RevisionContent, ClientError> {
+        let page_id_text = page_id.to_string();
+        let revision_id_text = revision_id.to_string();
+        let response: QueryResponse<PagesQuery> = self
+            .get_json(&[
+                ("action", "query"),
+                ("prop", "revisions"),
+                ("pageids", &page_id_text),
+                ("rvstartid", &revision_id_text),
+                ("rvendid", &revision_id_text),
+                (
+                    "rvprop",
+                    "ids|timestamp|user|userid|comment|flags|size|sha1|contentmodel|content",
+                ),
+                ("rvslots", "main"),
+            ])
+            .await?;
+        let page = response
+            .query
+            .pages
+            .into_iter()
+            .find(|page| page.page_id == Some(page_id.get()))
+            .ok_or(ClientError::InvalidResponse(
+                "revision-content response did not contain the requested page",
+            ))?;
+        let revision = page
+            .revisions
+            .and_then(|revisions| revisions.into_iter().next())
+            .ok_or(ClientError::InvalidResponse(
+                "revision-content response did not contain the requested revision",
+            ))?;
+        if revision.revision_id != revision_id.get() {
+            return Err(ClientError::InvalidResponse(
+                "revision-content response returned a different revision",
+            ));
+        }
+        let source = revision
+            .slots
+            .as_ref()
+            .and_then(|slots| slots.main.content.as_deref())
+            .ok_or(ClientError::InvalidResponse(
+                "requested revision has no public main-slot content",
+            ))?
+            .as_bytes()
+            .to_vec();
+
+        Ok(RevisionContent {
+            metadata: revision.try_into()?,
+            source,
+        })
+    }
+
     async fn get_json<T>(&self, params: &[(&str, &str)]) -> Result<T, ClientError>
     where
         T: DeserializeOwned,
@@ -435,6 +496,15 @@ pub struct RevisionMetadata {
     pub sha1: Option<String>,
     /// Content model for the main slot, when returned.
     pub content_model: Option<String>,
+}
+
+/// Canonical public main-slot bytes and metadata for one revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevisionContent {
+    /// Public revision metadata returned with the source.
+    pub metadata: RevisionMetadata,
+    /// Exact UTF-8 bytes obtained by decoding the Action API JSON string.
+    pub source: Vec<u8>,
 }
 
 /// One response page of revision metadata and its opaque next-page token.
@@ -692,6 +762,7 @@ struct SlotsPayload {
 struct MainSlotPayload {
     #[serde(rename = "contentmodel")]
     content_model: Option<String>,
+    content: Option<String>,
 }
 
 impl TryFrom<RevisionPayload> for RevisionMetadata {

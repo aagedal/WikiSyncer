@@ -11,6 +11,7 @@ use wikisync_mediawiki::{
 const TITLE_RESOLUTION: &str = include_str!("../../../fixtures/mediawiki/title-resolution.json");
 const REVISIONS_PAGE_1: &str = include_str!("../../../fixtures/mediawiki/revisions-page-1.json");
 const REVISIONS_PAGE_2: &str = include_str!("../../../fixtures/mediawiki/revisions-page-2.json");
+const REVISION_CONTENT: &str = include_str!("../../../fixtures/mediawiki/revision-content.json");
 const MAXLAG: &str = include_str!("../../../fixtures/mediawiki/maxlag.json");
 const EMPTY_PAGES: &str = include_str!("../../../fixtures/mediawiki/empty-pages.json");
 
@@ -131,6 +132,32 @@ async fn revision_continuation_round_trips_as_opaque_values() {
     assert!(requests[1].contains("rvcontinue=20260818100000%7C1299999999"));
     assert!(requests[1].contains("rvdir=older"));
     assert!(requests[1].contains("rvlimit=500"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetches_one_exact_revision_content_with_metadata() {
+    let server = FixtureServer::start(vec![FixtureResponse::json(REVISION_CONTENT)]);
+    let client = fixture_client(&server);
+    let page_id = PageId::new(25_357_340).expect("page ID");
+    let revision_id = 1_300_000_001_u64.try_into().expect("revision ID");
+
+    let revision = client
+        .revision_content(page_id, revision_id)
+        .await
+        .expect("revision content");
+    assert_eq!(revision.metadata.revision_id, revision_id);
+    assert_eq!(revision.metadata.content_model.as_deref(), Some("wikitext"));
+    assert_eq!(
+        revision.source,
+        b"== Rust ==\nA systems programming language."
+    );
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("pageids=25357340"));
+    assert!(requests[0].contains("rvstartid=1300000001"));
+    assert!(requests[0].contains("rvendid=1300000001"));
+    assert!(requests[0].contains("contentmodel%7Ccontent"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
