@@ -36,10 +36,15 @@ Updated: 2026-08-21
    whole-source and collection-scoped RecentChanges checkpoints with configurable
    overlap windows; checkpoint advancement gated on successful durable jobs; and CLI
    `status` output in human-readable and JSON forms.
+10. A loopback-only Axum reader with home, search, article, history, revision, diff,
+    changes, collections, and source/integrity routes; bundled styling, restrictive
+    Content Security Policy and response headers, sanitized derived HTML, same-wiki
+    local article links, provenance notices, CLI `serve`, and an in-process crawl
+    proving every loaded resource remains local or embedded.
 
 ## Next backlog item
 
-10. Add the minimal Axum reader and outbound-network test.
+11. Prove the complete offline vertical slice.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening

@@ -2,6 +2,7 @@ use std::env;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str;
@@ -26,6 +27,7 @@ Usage:
   wikisync --library <path> history [--wiki <id>] [--json] <title>
   wikisync --library <path> diff [--wiki <id>] [--reading] [--json] <from-revision> <to-revision>
   wikisync --library <path> status [--json]
+  wikisync --library <path> serve [--port <port>]
   wikisync --help
   wikisync --version
 
@@ -58,7 +60,8 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                     library.display()
                 )));
             }
-            let library = Library::open(library)?;
+            let library_root = library;
+            let library = Library::open(&library_root)?;
             match command {
                 Command::Search {
                     query,
@@ -86,6 +89,16 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                     json,
                 } => revision_diff(&library, from, to, wiki_id, reading, json),
                 Command::Status { json } => status(&library, json),
+                Command::Serve { port } => {
+                    drop(library);
+                    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+                    println!("WikiSyncer reader available at http://{address}/");
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    runtime.block_on(wikisync_web::serve(library_root, address))?;
+                    Ok(())
+                }
             }
         }
     }
@@ -597,6 +610,9 @@ enum Command {
     Status {
         json: bool,
     },
+    Serve {
+        port: u16,
+    },
 }
 
 fn parse(
@@ -621,7 +637,7 @@ fn parse(
             }
             Some("--help" | "-h") => return Ok(Action::Help),
             Some("--version" | "-V") => return Ok(Action::Version),
-            Some("search" | "show" | "history" | "diff" | "status") => break argument,
+            Some("search" | "show" | "history" | "diff" | "status" | "serve") => break argument,
             Some(value) => return Err(CliError::usage(format!("unknown command {value:?}"))),
             None => return Err(CliError::usage("arguments must be valid UTF-8")),
         }
@@ -642,9 +658,31 @@ fn parse(
         Some("history") => parse_history(values)?,
         Some("diff") => parse_diff(values)?,
         Some("status") => parse_status(values)?,
+        Some("serve") => parse_serve(values)?,
         _ => unreachable!("validated command"),
     };
     Ok(Action::Command { library, command })
+}
+
+fn parse_serve(values: Vec<String>) -> Result<Command, CliError> {
+    let mut port = 8_080;
+    let mut values = values.into_iter();
+    while let Some(value) = values.next() {
+        match value.as_str() {
+            "--port" => {
+                port = required_value(&mut values, "--port")?
+                    .parse::<u16>()
+                    .map_err(|_| CliError::usage("--port requires an integer from 1 to 65535"))?;
+                if port == 0 {
+                    return Err(CliError::usage(
+                        "--port requires an integer from 1 to 65535",
+                    ));
+                }
+            }
+            _ => return Err(CliError::usage(format!("unknown serve option {value:?}"))),
+        }
+    }
+    Ok(Command::Serve { port })
 }
 
 fn parse_status(values: Vec<String>) -> Result<Command, CliError> {
@@ -866,6 +904,12 @@ impl From<io::Error> for CliError {
     }
 }
 
+impl From<wikisync_web::ServeError> for CliError {
+    fn from(error: wikisync_web::ServeError) -> Self {
+        Self::message(error.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,6 +1010,14 @@ mod tests {
             Action::Command {
                 library: PathBuf::from("/tmp/wiki"),
                 command: Command::Status { json: true },
+            }
+        );
+
+        assert_eq!(
+            parse(["--library", "/tmp/wiki", "serve", "--port", "8765"]).expect("serve parse"),
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::Serve { port: 8_765 },
             }
         );
     }

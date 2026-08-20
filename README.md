@@ -22,5 +22,15 @@ wikisync --library /path/to/library status
 wikisync --library /path/to/library status --json
 ```
 
+Serve the read-only local encyclopedia on the loopback interface:
+
+```sh
+wikisync --library /path/to/library serve
+wikisync --library /path/to/library serve --port 8765
+```
+
+The reader loads only bundled or embedded resources and refuses non-loopback
+listeners. Open `http://127.0.0.1:8080/` when using the default port.
+
 The workspace is licensed under GPL-3.0-only. New dependencies must pass the
 license and source policy in `deny.toml`.

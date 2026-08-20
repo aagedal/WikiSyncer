@@ -281,6 +281,19 @@ pub struct StoredRevision {
     pub captured_at: u64,
 }
 
+/// Read-only collection summary used by local readers and status interfaces.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredCollection {
+    /// Local collection identity.
+    pub collection_id: CollectionId,
+    /// Source wiki identity.
+    pub wiki_id: WikiId,
+    /// User-visible collection name.
+    pub name: String,
+    /// Number of currently resolved pages in the collection.
+    pub page_count: u64,
+}
+
 /// The source-level operation represented by a durable synchronization run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncRunKind {
@@ -1260,6 +1273,41 @@ impl Library {
             .transpose()
     }
 
+    /// Finds pages with a remote ID across configured wikis.
+    ///
+    /// Remote page IDs are unique only within a wiki, so callers should report
+    /// ambiguity instead of silently selecting the first match.
+    pub fn pages_by_id(&self, page_id: PageId) -> Result<Vec<StoredPage>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT wiki_id, namespace, current_title, current_revision_id
+             FROM pages WHERE page_id = ?1 ORDER BY wiki_id",
+        )?;
+        let rows = statement
+            .query_map([to_sql_integer(page_id.get())?], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(raw_wiki_id, namespace, title, raw_revision_id)| {
+                Ok(StoredPage {
+                    wiki_id: sql_id(raw_wiki_id, "invalid stored wiki ID")?,
+                    page_id,
+                    namespace,
+                    title: PageTitle::new(title)
+                        .map_err(|_| StoreError::CorruptMetadata("invalid stored page title"))?,
+                    current_revision_id: raw_revision_id
+                        .map(|value| sql_id(value, "invalid stored revision ID"))
+                        .transpose()?,
+                })
+            })
+            .collect()
+    }
+
     /// Looks up captured pages by an observed title.
     ///
     /// When `wiki_id` is absent, matches from every configured wiki are returned so
@@ -1409,6 +1457,65 @@ impl Library {
             .query_map([to_sql_integer(revision_id.get())?], revision_row)?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter().map(stored_revision).collect()
+    }
+
+    /// Lists the most recently captured source revisions across all configured wikis.
+    pub fn recent_revisions(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<(WikiId, StoredRevision)>, StoreError> {
+        if !(1..=100).contains(&limit) {
+            return Err(StoreError::InvalidConfig(
+                "recent revision limit must be between 1 and 100",
+            ));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT wiki_id, revision_id, page_id, parent_revision_id,
+                    revision_time, author_name, author_id, comment, is_minor,
+                    source_size, upstream_sha1, content_model, content_object_id,
+                    captured_at
+             FROM revisions
+             ORDER BY revision_time DESC, wiki_id, revision_id DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement
+            .query_map([i64::from(limit)], revision_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(stored_revision).collect()
+    }
+
+    /// Lists collection summaries in deterministic name and identity order.
+    pub fn collections(&self) -> Result<Vec<StoredCollection>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT collections.collection_id, collections.wiki_id, collections.name,
+                    COUNT(collection_pages.page_id)
+             FROM collections
+             LEFT JOIN collection_pages USING (collection_id)
+             GROUP BY collections.collection_id
+             ORDER BY collections.name, collections.collection_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(collection_id, wiki_id, name, page_count)| {
+                Ok(StoredCollection {
+                    collection_id: sql_id(collection_id, "invalid collection ID")?,
+                    wiki_id: sql_id(wiki_id, "invalid wiki ID")?,
+                    name,
+                    page_count: u64::try_from(page_count).map_err(|_| {
+                        StoreError::CorruptMetadata("invalid collection page count")
+                    })?,
+                })
+            })
+            .collect()
     }
 
     /// Stores an in-memory canonical object.

@@ -10,3 +10,18 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[dependencies]
+axum = "0.8"
+percent-encoding = "2.3"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.0", features = ["net"] }
+wikisync-content = { path = "../wikisync-content" }
+wikisync-core = { path = "../wikisync-core" }
+wikisync-search = { path = "../wikisync-search" }
+wikisync-store = { path = "../wikisync-store" }
+
+[dev-dependencies]
+tempfile = "3.20"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
