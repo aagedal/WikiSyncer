@@ -15,6 +15,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+Inspect durable synchronization progress without network access:
+
+```sh
+wikisync --library /path/to/library status
+wikisync --library /path/to/library status --json
+```
+
 The workspace is licensed under GPL-3.0-only. New dependencies must pass the
 license and source policy in `deny.toml`.
-

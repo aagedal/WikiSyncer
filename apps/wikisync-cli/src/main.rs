@@ -14,7 +14,9 @@ use wikisync_core::{PageTitle, RevisionId, WikiId};
 use wikisync_search::{
     MAX_SEARCH_RESULTS, SearchError, SearchIndex, SearchQuery, SqliteSearchIndex,
 };
-use wikisync_store::{Library, StoreError, StoredPage, StoredRevision};
+use wikisync_store::{
+    Library, StoreError, StoredPage, StoredRevision, SyncCheckpoint, SyncRunState, SyncRunStatus,
+};
 
 const USAGE: &str = "WikiSyncer offline reader
 
@@ -23,6 +25,7 @@ Usage:
   wikisync --library <path> show [--wiki <id>] [--revision <id>] [--json] [--source] <title>
   wikisync --library <path> history [--wiki <id>] [--json] <title>
   wikisync --library <path> diff [--wiki <id>] [--reading] [--json] <from-revision> <to-revision>
+  wikisync --library <path> status [--json]
   wikisync --help
   wikisync --version
 
@@ -82,9 +85,111 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                     reading,
                     json,
                 } => revision_diff(&library, from, to, wiki_id, reading, json),
+                Command::Status { json } => status(&library, json),
             }
         }
     }
+}
+
+fn status(library: &Library, json_output: bool) -> Result<(), CliError> {
+    let checkpoints = library.sync_checkpoints()?;
+    let runs = library.sync_run_statuses(20)?;
+    let state = library_sync_state(&runs);
+    if json_output {
+        write_json(&json!({
+            "state": state,
+            "checkpoints": checkpoints.iter().map(checkpoint_json).collect::<Vec<_>>(),
+            "runs": runs.iter().map(sync_run_json).collect::<Vec<_>>(),
+        }))?;
+    } else {
+        println!("WikiSyncer status: {state}");
+        if checkpoints.is_empty() {
+            println!("No source checkpoints recorded.");
+        } else {
+            for checkpoint in checkpoints {
+                let scope = checkpoint.collection_id.map_or_else(
+                    || "all collections".to_owned(),
+                    |id| format!("collection {id}"),
+                );
+                println!(
+                    "Wiki {} ({scope}): committed through {}, next window starts {} ({}s overlap)",
+                    checkpoint.wiki_id,
+                    checkpoint.committed_through,
+                    checkpoint.next_window_start(),
+                    checkpoint.overlap_seconds,
+                );
+            }
+        }
+        for run in runs {
+            println!(
+                "Run {}: {} {} — {} queued, {} running, {} succeeded, {} failed",
+                run.run_id,
+                run.kind.as_str(),
+                run.state.as_str(),
+                run.queued_jobs,
+                run.running_jobs,
+                run.succeeded_jobs,
+                run.failed_jobs,
+            );
+            if let Some(error) = run.latest_error {
+                println!("  Last error [{}]: {}", error.code, error.message);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn library_sync_state(runs: &[SyncRunStatus]) -> &'static str {
+    if runs
+        .iter()
+        .any(|run| run.state == SyncRunState::Running && run.failed_jobs > 0)
+    {
+        "attention"
+    } else if runs.iter().any(|run| run.state == SyncRunState::Running) {
+        "running"
+    } else {
+        "idle"
+    }
+}
+
+fn checkpoint_json(checkpoint: &SyncCheckpoint) -> serde_json::Value {
+    json!({
+        "wiki_id": checkpoint.wiki_id.get(),
+        "collection_id": checkpoint.collection_id.map(|id| id.get()),
+        "committed_through": checkpoint.committed_through,
+        "overlap_seconds": checkpoint.overlap_seconds,
+        "next_window_start": checkpoint.next_window_start(),
+        "recent_changes_cursor": checkpoint.recent_changes_cursor,
+        "reconciled_at": checkpoint.reconciled_at,
+        "last_run_id": checkpoint.last_run_id,
+        "updated_at": checkpoint.updated_at,
+    })
+}
+
+fn sync_run_json(run: &SyncRunStatus) -> serde_json::Value {
+    json!({
+        "run_id": run.run_id,
+        "wiki_id": run.wiki_id.get(),
+        "collection_id": run.collection_id.map(|id| id.get()),
+        "kind": run.kind.as_str(),
+        "state": run.state.as_str(),
+        "window_start": run.window_start,
+        "checkpoint_candidate": run.checkpoint_candidate,
+        "jobs": {
+            "queued": run.queued_jobs,
+            "running": run.running_jobs,
+            "succeeded": run.succeeded_jobs,
+            "failed": run.failed_jobs,
+        },
+        "created_at": run.created_at,
+        "finished_at": run.finished_at,
+        "latest_error": run.latest_error.as_ref().map(|error| json!({
+            "code": error.code,
+            "message": error.message,
+            "retryable": error.retryable,
+            "occurred_at": error.occurred_at,
+        })),
+    })
 }
 
 fn search(
@@ -489,6 +594,9 @@ enum Command {
         reading: bool,
         json: bool,
     },
+    Status {
+        json: bool,
+    },
 }
 
 fn parse(
@@ -513,7 +621,7 @@ fn parse(
             }
             Some("--help" | "-h") => return Ok(Action::Help),
             Some("--version" | "-V") => return Ok(Action::Version),
-            Some("search" | "show" | "history" | "diff") => break argument,
+            Some("search" | "show" | "history" | "diff" | "status") => break argument,
             Some(value) => return Err(CliError::usage(format!("unknown command {value:?}"))),
             None => return Err(CliError::usage("arguments must be valid UTF-8")),
         }
@@ -533,9 +641,21 @@ fn parse(
         Some("show") => parse_show(values)?,
         Some("history") => parse_history(values)?,
         Some("diff") => parse_diff(values)?,
+        Some("status") => parse_status(values)?,
         _ => unreachable!("validated command"),
     };
     Ok(Action::Command { library, command })
+}
+
+fn parse_status(values: Vec<String>) -> Result<Command, CliError> {
+    let mut json = false;
+    for value in values {
+        match value.as_str() {
+            "--json" => json = true,
+            _ => return Err(CliError::usage(format!("unknown status option {value:?}"))),
+        }
+    }
+    Ok(Command::Status { json })
 }
 
 fn parse_search(values: Vec<String>) -> Result<Command, CliError> {
@@ -838,6 +958,14 @@ mod tests {
                     reading: true,
                     json: true,
                 },
+            }
+        );
+
+        assert_eq!(
+            parse(["--library", "/tmp/wiki", "status", "--json"]).expect("status parse"),
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::Status { json: true },
             }
         );
     }

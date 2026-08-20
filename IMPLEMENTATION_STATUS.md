@@ -31,10 +31,15 @@ Updated: 2026-08-21
    newest-first local history queries; deterministic exact-source and normalized
    reading diffs with line alignment and word-level spans; and CLI `history`, `diff`,
    and `show --revision` commands with human-readable or JSON output.
+9. Durable, idempotent synchronization runs and jobs with crash recovery of claimed
+   and retryable-failed work; structured error history and aggregate job counts;
+   whole-source and collection-scoped RecentChanges checkpoints with configurable
+   overlap windows; checkpoint advancement gated on successful durable jobs; and CLI
+   `status` output in human-readable and JSON forms.
 
 ## Next backlog item
 
-9. Add resumable sync jobs, overlap checkpoints, and structured status.
+10. Add the minimal Axum reader and outbound-network test.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening
