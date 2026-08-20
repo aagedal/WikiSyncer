@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": "maxlag",
+    "info": "Waiting for db1234: 7 seconds lagged",
+    "host": "db1234",
+    "lag": 7
+  }
+}

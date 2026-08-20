@@ -1,0 +1,32 @@
+{
+  "batchcomplete": true,
+  "query": {
+    "normalized": [
+      { "from": "Rust_programming_language", "to": "Rust programming language" }
+    ],
+    "redirects": [
+      { "from": "Rust programming language", "to": "Rust (programming language)" }
+    ],
+    "pages": [
+      {
+        "pageid": 25357340,
+        "ns": 0,
+        "title": "Rust (programming language)",
+        "revisions": [
+          {
+            "revid": 1300000001,
+            "parentid": 1300000000,
+            "timestamp": "2026-08-19T12:34:56Z",
+            "size": 98765,
+            "sha1": "0123456789abcdefghijklmnopqrstuv"
+          }
+        ]
+      },
+      {
+        "ns": 0,
+        "title": "Definitely missing WikiSyncer fixture page",
+        "missing": true
+      }
+    ]
+  }
+}

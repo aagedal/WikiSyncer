@@ -8,10 +8,13 @@ Updated: 2026-08-20
    license/source policy.
 2. Validated core identities, explicit-title and category collection rules, and all
    planned history-policy variants.
+3. Bounded MediaWiki Action API client, 100-title batching spike, resumable revision
+   metadata pagination, retry classification, and offline loopback fixture harness.
 
 ## Next backlog item
 
-3. Implement the bounded MediaWiki HTTP client and fixture harness.
+4. Create SQLite migration 1 and the atomic loose content-object store, keeping
+   physical locations separate from logical content identity.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening

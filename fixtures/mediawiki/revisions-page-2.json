@@ -1,0 +1,26 @@
+{
+  "batchcomplete": true,
+  "query": {
+    "pages": [
+      {
+        "pageid": 25357340,
+        "ns": 0,
+        "title": "Rust (programming language)",
+        "revisions": [
+          {
+            "revid": 1300000000,
+            "parentid": 0,
+            "timestamp": "2026-08-18T10:00:00Z",
+            "userhidden": true,
+            "commenthidden": true,
+            "size": 98000,
+            "sha1hidden": true,
+            "slots": {
+              "main": { "contentmodel": "wikitext" }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

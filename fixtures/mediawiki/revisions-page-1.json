@@ -1,0 +1,31 @@
+{
+  "continue": {
+    "rvcontinue": "20260818100000|1299999999",
+    "continue": "||"
+  },
+  "query": {
+    "pages": [
+      {
+        "pageid": 25357340,
+        "ns": 0,
+        "title": "Rust (programming language)",
+        "revisions": [
+          {
+            "revid": 1300000001,
+            "parentid": 1300000000,
+            "timestamp": "2026-08-19T12:34:56Z",
+            "user": "Fixture editor",
+            "userid": 42,
+            "comment": "Improve the history section",
+            "minor": true,
+            "size": 98765,
+            "sha1": "0123456789abcdefghijklmnopqrstuv",
+            "slots": {
+              "main": { "contentmodel": "wikitext" }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
