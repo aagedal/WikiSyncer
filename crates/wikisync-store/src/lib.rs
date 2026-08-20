@@ -17,6 +17,7 @@ use wikisync_core::{CollectionId, PageId, PageTitle, RevisionId, WikiId};
 
 const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
 const MIGRATION_2: &str = include_str!("../migrations/0002_capture.sql");
+const MIGRATION_3: &str = include_str!("../migrations/0003_search.sql");
 const OBJECT_DOMAIN: &[u8] = b"wikisync-object-v1\0";
 const DATABASE_NAME: &str = "library.sqlite3";
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
@@ -208,6 +209,8 @@ pub struct CurrentRevisionCapture<'a> {
 /// Persisted page head metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredPage {
+    /// Source wiki identity.
+    pub wiki_id: WikiId,
     /// Stable remote page identity.
     pub page_id: PageId,
     /// MediaWiki namespace number.
@@ -275,6 +278,12 @@ impl Library {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Returns the SQLite database path for read/index services sharing this library.
+    #[must_use]
+    pub fn database_path(&self) -> PathBuf {
+        self.root.join(DATABASE_NAME)
     }
 
     /// Registers a MediaWiki source, returning the existing identity on repetition.
@@ -522,6 +531,7 @@ impl Library {
             .optional()?
             .map(|(namespace, title, revision_id)| {
                 Ok(StoredPage {
+                    wiki_id,
                     page_id,
                     namespace,
                     title: PageTitle::new(title)
@@ -532,6 +542,83 @@ impl Library {
                 })
             })
             .transpose()
+    }
+
+    /// Looks up captured pages by an observed title.
+    ///
+    /// When `wiki_id` is absent, matches from every configured wiki are returned so
+    /// callers can report ambiguity instead of silently choosing one language.
+    pub fn pages_by_title(
+        &self,
+        title: &PageTitle,
+        wiki_id: Option<WikiId>,
+    ) -> Result<Vec<StoredPage>, StoreError> {
+        let wiki_filter = wiki_id.map(|id| to_sql_integer(id.get())).transpose()?;
+        let mut statement = self.connection.prepare(
+            "SELECT pages.wiki_id, pages.page_id, pages.namespace,
+                    pages.current_title, pages.current_revision_id
+             FROM page_titles AS titles
+             JOIN pages USING (wiki_id, page_id)
+             WHERE titles.title = ?1 AND (?2 IS NULL OR pages.wiki_id = ?2)
+             ORDER BY pages.wiki_id, pages.page_id",
+        )?;
+        let rows = statement
+            .query_map(params![title.as_str(), wiki_filter], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i32>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter()
+            .map(
+                |(raw_wiki_id, raw_page_id, namespace, current_title, raw_revision_id)| {
+                    Ok(StoredPage {
+                        wiki_id: sql_id(raw_wiki_id, "invalid stored wiki ID")?,
+                        page_id: sql_id(raw_page_id, "invalid stored page ID")?,
+                        namespace,
+                        title: PageTitle::new(current_title).map_err(|_| {
+                            StoreError::CorruptMetadata("invalid stored page title")
+                        })?,
+                        current_revision_id: raw_revision_id
+                            .map(|value| sql_id(value, "invalid stored revision ID"))
+                            .transpose()?,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Returns every title observed for a captured page in lexical order.
+    pub fn page_titles(
+        &self,
+        wiki_id: WikiId,
+        page_id: PageId,
+    ) -> Result<Vec<PageTitle>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT title FROM page_titles
+             WHERE wiki_id = ?1 AND page_id = ?2 ORDER BY title",
+        )?;
+        let titles = statement
+            .query_map(
+                params![
+                    to_sql_integer(wiki_id.get())?,
+                    to_sql_integer(page_id.get())?
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        titles
+            .into_iter()
+            .map(|title| {
+                PageTitle::new(title)
+                    .map_err(|_| StoreError::CorruptMetadata("invalid stored page title"))
+            })
+            .collect()
     }
 
     /// Looks up a captured revision and its logical content identity.
@@ -854,7 +941,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
          ) STRICT;",
     )?;
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > 2 {
+    if version > 3 {
         return Err(StoreError::UnsupportedSchemaVersion(version));
     }
     if version == 0 {
@@ -878,6 +965,18 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
             [unix_time()?],
         )?;
         transaction.pragma_update(None, "user_version", 2)?;
+        transaction.commit()?;
+    }
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 2 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(MIGRATION_3)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (3, 'search', ?1)",
+            [unix_time()?],
+        )?;
+        transaction.pragma_update(None, "user_version", 3)?;
         transaction.commit()?;
     }
     Ok(())
@@ -1026,13 +1125,13 @@ mod tests {
     #[test]
     fn migration_is_applied_once_and_keeps_locations_separate() {
         let (directory, library) = test_library();
-        assert_eq!(library.schema_version().expect("schema version"), 2);
-        assert_eq!(migration_count(&library), 2);
+        assert_eq!(library.schema_version().expect("schema version"), 3);
+        assert_eq!(migration_count(&library), 3);
 
         drop(library);
         let reopened = Library::open(directory.path()).expect("reopen library");
-        assert_eq!(reopened.schema_version().expect("schema version"), 2);
-        assert_eq!(migration_count(&reopened), 2);
+        assert_eq!(reopened.schema_version().expect("schema version"), 3);
+        assert_eq!(migration_count(&reopened), 3);
 
         let logical_columns: Vec<String> = reopened
             .connection()
@@ -1063,7 +1162,7 @@ mod tests {
     }
 
     #[test]
-    fn version_one_library_upgrades_to_capture_schema() {
+    fn version_one_library_upgrades_to_current_schema() {
         let directory = tempfile::tempdir().expect("temporary library");
         let database = directory.path().join(DATABASE_NAME);
         let connection = Connection::open(database).expect("open version one database");
@@ -1092,9 +1191,56 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 2);
-        assert_eq!(migration_count(&upgraded), 2);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 3);
+        assert_eq!(migration_count(&upgraded), 3);
         assert_eq!(table_count(&upgraded, "revisions"), 0);
+    }
+
+    #[test]
+    fn version_two_library_upgrades_to_contentless_search_schema() {
+        let directory = tempfile::tempdir().expect("temporary library");
+        let database = directory.path().join(DATABASE_NAME);
+        let connection = Connection::open(database).expect("open version two database");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY NOT NULL CHECK (version > 0),
+                    name TEXT NOT NULL,
+                    applied_at INTEGER NOT NULL
+                 ) STRICT;",
+            )
+            .expect("migration table");
+        connection
+            .execute_batch(MIGRATION_1)
+            .expect("migration one");
+        connection
+            .execute_batch(MIGRATION_2)
+            .expect("migration two");
+        connection
+            .execute_batch(
+                "INSERT INTO schema_migrations (version, name, applied_at)
+                 VALUES (1, 'initial', 0), (2, 'capture', 0);",
+            )
+            .expect("migration records");
+        connection
+            .pragma_update(None, "user_version", 2)
+            .expect("schema version");
+        drop(connection);
+
+        let upgraded = Library::open(directory.path()).expect("upgrade library");
+        assert_eq!(upgraded.schema_version().expect("schema version"), 3);
+        assert_eq!(migration_count(&upgraded), 3);
+        assert_eq!(table_count(&upgraded, "search_documents"), 0);
+        let fts_definition: String = upgraded
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name = 'search_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("FTS schema");
+        assert!(fts_definition.contains("content=''"));
+        assert!(fts_definition.contains("contentless_delete=1"));
     }
 
     #[test]

@@ -14,3 +14,9 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[dependencies]
+serde_json = "1.0"
+wikisync-content = { path = "../../crates/wikisync-content" }
+wikisync-core = { path = "../../crates/wikisync-core" }
+wikisync-search = { path = "../../crates/wikisync-search" }
+wikisync-store = { path = "../../crates/wikisync-store" }

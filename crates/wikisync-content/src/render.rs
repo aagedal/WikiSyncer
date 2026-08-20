@@ -9,6 +9,21 @@ pub(crate) fn render(source: &str, kind: OutputKind) -> String {
     renderer.finish()
 }
 
+pub(crate) fn search_headings(source: &str) -> String {
+    let source = strip_comments(&source.replace("\r\n", "\n").replace('\r', "\n"));
+    let mut headings = source
+        .lines()
+        .filter_map(heading)
+        .map(|(_, value)| normalized_inline(value, OutputKind::PlainText))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !headings.is_empty() {
+        headings.push('\n');
+    }
+    headings
+}
+
 #[derive(Debug)]
 struct Renderer {
     kind: OutputKind,

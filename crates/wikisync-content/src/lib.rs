@@ -85,6 +85,17 @@ pub struct DerivedContent {
     pub body: String,
 }
 
+/// Rebuildable fields used by the current-page search index.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchContent {
+    /// Exact transformer version used for both fields.
+    pub transformer_version: TransformerVersion,
+    /// Normalized article headings, one per line.
+    pub headings: String,
+    /// Complete normalized reading text.
+    pub body: String,
+}
+
 /// Derives one rebuildable representation from canonical UTF-8 wikitext.
 ///
 /// The v1 transformer intentionally recognizes a conservative subset: headings,
@@ -113,6 +124,16 @@ pub fn to_markdown(source: &str) -> String {
     transform(source, OutputKind::Markdown).body
 }
 
+/// Derives the separately weighted fields used by full-text search.
+#[must_use]
+pub fn to_search_content(source: &str) -> SearchContent {
+    SearchContent {
+        transformer_version: PLAIN_TEXT_TRANSFORMER_VERSION,
+        headings: render::search_headings(source),
+        body: to_plain_text(source),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +158,13 @@ mod tests {
     fn empty_input_has_no_synthetic_newline() {
         assert_eq!(to_plain_text(" \r\n\t"), "");
         assert_eq!(to_markdown("<!-- metadata only -->"), "");
+    }
+
+    #[test]
+    fn search_content_separates_normalized_headings() {
+        let content = to_search_content("== [[Rust]] ==\nA language.\n=== History ===\nOld.");
+        assert_eq!(content.headings, "Rust\nHistory\n");
+        assert_eq!(content.transformer_version, PLAIN_TEXT_TRANSFORMER_VERSION);
+        assert!(content.body.contains("A language."));
     }
 }

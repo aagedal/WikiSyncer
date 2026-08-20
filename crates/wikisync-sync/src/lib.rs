@@ -2,10 +2,12 @@
 
 use std::error::Error;
 use std::fmt;
+use std::str;
 
 use sha1::{Digest, Sha1};
 use wikisync_core::{CollectionId, PageId, PageTitle, RevisionId, TitleSelection, WikiId};
 use wikisync_mediawiki::{ClientError, MediaWikiClient, TitleResolution};
+use wikisync_search::{SearchDocument, SearchError, SearchIndex, SqliteSearchIndex};
 use wikisync_store::{CurrentRevisionCapture, Library, ObjectId, StoreError};
 
 /// Result of resolving and capturing one explicit-title selection.
@@ -44,6 +46,7 @@ pub async fn capture_explicit_titles(
 ) -> Result<CaptureReport, CaptureError> {
     let titles = selection.iter().cloned().collect::<Vec<_>>();
     let resolutions = client.resolve_titles(&titles).await?;
+    let mut search_index = SqliteSearchIndex::open(library)?;
     let mut report = CaptureReport {
         pages: Vec::with_capacity(resolutions.len()),
         missing_titles: Vec::new(),
@@ -96,6 +99,28 @@ pub async fn capture_explicit_titles(
                         source: &content.source,
                     },
                 )?;
+                let source = str::from_utf8(&content.source)
+                    .map_err(|_| CaptureError::InvalidUtf8(content.metadata.revision_id))?;
+                let search_content = wikisync_content::to_search_content(source);
+                let aliases = library
+                    .page_titles(wiki_id, page.page_id)?
+                    .into_iter()
+                    .filter(|title| title != &page.title)
+                    .map(PageTitle::into_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                search_index.index_document(&SearchDocument {
+                    wiki_id,
+                    page_id: page.page_id,
+                    revision_id: content.metadata.revision_id,
+                    title: &page.title,
+                    aliases: &aliases,
+                    headings: &search_content.headings,
+                    body: &search_content.body,
+                    categories: "",
+                    captions: "",
+                    transformer_version: search_content.transformer_version.as_str(),
+                })?;
                 report.pages.push(CapturedPage {
                     page_id: page.page_id,
                     revision_id: content.metadata.revision_id,
@@ -180,8 +205,12 @@ pub enum CaptureError {
     Source(ClientError),
     /// Durable local storage failed.
     Store(StoreError),
+    /// Rebuildable current-page indexing failed after canonical capture.
+    Search(SearchError),
     /// A resolved page did not expose a current public revision.
     MissingCurrentRevision(PageId),
+    /// Canonical wikitext was not valid UTF-8.
+    InvalidUtf8(RevisionId),
     /// The exact-content request returned another revision than title resolution.
     RevisionIdentityChanged {
         /// Head revision selected during title resolution.
@@ -225,8 +254,15 @@ impl fmt::Display for CaptureError {
         match self {
             Self::Source(error) => error.fmt(formatter),
             Self::Store(error) => error.fmt(formatter),
+            Self::Search(error) => error.fmt(formatter),
             Self::MissingCurrentRevision(page_id) => {
                 write!(formatter, "page {page_id} has no public current revision")
+            }
+            Self::InvalidUtf8(revision_id) => {
+                write!(
+                    formatter,
+                    "revision {revision_id} source is not valid UTF-8"
+                )
             }
             Self::RevisionIdentityChanged { expected, actual } => write!(
                 formatter,
@@ -271,6 +307,7 @@ impl Error for CaptureError {
         match self {
             Self::Source(error) => Some(error),
             Self::Store(error) => Some(error),
+            Self::Search(error) => Some(error),
             _ => None,
         }
     }
@@ -285,6 +322,12 @@ impl From<ClientError> for CaptureError {
 impl From<StoreError> for CaptureError {
     fn from(error: StoreError) -> Self {
         Self::Store(error)
+    }
+}
+
+impl From<SearchError> for CaptureError {
+    fn from(error: SearchError) -> Self {
+        Self::Search(error)
     }
 }
 

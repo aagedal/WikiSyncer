@@ -3,6 +3,7 @@ mod support;
 use support::{FixtureResponse, FixtureServer};
 use wikisync_core::{PageId, PageTitle, TitleSelection};
 use wikisync_mediawiki::{ClientConfig, MediaWikiClient};
+use wikisync_search::{SearchIndex, SearchQuery, SqliteSearchIndex};
 use wikisync_store::Library;
 use wikisync_sync::capture_explicit_titles;
 
@@ -63,6 +64,12 @@ async fn explicit_title_capture_is_durable_and_idempotent() {
             .expect("canonical source"),
         b"== Rust ==\nA systems programming language."
     );
+    let search = SqliteSearchIndex::open(&library).expect("search index");
+    let hits = search
+        .search(SearchQuery::new("systems programming"))
+        .expect("offline search");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].page_id, page_id);
 
     let second = capture_explicit_titles(&client, &mut library, wiki_id, collection_id, &selection)
         .await

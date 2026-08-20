@@ -12,8 +12,10 @@ workspace = true
 
 [dependencies]
 sha1 = "0.10"
+wikisync-content = { path = "../wikisync-content" }
 wikisync-core = { path = "../wikisync-core" }
 wikisync-mediawiki = { path = "../wikisync-mediawiki" }
+wikisync-search = { path = "../wikisync-search" }
 wikisync-store = { path = "../wikisync-store" }
 
 [dev-dependencies]

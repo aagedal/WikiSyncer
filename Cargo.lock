@@ -1313,6 +1313,13 @@ dependencies = [
 [[package]]
 name = "wikisync-cli"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wikisync-content",
+ "wikisync-core",
+ "wikisync-search",
+ "wikisync-store",
+]
 
 [[package]]
 name = "wikisync-content"
@@ -1344,6 +1351,13 @@ dependencies = [
 [[package]]
 name = "wikisync-search"
 version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "tempfile",
+ "wikisync-content",
+ "wikisync-core",
+ "wikisync-store",
+]
 
 [[package]]
 name = "wikisync-store"
@@ -1363,8 +1377,10 @@ dependencies = [
  "sha1",
  "tempfile",
  "tokio",
+ "wikisync-content",
  "wikisync-core",
  "wikisync-mediawiki",
+ "wikisync-search",
  "wikisync-store",
 ]
 

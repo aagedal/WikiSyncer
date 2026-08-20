@@ -1,6 +1,6 @@
 # WikiSyncer implementation status
 
-Updated: 2026-08-20
+Updated: 2026-08-21
 
 ## Completed backlog items
 
@@ -21,10 +21,14 @@ Updated: 2026-08-20
    transformer versions, conservative structural/inline wikitext handling, readable
    placeholders for unsupported templates, malformed-input bounds, and golden article
    fixtures.
+7. Contentless SQLite FTS5 indexing for selected current revisions with separately
+   weighted title, alias, heading, body, category, and caption fields; atomic derived
+   index replacement during capture; wiki filters and bounded ranked queries; and CLI
+   `search`/`show` commands with human-readable or JSON output and exact-source mode.
 
 ## Next backlog item
 
-7. Add FTS indexing and CLI search/show.
+8. Add revision enumeration, history, and local diff.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening
