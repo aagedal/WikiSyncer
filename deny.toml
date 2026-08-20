@@ -12,13 +12,16 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "CC0-1.0",
-    "CDLA-Permissive-2.0",
     "GPL-3.0-only",
     "ISC",
     "MIT",
     "MPL-2.0",
     "Unicode-3.0",
     "Zlib",
+]
+exceptions = [
+    # Mozilla/CCADB root-certificate data used by reqwest's Rustls backend.
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
 ]
 
 [sources]
