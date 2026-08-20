@@ -10,3 +10,8 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[dependencies]
+blake3 = "1.8"
+rusqlite = { version = "0.37", features = ["bundled"] }
+tempfile = "3.20"
+zstd = "0.13"

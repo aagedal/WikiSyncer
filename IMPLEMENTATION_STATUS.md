@@ -10,11 +10,13 @@ Updated: 2026-08-20
    planned history-policy variants.
 3. Bounded MediaWiki Action API client, 100-title batching spike, resumable revision
    metadata pagination, retry classification, and offline loopback fixture harness.
+4. SQLite migration 1 and a bounded atomic loose-object store with domain-separated
+   BLAKE3 identities, Zstandard compression, durable installation, deduplication, and
+   verified reads. Logical content identity is isolated from physical locations.
 
 ## Next backlog item
 
-4. Create SQLite migration 1 and the atomic loose content-object store, keeping
-   physical locations separate from logical content identity.
+5. Implement explicit-title resolution and current-revision capture.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening
