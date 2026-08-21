@@ -215,6 +215,9 @@ are implemented and tested.
   locked workspace tests on macOS and Ubuntu.
 - `cargo-deny` runs in CI with explicit license policy, denied wildcard dependencies,
   denied unknown registries/Git sources, and yanked-crate denial.
+- Three unmaintained-only advisories in Iced 0.13's transitive timer and text stacks
+  have narrow documented exceptions in `deny.toml` because the advisories offer no
+  safe compatible upgrade. Re-evaluate and remove them with the next Iced upgrade.
 - The HTTP stack uses Rustls rather than a platform OpenSSL dependency.
 
 This is useful hygiene, not a complete software-supply-chain guarantee. Release
@@ -364,13 +367,16 @@ reading interests or personal data.
 
 **Present resistance.** Captured history is retained deliberately, the reader sends no
 telemetry or external asset requests in its tested default mode, responses use
-`no-referrer`, and library files are private on Unix.
+`no-referrer`, and library files are private on Unix. The offline `doctor` bundle uses
+a tested field allowlist, aggregate counts, bounded quick verification, create-new
+`0600` output, and redacted section error codes; sentinel tests reject endpoints,
+titles, names, paths, raw errors, content, object IDs, and environment values.
 
 **Residual risk and action.** Onboarding, export, backup, and restore documentation
-must warn about retained suppressed material and legal obligations. Logs and doctor
-bundles need defined redaction for titles, query text, user/IP metadata, paths, tokens,
-and content excerpts; retention must be bounded. Verify no telemetry endpoints or
-unexpected outbound requests in release binaries. Purge, if later implemented, must
+must warn about retained suppressed material and legal obligations. Diagnostic
+redaction must remain an explicit versioned allowlist, and users must review bundles
+before sharing them. Define bounded log retention and verify no telemetry endpoints
+or unexpected outbound requests in release binaries. Purge, if later implemented, must
 be a separately authorized destructive workflow with preview and clear limits on
 recoverability from packs/backups.
 
@@ -390,7 +396,7 @@ recoverability from packs/backups.
 | Optional Ed25519 signatures and external trust anchor | **Pending** | No signing/key lifecycle or trusted-head export is present |
 | Full verify contract | **Partial** | Loose/pack/delta/object catalog verification exists; revision chains, manifests, search/cache pointers, deletion/truncation and trusted-head comparison remain |
 | Loopback-only read-only reader | **Present, confidentiality gap** | Non-loopback addresses are rejected and only GET routes exist; localhost is unauthenticated and not an OS-user boundary |
-| Daemon single-writer authorization | **Partial** | Versioned bounded Unix IPC, `0600` sockets inside the private library, cooperative writer leases, GUI/CLI forwarding, and service templates exist; peer-credential review, signal/stale-socket recovery, scheduling, and complete exclusion tests remain |
+| Daemon single-writer authorization | **Partial** | Versioned bounded Unix IPC, `0600` sockets inside the private library, cooperative writer leases, scheduling, signal cancellation, advisory-lock stale-socket recovery, GUI/CLI forwarding, and exclusion/recovery tests exist; peer-credential review and hostile same-UID analysis remain |
 | Locked/audited dependencies | **Partial** | Lockfile, cargo-deny policy, locked CI tests; formal audit response, immutable CI action pins, SBOM/provenance remain |
 | Signed beta packages | **Pending** | Packaging, platform signing, protected key flow, and artifact verification remain |
 | Safe optional media | **Deferred / disabled** | Image placeholders only; do not enable capture until bounded validation, attribution, licensing, and safe serving land |

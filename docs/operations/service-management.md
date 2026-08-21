@@ -7,11 +7,12 @@ are created with user-only permissions. `status`, `health`, and `shutdown` use t
 same `--library` argument. `WIKISYNC_LIBRARY` is also accepted, but the templates
 deliberately use an explicit absolute path.
 
-This checkpoint provides the single-writer IPC foundation and application dispatch,
-not the finished scheduler. GUI and CLI clients can forward collection sync, logical-
-object verification, and compaction to the daemon; those operations open the store
-and synchronization contacts the configured MediaWiki source. Nothing runs
-unattended until scheduling is implemented and configured.
+The daemon executes durable per-collection interval and daily-UTC schedules configured
+in the GUI. Each occurrence receives deterministic delay-only jitter. The next run is
+advanced atomically before synchronization starts, so restart or wake coalesces missed
+occurrences into one resumable run instead of a catch-up storm. Manual and paused
+schedules never start automatically. GUI and CLI clients can also forward collection
+sync, logical-object verification, and compaction to the daemon.
 
 The service integration in `packaging/` is opt-in and per-user. Do not install it as
 root or convert it into a system service: the daemon and library should have the same
@@ -70,11 +71,10 @@ making a network request:
 launchctl print "gui/$(id -u)/org.wikisync.WikiSyncer"
 ```
 
-The current daemon does not handle `SIGTERM` or `SIGINT`. A direct `launchctl bootout`
-or logout can therefore terminate it without the cooperative IPC shutdown path. This
-is a known Milestone 4 gap, not a graceful-shutdown guarantee. Before uninstalling,
-upgrading, or deliberately stopping the agent, request IPC shutdown, wait for the
-process to exit successfully, and only then unload its definition:
+`SIGTERM`, `SIGINT`, and the IPC `shutdown` command all request cooperative shutdown
+after the active operation completes. Before uninstalling, upgrading, or deliberately
+stopping the agent, request IPC shutdown, wait for the process to exit successfully,
+and only then unload its definition:
 
 ```sh
 /absolute/path/to/wikisyncd --library /absolute/path/to/library shutdown
@@ -112,9 +112,8 @@ systemctl --user enable --now wikisyncd.service
 The persistent service restarts only after an unexpected failure. `systemctl stop`
 invokes the local `shutdown` command, then waits for the main PID to exit and release
 its sockets. The combined stop sequence allows up to 60 seconds for the active
-request to finish. If that deadline expires, systemd may use an abrupt signal that
-the current daemon does not handle gracefully. Enable the optional health probe
-independently:
+request to finish; `SIGTERM` also enters the same cooperative path. Enable the
+optional health probe independently:
 
 ```sh
 install -m 600 /path/to/rendered/wikisyncd-health.service \
@@ -149,22 +148,26 @@ and checkpoints make interrupted work resumable. A checkpoint advances only afte
 the corresponding jobs are durably successful.
 
 After a long sleep or an offline interval, first run `health` and inspect daemon
-`status`. The presence of a running daemon does not prove that a synchronization ran
-or that no revisions were missed. Long-gap reconciliation exists in the sync engine,
-but schedule controls and an end-to-end service gate for sleep/wake behavior remain
-Milestone 4 work. Do not claim unattended sleep/wake acceptance until that gate passes.
+`status`. The durable schedule cursor starts at most one overdue run and moves its
+next occurrence into the future. Long-gap reconciliation then compares stable page
+IDs and captures intermediate revisions before advancing its checkpoint. The daemon
+applies bounded retry/backoff and a shared circuit breaker to transient source
+throttling. A real-daemon restart gate proves a retryable partial failure retains its
+old head/checkpoint, reuses the durable intermediate revision, and resumes the same
+run. Cooperative signal cancellation exits at bounded request/transaction boundaries
+and leaves the run resumable. Metered-network avoidance and explicit bandwidth and
+concurrency controls remain Milestone 4 work.
 
 Before shutting down the computer, moving the library, or taking a backup, request a
 cooperative stop and confirm both that the service manager has no daemon process and
 that `status` can no longer connect. A forced kill should be reserved for a daemon
-that cannot respond; durable sync jobs are designed to resume, but the current daemon
-does not provide a graceful signal path and an offline whole-library copy must not be
-taken while files are changing.
+that cannot respond; durable sync jobs are designed to resume, but an offline whole-
+library copy must not be taken while files are changing.
 
-An ordinary IPC shutdown removes both socket files. After a crash, the daemon fails
-closed rather than automatically unlinking a socket path, because unlinking after a
-racy ownership check could interfere with another process. If a subsequent start
-reports a stale socket, keep the service disabled, use service-manager state plus a
-tool such as `lsof` to establish that no process owns either socket, and retain a
-backup before removing only the confirmed stale socket files. Never treat socket
-removal as a repair for database or object-store errors.
+An ordinary IPC shutdown removes both socket files. After a crash, startup is
+serialized by `.wikisync-ipc.lock`; a nonresponsive Unix socket is removed only after
+its device/inode identity is rechecked under that advisory lock, and the replacement
+is bound before releasing the lock. Active sockets and unexpected paths are never
+removed. This coordinates WikiSyncer processes inside the owner-private library; it
+does not protect against a hostile process running as the same OS account. Never
+treat socket removal as a repair for database or object-store errors.

@@ -2,13 +2,17 @@
 //!
 //! The transport deliberately performs one bounded API response at a time. Callers
 //! persist [`RevisionContinuation`] between calls, which keeps long histories
-//! resumable without an unbounded in-memory paginator or hidden retry loop.
+//! resumable without an unbounded in-memory paginator. A configured [`RetryPolicy`]
+//! may repeat the same bounded request, but it has an explicit attempt ceiling and a
+//! shared circuit breaker for persistent retryable failures.
 
 use std::error::Error;
 use std::fmt;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use reqwest::{StatusCode, Url, redirect};
 use serde::Deserialize;
@@ -20,6 +24,95 @@ const DEFAULT_TITLES_PER_OPERATION: usize = 1_000;
 const DEFAULT_TITLES_PER_REQUEST: usize = 50;
 const DEFAULT_REVISIONS_PER_REQUEST: usize = 500;
 const DEFAULT_CATEGORY_MEMBERS_PER_REQUEST: usize = 500;
+const DEFAULT_RETRY_ATTEMPTS: usize = 4;
+const DEFAULT_CIRCUIT_FAILURE_THRESHOLD: usize = 3;
+
+static NEXT_JITTER_SEED: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+
+/// Bounded retry and circuit-breaker policy for one MediaWiki client.
+///
+/// Backoff uses equal jitter: each retry waits between half and all of its capped
+/// exponential delay. A server `Retry-After` value is used as a minimum delay when
+/// it is within `maximum_delay`, and is clamped to that safety ceiling otherwise.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetryPolicy {
+    maximum_attempts: NonZeroUsize,
+    initial_delay: Duration,
+    maximum_delay: Duration,
+    circuit_failure_threshold: NonZeroUsize,
+    circuit_open_duration: Duration,
+}
+
+impl RetryPolicy {
+    /// Creates a policy with an explicit total-attempt ceiling and delay bounds.
+    ///
+    /// `maximum_attempts` includes the first request. Therefore, one disables
+    /// request retries while retaining conservative error classification.
+    pub fn new(
+        maximum_attempts: usize,
+        initial_delay: Duration,
+        maximum_delay: Duration,
+    ) -> Result<Self, ConfigError> {
+        let maximum_attempts =
+            NonZeroUsize::new(maximum_attempts).ok_or(ConfigError::ZeroLimit {
+                name: "maximum retry attempts",
+            })?;
+        if initial_delay.is_zero() {
+            return Err(ConfigError::ZeroLimit {
+                name: "initial retry delay",
+            });
+        }
+        if maximum_delay.is_zero() {
+            return Err(ConfigError::ZeroLimit {
+                name: "maximum retry delay",
+            });
+        }
+        if initial_delay > maximum_delay {
+            return Err(ConfigError::InvalidRange {
+                smaller: "initial retry delay",
+                larger: "maximum retry delay",
+            });
+        }
+        Ok(Self {
+            maximum_attempts,
+            initial_delay,
+            maximum_delay,
+            circuit_failure_threshold: nonzero(DEFAULT_CIRCUIT_FAILURE_THRESHOLD),
+            circuit_open_duration: Duration::from_secs(60),
+        })
+    }
+
+    /// Configures how many exhausted retryable operations open the circuit and for
+    /// how long new operations are rejected without contacting the source.
+    pub fn with_circuit_breaker(
+        mut self,
+        failure_threshold: usize,
+        open_duration: Duration,
+    ) -> Result<Self, ConfigError> {
+        self.circuit_failure_threshold =
+            NonZeroUsize::new(failure_threshold).ok_or(ConfigError::ZeroLimit {
+                name: "circuit-breaker failure threshold",
+            })?;
+        if open_duration.is_zero() {
+            return Err(ConfigError::ZeroLimit {
+                name: "circuit-breaker open duration",
+            });
+        }
+        self.circuit_open_duration = open_duration;
+        Ok(self)
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_RETRY_ATTEMPTS,
+            Duration::from_millis(250),
+            Duration::from_secs(30),
+        )
+        .expect("default retry policy is valid")
+    }
+}
 
 /// Limits and source identity used by a [`MediaWikiClient`].
 #[derive(Clone, Debug)]
@@ -35,6 +128,7 @@ pub struct ClientConfig {
     titles_per_request: NonZeroUsize,
     revisions_per_request: NonZeroUsize,
     category_members_per_request: NonZeroUsize,
+    retry_policy: RetryPolicy,
 }
 
 impl ClientConfig {
@@ -64,6 +158,7 @@ impl ClientConfig {
             titles_per_request: nonzero(DEFAULT_TITLES_PER_REQUEST),
             revisions_per_request: nonzero(DEFAULT_REVISIONS_PER_REQUEST),
             category_members_per_request: nonzero(DEFAULT_CATEGORY_MEMBERS_PER_REQUEST),
+            retry_policy: RetryPolicy::default(),
         })
     }
 
@@ -124,6 +219,13 @@ impl ClientConfig {
         self.category_members_per_request = nonzero(count);
         Ok(self)
     }
+
+    /// Sets the bounded retry and shared circuit-breaker policy.
+    #[must_use]
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
+    }
 }
 
 fn nonzero(value: usize) -> NonZeroUsize {
@@ -180,6 +282,13 @@ pub enum ConfigError {
         /// Largest accepted value.
         maximum: usize,
     },
+    /// A lower retry-policy bound exceeded its corresponding upper bound.
+    InvalidRange {
+        /// Value required to be no greater than the other value.
+        smaller: &'static str,
+        /// Inclusive upper bound.
+        larger: &'static str,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -199,6 +308,9 @@ impl fmt::Display for ConfigError {
             Self::InvalidLimit { name, maximum } => {
                 write!(formatter, "{name} must be between 1 and {maximum}")
             }
+            Self::InvalidRange { smaller, larger } => {
+                write!(formatter, "{smaller} must not exceed {larger}")
+            }
         }
     }
 }
@@ -210,6 +322,75 @@ impl Error for ConfigError {}
 pub struct MediaWikiClient {
     config: ClientConfig,
     http: reqwest::Client,
+    circuit: Arc<CircuitBreaker>,
+}
+
+#[derive(Debug)]
+struct CircuitBreaker {
+    state: Mutex<CircuitState>,
+}
+
+#[derive(Debug)]
+struct CircuitState {
+    consecutive_failures: usize,
+    open_until: Option<Instant>,
+    jitter_state: u64,
+}
+
+impl CircuitBreaker {
+    fn new() -> Self {
+        let seed = NEXT_JITTER_SEED.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed);
+        Self {
+            state: Mutex::new(CircuitState {
+                consecutive_failures: 0,
+                open_until: None,
+                jitter_state: seed.max(1),
+            }),
+        }
+    }
+
+    fn before_request(&self) -> Result<(), ClientError> {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(open_until) = state.open_until {
+            let remaining = open_until.saturating_duration_since(now);
+            if !remaining.is_zero() {
+                return Err(ClientError::CircuitOpen {
+                    retry_after: remaining,
+                });
+            }
+            state.open_until = None;
+            state.consecutive_failures = 0;
+        }
+        Ok(())
+    }
+
+    fn record_success(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.consecutive_failures = 0;
+        state.open_until = None;
+    }
+
+    fn record_retryable_failure(&self, policy: RetryPolicy) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.consecutive_failures >= policy.circuit_failure_threshold.get() {
+            state.open_until = Instant::now().checked_add(policy.circuit_open_duration);
+        }
+    }
+
+    fn random_inclusive(&self, maximum: u64) -> u64 {
+        if maximum == 0 {
+            return 0;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut value = state.jitter_state;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        state.jitter_state = value.max(1);
+        value % maximum.saturating_add(1)
+    }
 }
 
 impl MediaWikiClient {
@@ -225,7 +406,11 @@ impl MediaWikiClient {
             .build()
             .map_err(ClientError::Transport)?;
 
-        Ok(Self { config, http })
+        Ok(Self {
+            config,
+            http,
+            circuit: Arc::new(CircuitBreaker::new()),
+        })
     }
 
     /// Resolves and normalizes a bounded set of titles, following redirects.
@@ -496,6 +681,7 @@ impl MediaWikiClient {
     where
         T: DeserializeOwned,
     {
+        self.circuit.before_request()?;
         let max_lag = self.config.max_lag_seconds.to_string();
         let mut all_params = Vec::with_capacity(params.len() + 3);
         all_params.extend_from_slice(params);
@@ -503,6 +689,37 @@ impl MediaWikiClient {
         all_params.push(("formatversion", "2"));
         all_params.push(("maxlag", &max_lag));
 
+        let policy = self.config.retry_policy;
+        for attempt in 1..=policy.maximum_attempts.get() {
+            match self.get_json_once(&all_params).await {
+                Ok(value) => {
+                    self.circuit.record_success();
+                    return Ok(value);
+                }
+                Err(error) if error.is_retryable() && attempt < policy.maximum_attempts.get() => {
+                    let delay = self.retry_delay(attempt, error.retry_after());
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => {
+                    if error.is_retryable() {
+                        self.circuit.record_retryable_failure(policy);
+                    } else {
+                        // A completed non-transient response breaks a sequence of
+                        // source-availability failures even though this operation
+                        // still returns its validation or protocol error.
+                        self.circuit.record_success();
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        unreachable!("retry policies always contain at least one attempt")
+    }
+
+    async fn get_json_once<T>(&self, all_params: &[(&str, &str)]) -> Result<T, ClientError>
+    where
+        T: DeserializeOwned,
+    {
         let mut response = self
             .http
             .get(self.config.endpoint.clone())
@@ -562,6 +779,24 @@ impl MediaWikiClient {
         }
 
         serde_json::from_value(value).map_err(ClientError::Decode)
+    }
+
+    fn retry_delay(&self, retry_number: usize, retry_after: Option<Duration>) -> Duration {
+        let policy = self.config.retry_policy;
+        let mut exponential = policy.initial_delay;
+        for _ in 1..retry_number {
+            exponential = exponential.saturating_mul(2).min(policy.maximum_delay);
+        }
+        exponential = exponential.min(policy.maximum_delay);
+
+        let exponential_nanos = u64::try_from(exponential.as_nanos()).unwrap_or(u64::MAX);
+        let minimum_jitter = exponential_nanos / 2;
+        let jitter_span = exponential_nanos.saturating_sub(minimum_jitter);
+        let jittered = Duration::from_nanos(
+            minimum_jitter.saturating_add(self.circuit.random_inclusive(jitter_span)),
+        );
+        let requested = retry_after.unwrap_or_default().min(policy.maximum_delay);
+        jittered.max(requested)
     }
 }
 
@@ -711,6 +946,12 @@ pub struct CategoryContinuation {
 /// A transport, bound, protocol, or remote API error.
 #[derive(Debug)]
 pub enum ClientError {
+    /// The shared client circuit is temporarily rejecting source requests after
+    /// repeated exhausted retryable operations.
+    CircuitOpen {
+        /// Remaining cool-down before a later operation may probe the source.
+        retry_after: Duration,
+    },
     /// The HTTP stack failed before a complete response was available.
     Transport(reqwest::Error),
     /// The response body was not valid for the expected API schema.
@@ -747,6 +988,7 @@ impl ClientError {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
+            Self::CircuitOpen { .. } => true,
             Self::Transport(error) => error.is_timeout() || error.is_connect(),
             Self::HttpStatus { status, .. } => matches!(
                 *status,
@@ -764,6 +1006,7 @@ impl ClientError {
     #[must_use]
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
+            Self::CircuitOpen { retry_after } => Some(*retry_after),
             Self::HttpStatus { retry_after, .. } => *retry_after,
             Self::Api(error) => error.retry_after,
             _ => None,
@@ -774,6 +1017,11 @@ impl ClientError {
 impl fmt::Display for ClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CircuitOpen { retry_after } => write!(
+                formatter,
+                "MediaWiki circuit breaker is open; retry after about {} ms",
+                retry_after.as_millis()
+            ),
             Self::Transport(error) => write!(formatter, "MediaWiki request failed: {error}"),
             Self::Decode(error) => write!(formatter, "invalid MediaWiki JSON response: {error}"),
             Self::HttpStatus { status, .. } => {
@@ -1079,5 +1327,43 @@ mod tests {
 
         let invalid = ClientError::InvalidResponse("bad identity");
         assert!(!invalid.is_retryable());
+    }
+
+    #[test]
+    fn retry_backoff_is_exponential_jittered_capped_and_server_aware() {
+        let policy = RetryPolicy::new(4, Duration::from_millis(8), Duration::from_millis(20))
+            .expect("retry policy");
+        let config = ClientConfig::new("http://127.0.0.1:9/api.php", "WikiSyncer/0.1")
+            .expect("loopback config")
+            .with_retry_policy(policy);
+        let client = MediaWikiClient::new(config).expect("client");
+
+        let first = client.retry_delay(1, None);
+        assert!((Duration::from_millis(4)..=Duration::from_millis(8)).contains(&first));
+        let second = client.retry_delay(2, None);
+        assert!((Duration::from_millis(8)..=Duration::from_millis(16)).contains(&second));
+        let capped = client.retry_delay(3, None);
+        assert!((Duration::from_millis(10)..=Duration::from_millis(20)).contains(&capped));
+        assert_eq!(
+            client.retry_delay(1, Some(Duration::from_secs(10))),
+            Duration::from_millis(20),
+            "Retry-After is a minimum delay clamped by the configured safety ceiling"
+        );
+    }
+
+    #[test]
+    fn retry_policy_rejects_zero_and_inverted_bounds() {
+        assert!(matches!(
+            RetryPolicy::new(0, Duration::from_millis(1), Duration::from_millis(2)),
+            Err(ConfigError::ZeroLimit { .. })
+        ));
+        assert!(matches!(
+            RetryPolicy::new(1, Duration::from_millis(2), Duration::from_millis(1)),
+            Err(ConfigError::InvalidRange { .. })
+        ));
+        assert!(matches!(
+            RetryPolicy::default().with_circuit_breaker(0, Duration::from_secs(1)),
+            Err(ConfigError::ZeroLimit { .. })
+        ));
     }
 }

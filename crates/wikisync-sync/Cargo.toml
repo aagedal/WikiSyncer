@@ -12,11 +12,11 @@ workspace = true
 
 [dependencies]
 sha1 = "0.10"
-wikisync-content = { path = "../wikisync-content" }
-wikisync-core = { path = "../wikisync-core" }
-wikisync-mediawiki = { path = "../wikisync-mediawiki" }
-wikisync-search = { path = "../wikisync-search" }
-wikisync-store = { path = "../wikisync-store" }
+wikisync-content = { version = "=0.1.0", path = "../wikisync-content" }
+wikisync-core = { version = "=0.1.0", path = "../wikisync-core" }
+wikisync-mediawiki = { version = "=0.1.0", path = "../wikisync-mediawiki" }
+wikisync-search = { version = "=0.1.0", path = "../wikisync-search" }
+wikisync-store = { version = "=0.1.0", path = "../wikisync-store" }
 
 [dev-dependencies]
 tempfile = "3.20"

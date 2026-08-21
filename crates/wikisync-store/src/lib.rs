@@ -16,7 +16,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use wikisync_core::{
     CollectionBudget, CollectionId, CollectionRemovalPolicy, CollectionRule, HistoryPolicy,
     InclusionReason, PageId, PageTitle, RevisionId, TitleSelection, UnixTimestamp, WikiId,
@@ -28,6 +30,7 @@ const MIGRATION_3: &str = include_str!("../migrations/0003_search.sql");
 const MIGRATION_4: &str = include_str!("../migrations/0004_sync.sql");
 const MIGRATION_5: &str = include_str!("../migrations/0005_packs.sql");
 const MIGRATION_6: &str = include_str!("../migrations/0006_collections.sql");
+const MIGRATION_7: &str = include_str!("../migrations/0007_schedules.sql");
 const OBJECT_DOMAIN: &[u8] = b"wikisync-object-v1\0";
 const DATABASE_NAME: &str = "library.sqlite3";
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
@@ -56,6 +59,18 @@ pub const DEFAULT_MAX_PACK_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Default amount of already-committed source time revisited by an update (5 minutes).
 pub const DEFAULT_SYNC_OVERLAP_SECONDS: u64 = 5 * 60;
+
+/// Smallest supported recurring interval (one minute).
+pub const MIN_SCHEDULE_INTERVAL_SECONDS: u32 = 60;
+
+/// Largest supported recurring interval (366 days).
+pub const MAX_SCHEDULE_INTERVAL_SECONDS: u32 = 366 * 24 * 60 * 60;
+
+/// Largest supported schedule jitter (one day).
+pub const MAX_SCHEDULE_JITTER_SECONDS: u32 = 24 * 60 * 60;
+
+/// Largest due-schedule page accepted by [`Library::due_schedules`].
+pub const MAX_DUE_SCHEDULES: u32 = 10_000;
 
 /// Configuration for a [`Library`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -451,6 +466,90 @@ impl CollectionEstimate {
     }
 }
 
+/// A validated recurring interval used by a collection schedule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScheduleInterval(u32);
+
+impl ScheduleInterval {
+    /// Creates an interval between one minute and 366 days, inclusive.
+    pub fn new(seconds: u32) -> Result<Self, StoreError> {
+        if !(MIN_SCHEDULE_INTERVAL_SECONDS..=MAX_SCHEDULE_INTERVAL_SECONDS).contains(&seconds) {
+            return Err(StoreError::InvalidConfig(
+                "schedule interval must be between 60 and 31,622,400 seconds",
+            ));
+        }
+        Ok(Self(seconds))
+    }
+
+    /// Returns the interval length in seconds.
+    #[must_use]
+    pub const fn seconds(self) -> u32 {
+        self.0
+    }
+}
+
+/// A validated UTC wall-clock time represented as seconds after midnight.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DailyUtcTime(u32);
+
+impl DailyUtcTime {
+    /// Creates a UTC time from a value in `00:00:00` through `23:59:59`.
+    pub fn new(seconds_after_midnight: u32) -> Result<Self, StoreError> {
+        if seconds_after_midnight >= 24 * 60 * 60 {
+            return Err(StoreError::InvalidConfig(
+                "daily UTC time must be less than 86,400 seconds after midnight",
+            ));
+        }
+        Ok(Self(seconds_after_midnight))
+    }
+
+    /// Returns the UTC wall-clock time as seconds after midnight.
+    #[must_use]
+    pub const fn seconds_after_midnight(self) -> u32 {
+        self.0
+    }
+}
+
+/// How a collection becomes eligible for scheduled synchronization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScheduleCadence {
+    /// The collection runs only after an explicit user request.
+    Manual,
+    /// The collection runs on a recurring elapsed-time interval.
+    Interval(ScheduleInterval),
+    /// The collection runs once per day at a UTC wall-clock time.
+    DailyUtc(DailyUtcTime),
+}
+
+impl ScheduleCadence {
+    /// Creates a validated interval cadence.
+    pub fn interval(seconds: u32) -> Result<Self, StoreError> {
+        ScheduleInterval::new(seconds).map(Self::Interval)
+    }
+
+    /// Creates a validated daily UTC cadence.
+    pub fn daily_utc(seconds_after_midnight: u32) -> Result<Self, StoreError> {
+        DailyUtcTime::new(seconds_after_midnight).map(Self::DailyUtc)
+    }
+}
+
+/// Durable scheduling state for one collection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollectionSchedule {
+    /// Collection controlled by this schedule.
+    pub collection_id: CollectionId,
+    /// Configured cadence.
+    pub cadence: ScheduleCadence,
+    /// Maximum scheduler-selected delay after a nominal occurrence.
+    pub jitter_seconds: u32,
+    /// Whether automatic starts are temporarily disabled.
+    pub paused: bool,
+    /// Durable next eligible instant, absent for manual cadence.
+    pub next_run_at: Option<u64>,
+    /// Most recent instant atomically claimed for an automatic start.
+    pub last_started_at: Option<u64>,
+}
+
 /// Logical object metadata used by paginated full-integrity verification.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogicalObject {
@@ -782,12 +881,13 @@ struct RecordedPack {
     object_count: u64,
 }
 
-/// One WikiSyncer library and its writer connection.
+/// One WikiSyncer library and its SQLite connection.
 #[derive(Debug)]
 pub struct Library {
     root: PathBuf,
     connection: Connection,
     config: StoreConfig,
+    read_only: bool,
 }
 
 fn prepare_library_directories(root: &Path) -> io::Result<()> {
@@ -843,10 +943,67 @@ fn restrict_sqlite_file_permissions(database_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn immutable_sqlite_uri(database_path: &Path) -> Result<String, StoreError> {
+    let absolute = fs::canonicalize(database_path)?;
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt as _;
+        absolute.as_os_str().as_bytes()
+    };
+    #[cfg(not(unix))]
+    let path_text = absolute.to_string_lossy();
+    #[cfg(not(unix))]
+    let bytes = path_text.as_bytes();
+
+    let mut uri = String::from("file:");
+    for byte in bytes {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'/' | b'-' | b'.' | b'_' | b'~') {
+            uri.push(char::from(*byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(uri, "%{byte:02X}").expect("writing to a string cannot fail");
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    Ok(uri)
+}
+
 impl Library {
     /// Opens or creates a library using default object bounds.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, StoreError> {
         Self::open_with_config(root, StoreConfig::default())
+    }
+
+    /// Opens an existing library without changing its database or filesystem layout.
+    ///
+    /// The SQLite connection is both operating-system read-only and `query_only`.
+    /// This path does not create directories or files, apply migrations, change file
+    /// permissions, or alter persistent journal and synchronization settings.
+    pub fn open_read_only(root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let root = root.as_ref().to_path_buf();
+        let database_path = root.join(DATABASE_NAME);
+        let metadata = fs::symlink_metadata(&database_path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StoreError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "library database must be an existing regular file",
+            )));
+        }
+
+        let database_uri = immutable_sqlite_uri(&database_path)?;
+        let connection = Connection::open_with_flags(
+            database_uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        connection.pragma_update(None, "query_only", true)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+
+        Ok(Self {
+            root,
+            connection,
+            config: StoreConfig::default(),
+            read_only: true,
+        })
     }
 
     /// Opens or creates a library, configures SQLite, and applies migrations.
@@ -871,7 +1028,16 @@ impl Library {
             root,
             connection,
             config,
+            read_only: false,
         })
+    }
+
+    fn ensure_writable(&self) -> Result<(), StoreError> {
+        if self.read_only {
+            Err(StoreError::ReadOnly)
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns the library root directory.
@@ -979,6 +1145,13 @@ impl Library {
             |row| row.get(0),
         )?;
         let collection_id: CollectionId = sql_id(raw_id, "invalid collection ID")?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO collection_schedules (
+                collection_id, cadence_kind, cadence_seconds, jitter_seconds,
+                paused, next_run_at, last_started_at, updated_at
+             ) VALUES (?1, 'manual', NULL, 0, 0, NULL, NULL, ?2)",
+            params![to_sql_integer(collection_id.get())?, now],
+        )?;
         self.connection.execute(
             "INSERT OR IGNORE INTO collection_configuration (
                 collection_id, rule_kind, category_title, category_recursion_depth,
@@ -1545,6 +1718,169 @@ impl Library {
         })
     }
 
+    /// Creates or replaces the durable schedule for a collection.
+    ///
+    /// Recurring cadences require a persisted next-run instant so a daemon can
+    /// recover after restart or sleep. Manual cadence requires no next run or jitter.
+    pub fn set_collection_schedule(
+        &mut self,
+        collection_id: CollectionId,
+        cadence: ScheduleCadence,
+        jitter_seconds: u32,
+        paused: bool,
+        next_run_at: Option<u64>,
+    ) -> Result<CollectionSchedule, StoreError> {
+        validate_schedule_configuration(cadence, jitter_seconds, next_run_at)?;
+        let raw_collection_id = to_sql_integer(collection_id.get())?;
+        let raw_next_run_at = next_run_at.map(to_sql_integer).transpose()?;
+        let (cadence_kind, cadence_seconds) = schedule_cadence_values(cadence);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS (SELECT 1 FROM collections WHERE collection_id = ?1)",
+            [raw_collection_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::CollectionNotFound(collection_id));
+        }
+        transaction.execute(
+            "INSERT INTO collection_schedules (
+                collection_id, cadence_kind, cadence_seconds, jitter_seconds,
+                paused, next_run_at, last_started_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)
+             ON CONFLICT(collection_id) DO UPDATE SET
+                cadence_kind = excluded.cadence_kind,
+                cadence_seconds = excluded.cadence_seconds,
+                jitter_seconds = excluded.jitter_seconds,
+                paused = excluded.paused,
+                next_run_at = excluded.next_run_at,
+                updated_at = excluded.updated_at",
+            params![
+                raw_collection_id,
+                cadence_kind,
+                cadence_seconds,
+                jitter_seconds,
+                paused,
+                raw_next_run_at,
+                unix_time()?,
+            ],
+        )?;
+        transaction.commit()?;
+        self.collection_schedule(collection_id)?
+            .ok_or(StoreError::CorruptMetadata(
+                "new collection schedule was not found",
+            ))
+    }
+
+    /// Reads the durable schedule for one collection.
+    pub fn collection_schedule(
+        &self,
+        collection_id: CollectionId,
+    ) -> Result<Option<CollectionSchedule>, StoreError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT collection_id, cadence_kind, cadence_seconds, jitter_seconds,
+                        paused, next_run_at, last_started_at
+                 FROM collection_schedules WHERE collection_id = ?1",
+                [to_sql_integer(collection_id.get())?],
+                schedule_row,
+            )
+            .optional()?;
+        row.map(stored_schedule).transpose()
+    }
+
+    /// Lists all configured collection schedules in stable collection order.
+    pub fn schedules(&self) -> Result<Vec<CollectionSchedule>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT collection_id, cadence_kind, cadence_seconds, jitter_seconds,
+                    paused, next_run_at, last_started_at
+             FROM collection_schedules ORDER BY collection_id",
+        )?;
+        let rows = statement
+            .query_map([], schedule_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(stored_schedule).collect()
+    }
+
+    /// Lists a bounded page of unpaused schedules due at or before `now`.
+    pub fn due_schedules(
+        &self,
+        now: u64,
+        limit: u32,
+    ) -> Result<Vec<CollectionSchedule>, StoreError> {
+        if limit == 0 || limit > MAX_DUE_SCHEDULES {
+            return Err(StoreError::InvalidConfig(
+                "due schedule limit must be between 1 and 10,000",
+            ));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT collection_id, cadence_kind, cadence_seconds, jitter_seconds,
+                    paused, next_run_at, last_started_at
+             FROM collection_schedules
+             WHERE paused = 0 AND cadence_kind != 'manual' AND next_run_at <= ?1
+             ORDER BY next_run_at, collection_id LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![to_sql_integer(now)?, limit], schedule_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(stored_schedule).collect()
+    }
+
+    /// Atomically claims one due occurrence and advances its durable next run.
+    ///
+    /// `expected_next_run_at` is a compare-and-swap token obtained from
+    /// [`Self::due_schedules`]. Exactly one caller can advance that occurrence. The
+    /// replacement must be in the future relative to `started_at`, which lets a
+    /// restarted daemon skip missed occurrences without immediately duplicating a
+    /// start already durably claimed before a crash.
+    pub fn claim_due_schedule(
+        &mut self,
+        collection_id: CollectionId,
+        expected_next_run_at: u64,
+        started_at: u64,
+        next_run_at: u64,
+    ) -> Result<Option<CollectionSchedule>, StoreError> {
+        if next_run_at <= started_at {
+            return Err(StoreError::InvalidConfig(
+                "advanced schedule time must be later than its claim time",
+            ));
+        }
+        let raw_collection_id = to_sql_integer(collection_id.get())?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE collection_schedules
+             SET last_started_at = ?1, next_run_at = ?2, updated_at = ?1
+             WHERE collection_id = ?3 AND paused = 0
+               AND cadence_kind != 'manual'
+               AND next_run_at = ?4 AND next_run_at <= ?1",
+            params![
+                to_sql_integer(started_at)?,
+                to_sql_integer(next_run_at)?,
+                raw_collection_id,
+                to_sql_integer(expected_next_run_at)?,
+            ],
+        )?;
+        let claimed = if changed == 1 {
+            let row = transaction.query_row(
+                "SELECT collection_id, cadence_kind, cadence_seconds, jitter_seconds,
+                        paused, next_run_at, last_started_at
+                 FROM collection_schedules WHERE collection_id = ?1",
+                [raw_collection_id],
+                schedule_row,
+            )?;
+            Some(stored_schedule(row)?)
+        } else {
+            None
+        };
+        transaction.commit()?;
+        Ok(claimed)
+    }
+
     /// Starts a synchronization run or resumes matching unfinished work.
     ///
     /// A new update starts at the persisted checkpoint minus its overlap. Recovering
@@ -1977,6 +2313,33 @@ impl Library {
         }
         let mut statement = self.connection.prepare(&format!(
             "{} ORDER BY runs.run_id DESC LIMIT ?1",
+            sync_run_status_query()
+        ))?;
+        let rows = statement
+            .query_map([limit], sync_run_status_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(stored_sync_run_status).collect()
+    }
+
+    /// Returns bounded unfinished collection reconciliations, oldest first.
+    ///
+    /// The daemon uses this to resume durable scheduled or interrupted work before
+    /// claiming a later schedule occurrence. Source-wide and bootstrap runs are not
+    /// included because they require a different application operation.
+    pub fn running_collection_reconciliations(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<SyncRunStatus>, StoreError> {
+        if !(1..=100).contains(&limit) {
+            return Err(StoreError::InvalidConfig(
+                "sync status limit must be between 1 and 100",
+            ));
+        }
+        let mut statement = self.connection.prepare(&format!(
+            "{} WHERE runs.state = 'running'
+                 AND runs.run_kind = 'reconciliation'
+                 AND runs.collection_id IS NOT NULL
+             ORDER BY runs.run_id ASC LIMIT ?1",
             sync_run_status_query()
         ))?;
         let rows = statement
@@ -2664,6 +3027,7 @@ impl Library {
         expected_length: u64,
         mut reader: impl Read,
     ) -> Result<StoredObject, StoreError> {
+        self.ensure_writable()?;
         if expected_length > self.config.max_object_bytes {
             return Err(StoreError::ObjectTooLarge {
                 limit: self.config.max_object_bytes,
@@ -2790,6 +3154,7 @@ impl Library {
     /// packed location. Existing loose representations remain available until an
     /// explicit pruning pass marks them obsolete.
     pub fn pack_loose_objects(&mut self) -> Result<Option<PackSummary>, StoreError> {
+        self.ensure_writable()?;
         let candidate_ids = {
             let mut statement = self.connection.prepare(
                 "SELECT loose.object_id
@@ -2846,6 +3211,7 @@ impl Library {
     /// The previous representation remains active until [`Self::retire_pack`] is
     /// called, so interruption cannot strand an object between generations.
     pub fn repack_pack(&mut self, pack_id: &str) -> Result<PackSummary, StoreError> {
+        self.ensure_writable()?;
         let recorded = self.verify_recorded_pack(pack_id)?;
         if recorded.object_count > u64::from(self.config.max_pack_objects) {
             return Err(StoreError::PackLimitExceeded);
@@ -2892,6 +3258,7 @@ impl Library {
         &mut self,
         sources: &[(ObjectId, ObjectKind, Vec<u8>)],
     ) -> Result<PackSummary, StoreError> {
+        self.ensure_writable()?;
         let raw_generation: i64 = self.connection.query_row(
             "SELECT COALESCE(MAX(generation), 0) + 1 FROM packs",
             [],
@@ -3055,6 +3422,7 @@ impl Library {
     /// The metadata transition commits first, so interruption can leave only harmless
     /// orphaned loose files and never remove the active packed representation.
     pub fn prune_packed_loose_objects(&mut self, pack_id: &str) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
         self.verify_recorded_pack(pack_id)?;
         let paths = {
             let mut statement = self.connection.prepare(
@@ -3101,6 +3469,7 @@ impl Library {
     /// Retires and removes one pack after verifying another representation of every
     /// object. This is the final, separately crash-safe phase of repacking.
     pub fn retire_pack(&mut self, pack_id: &str) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
         let retiring = self.recorded_pack(pack_id)?;
         let object_ids = {
             let mut statement = self.connection.prepare(
@@ -3511,6 +3880,15 @@ impl Library {
     }
 }
 
+type ScheduleRow = (
+    i64,
+    String,
+    Option<i64>,
+    i64,
+    bool,
+    Option<i64>,
+    Option<i64>,
+);
 type SyncJobRow = (i64, i64, String, String, Option<String>, String, i64, bool);
 type SyncCheckpointRow = (
     i64,
@@ -3541,6 +3919,77 @@ type SyncRunStatusRow = (
     Option<bool>,
     Option<i64>,
 );
+
+fn schedule_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+fn stored_schedule(row: ScheduleRow) -> Result<CollectionSchedule, StoreError> {
+    let (
+        collection_id,
+        cadence_kind,
+        cadence_seconds,
+        jitter_seconds,
+        paused,
+        next_run_at,
+        last_started_at,
+    ) = row;
+    let cadence = match cadence_kind.as_str() {
+        "manual" if cadence_seconds.is_none() => ScheduleCadence::Manual,
+        "interval" => {
+            let seconds = cadence_seconds.ok_or(StoreError::CorruptMetadata(
+                "interval schedule lacks cadence seconds",
+            ))?;
+            let seconds = u32::try_from(seconds)
+                .map_err(|_| StoreError::CorruptMetadata("invalid schedule interval"))?;
+            ScheduleCadence::Interval(
+                ScheduleInterval::new(seconds)
+                    .map_err(|_| StoreError::CorruptMetadata("invalid schedule interval"))?,
+            )
+        }
+        "daily-utc" => {
+            let seconds = cadence_seconds
+                .ok_or(StoreError::CorruptMetadata("daily schedule lacks UTC time"))?;
+            let seconds = u32::try_from(seconds)
+                .map_err(|_| StoreError::CorruptMetadata("invalid daily UTC time"))?;
+            ScheduleCadence::DailyUtc(
+                DailyUtcTime::new(seconds)
+                    .map_err(|_| StoreError::CorruptMetadata("invalid daily UTC time"))?,
+            )
+        }
+        "manual" => {
+            return Err(StoreError::CorruptMetadata(
+                "manual schedule has cadence seconds",
+            ));
+        }
+        _ => return Err(StoreError::CorruptMetadata("unknown schedule cadence")),
+    };
+    let jitter_seconds = u32::try_from(jitter_seconds)
+        .map_err(|_| StoreError::CorruptMetadata("invalid schedule jitter"))?;
+    let next_run_at = next_run_at
+        .map(|value| sql_u64(value, "invalid next schedule time"))
+        .transpose()?;
+    validate_schedule_configuration(cadence, jitter_seconds, next_run_at)
+        .map_err(|_| StoreError::CorruptMetadata("invalid schedule configuration"))?;
+    Ok(CollectionSchedule {
+        collection_id: sql_id(collection_id, "invalid collection ID in schedule")?,
+        cadence,
+        jitter_seconds,
+        paused,
+        next_run_at,
+        last_started_at: last_started_at
+            .map(|value| sql_u64(value, "invalid last schedule start time"))
+            .transpose()?,
+    })
+}
 
 fn sync_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncJobRow> {
     Ok((
@@ -4533,6 +4982,41 @@ fn validate_inclusion_reason(
     }
 }
 
+fn schedule_cadence_values(cadence: ScheduleCadence) -> (&'static str, Option<u32>) {
+    match cadence {
+        ScheduleCadence::Manual => ("manual", None),
+        ScheduleCadence::Interval(interval) => ("interval", Some(interval.seconds())),
+        ScheduleCadence::DailyUtc(time) => ("daily-utc", Some(time.seconds_after_midnight())),
+    }
+}
+
+fn validate_schedule_configuration(
+    cadence: ScheduleCadence,
+    jitter_seconds: u32,
+    next_run_at: Option<u64>,
+) -> Result<(), StoreError> {
+    if jitter_seconds > MAX_SCHEDULE_JITTER_SECONDS {
+        return Err(StoreError::InvalidConfig(
+            "schedule jitter must not exceed 86,400 seconds",
+        ));
+    }
+    match cadence {
+        ScheduleCadence::Manual if jitter_seconds != 0 || next_run_at.is_some() => Err(
+            StoreError::InvalidConfig("manual schedule must not have jitter or a next run"),
+        ),
+        ScheduleCadence::Manual => Ok(()),
+        ScheduleCadence::Interval(interval) if jitter_seconds > interval.seconds() => Err(
+            StoreError::InvalidConfig("schedule jitter must not exceed its interval"),
+        ),
+        ScheduleCadence::Interval(_) | ScheduleCadence::DailyUtc(_) if next_run_at.is_none() => {
+            Err(StoreError::InvalidConfig(
+                "recurring schedule requires a next run time",
+            ))
+        }
+        ScheduleCadence::Interval(_) | ScheduleCadence::DailyUtc(_) => Ok(()),
+    }
+}
+
 fn migrate(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -4542,7 +5026,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
          ) STRICT;",
     )?;
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > 6 {
+    if version > 7 {
         return Err(StoreError::UnsupportedSchemaVersion(version));
     }
     if version == 0 {
@@ -4616,6 +5100,18 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
         transaction.pragma_update(None, "user_version", 6)?;
         transaction.commit()?;
     }
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 6 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(MIGRATION_7)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (7, 'schedules', ?1)",
+            [unix_time()?],
+        )?;
+        transaction.pragma_update(None, "user_version", 7)?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -4655,6 +5151,8 @@ pub enum StoreError {
     Io(io::Error),
     /// SQLite failure.
     Sqlite(rusqlite::Error),
+    /// A mutating object-store operation was attempted through a read-only library.
+    ReadOnly,
     /// A configuration value was invalid.
     InvalidConfig(&'static str),
     /// An object exceeded the configured bound.
@@ -4764,6 +5262,7 @@ impl fmt::Display for StoreError {
         match self {
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
             Self::Sqlite(error) => write!(formatter, "SQLite error: {error}"),
+            Self::ReadOnly => formatter.write_str("library was opened read-only"),
             Self::InvalidConfig(message) => formatter.write_str(message),
             Self::ObjectTooLarge { limit, actual } => {
                 write!(
@@ -4913,6 +5412,166 @@ mod tests {
         (directory, library)
     }
 
+    fn filesystem_snapshot(root: &Path) -> Vec<(PathBuf, bool, u32, [u8; 32])> {
+        fn visit(root: &Path, path: &Path, entries: &mut Vec<(PathBuf, bool, u32, [u8; 32])>) {
+            let metadata = fs::symlink_metadata(path).expect("snapshot metadata");
+            #[cfg(unix)]
+            let mode = metadata.permissions().mode() & 0o777;
+            #[cfg(not(unix))]
+            let mode = u32::from(metadata.permissions().readonly());
+            let relative = path
+                .strip_prefix(root)
+                .expect("snapshot path below root")
+                .to_path_buf();
+            let is_directory = metadata.is_dir();
+            let checksum = if metadata.is_file() {
+                *blake3::hash(&fs::read(path).expect("snapshot file")).as_bytes()
+            } else {
+                [0; 32]
+            };
+            entries.push((relative, is_directory, mode, checksum));
+            if is_directory {
+                let mut children = fs::read_dir(path)
+                    .expect("snapshot directory")
+                    .map(|entry| entry.expect("snapshot entry").path())
+                    .collect::<Vec<_>>();
+                children.sort();
+                for child in children {
+                    visit(root, &child, entries);
+                }
+            }
+        }
+
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    #[test]
+    fn read_only_open_requires_an_existing_database_without_creating_it() {
+        let directory = tempfile::tempdir().expect("temporary parent");
+        let root = directory.path().join("missing-library");
+        fs::create_dir(&root).expect("empty library root");
+        let before = filesystem_snapshot(&root);
+
+        let error = Library::open_read_only(&root).expect_err("missing database must fail");
+        assert!(matches!(error, StoreError::Io(error) if error.kind() == io::ErrorKind::NotFound));
+        assert_eq!(filesystem_snapshot(&root), before);
+        assert!(!root.join(DATABASE_NAME).exists());
+    }
+
+    #[test]
+    fn read_only_open_does_not_migrate_an_old_schema_or_create_layout() {
+        let directory = tempfile::tempdir().expect("temporary library");
+        let database = directory.path().join(DATABASE_NAME);
+        let connection = Connection::open(&database).expect("open version one database");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY NOT NULL CHECK (version > 0),
+                    name TEXT NOT NULL,
+                    applied_at INTEGER NOT NULL
+                 ) STRICT;",
+            )
+            .expect("migration table");
+        connection
+            .execute_batch(MIGRATION_1)
+            .expect("migration one");
+        connection
+            .execute(
+                "INSERT INTO schema_migrations (version, name, applied_at)
+                 VALUES (1, 'initial', 0)",
+                [],
+            )
+            .expect("migration record");
+        connection
+            .pragma_update(None, "user_version", 1)
+            .expect("schema version");
+        drop(connection);
+        let before = filesystem_snapshot(directory.path());
+
+        let library = Library::open_read_only(directory.path()).expect("read old schema");
+        assert_eq!(library.schema_version().expect("schema version"), 1);
+        assert_eq!(migration_count(&library), 1);
+        let query_only: bool = library
+            .connection()
+            .query_row("PRAGMA query_only", [], |row| row.get(0))
+            .expect("query-only state");
+        assert!(query_only);
+        drop(library);
+
+        assert_eq!(filesystem_snapshot(directory.path()), before);
+        let connection = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("inspect old database");
+        let revision_table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = 'revisions')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect old schema");
+        assert!(!revision_table_exists);
+    }
+
+    #[test]
+    fn read_only_open_preserves_initialized_files_while_reads_work_and_writes_fail() {
+        let (directory, mut writer) = test_library();
+        let wiki_id = writer
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let object = writer
+            .put_bytes(ObjectKind::Wikitext, b"read-only canonical bytes")
+            .expect("store object");
+        drop(writer);
+
+        #[cfg(unix)]
+        {
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o750))
+                .expect("set distinctive root permissions");
+            fs::set_permissions(
+                directory.path().join(DATABASE_NAME),
+                fs::Permissions::from_mode(0o640),
+            )
+            .expect("set distinctive database permissions");
+        }
+        let before = filesystem_snapshot(directory.path());
+
+        let mut library = Library::open_read_only(directory.path()).expect("read-only library");
+        assert_eq!(library.schema_version().expect("schema version"), 7);
+        assert_eq!(library.wikis().expect("wikis")[0].wiki_id, wiki_id);
+        assert_eq!(library.logical_object_count().expect("object count"), 1);
+        assert_eq!(
+            library
+                .logical_objects_after(None, 1)
+                .expect("bounded objects")[0]
+                .object,
+            object
+        );
+        assert!(library.contains(object.id).expect("contains object"));
+        assert_eq!(
+            library.read_object(object.id).expect("read object"),
+            b"read-only canonical bytes"
+        );
+
+        assert!(matches!(
+            library.register_wiki("https://example.org/w/api.php", "example"),
+            Err(StoreError::Sqlite(_))
+        ));
+        assert!(matches!(
+            library.put_bytes(ObjectKind::Wikitext, b"must not be installed"),
+            Err(StoreError::ReadOnly)
+        ));
+        drop(library);
+
+        assert_eq!(filesystem_snapshot(directory.path()), before);
+        let library = Library::open_read_only(directory.path()).expect("reopen read-only library");
+        assert_eq!(library.wikis().expect("unchanged wikis").len(), 1);
+        assert_eq!(
+            library.logical_object_count().expect("unchanged objects"),
+            1
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn opening_a_library_enforces_user_only_permissions() {
@@ -4979,13 +5638,13 @@ mod tests {
     #[test]
     fn migration_is_applied_once_and_keeps_locations_separate() {
         let (directory, library) = test_library();
-        assert_eq!(library.schema_version().expect("schema version"), 6);
-        assert_eq!(migration_count(&library), 6);
+        assert_eq!(library.schema_version().expect("schema version"), 7);
+        assert_eq!(migration_count(&library), 7);
 
         drop(library);
         let reopened = Library::open(directory.path()).expect("reopen library");
-        assert_eq!(reopened.schema_version().expect("schema version"), 6);
-        assert_eq!(migration_count(&reopened), 6);
+        assert_eq!(reopened.schema_version().expect("schema version"), 7);
+        assert_eq!(migration_count(&reopened), 7);
 
         let logical_columns: Vec<String> = reopened
             .connection()
@@ -5045,8 +5704,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 6);
-        assert_eq!(migration_count(&upgraded), 6);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 7);
+        assert_eq!(migration_count(&upgraded), 7);
         assert_eq!(table_count(&upgraded, "revisions"), 0);
     }
 
@@ -5082,8 +5741,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 6);
-        assert_eq!(migration_count(&upgraded), 6);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 7);
+        assert_eq!(migration_count(&upgraded), 7);
         assert_eq!(table_count(&upgraded, "search_documents"), 0);
         let fts_definition: String = upgraded
             .connection()
@@ -5095,6 +5754,184 @@ mod tests {
             .expect("FTS schema");
         assert!(fts_definition.contains("content=''"));
         assert!(fts_definition.contains("contentless_delete=1"));
+    }
+
+    #[test]
+    fn schedule_types_and_configuration_are_bounded() {
+        assert!(ScheduleCadence::interval(MIN_SCHEDULE_INTERVAL_SECONDS).is_ok());
+        assert!(ScheduleCadence::interval(MAX_SCHEDULE_INTERVAL_SECONDS).is_ok());
+        assert!(ScheduleCadence::interval(MIN_SCHEDULE_INTERVAL_SECONDS - 1).is_err());
+        assert!(ScheduleCadence::daily_utc(86_399).is_ok());
+        assert!(ScheduleCadence::daily_utc(86_400).is_err());
+
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Scheduled")
+            .expect("create collection");
+        assert!(matches!(
+            library
+                .set_collection_schedule(collection_id, ScheduleCadence::Manual, 1, false, None,),
+            Err(StoreError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            library.set_collection_schedule(
+                collection_id,
+                ScheduleCadence::interval(60).expect("interval"),
+                61,
+                false,
+                Some(100),
+            ),
+            Err(StoreError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            library.set_collection_schedule(
+                collection_id,
+                ScheduleCadence::daily_utc(0).expect("daily"),
+                0,
+                false,
+                None,
+            ),
+            Err(StoreError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            library.due_schedules(100, 0),
+            Err(StoreError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn schedules_persist_and_due_listing_is_ordered_and_bounded() {
+        let (directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let first = library
+            .create_explicit_collection(wiki_id, "First")
+            .expect("first collection");
+        let second = library
+            .create_explicit_collection(wiki_id, "Second")
+            .expect("second collection");
+        let manual = library
+            .create_explicit_collection(wiki_id, "Manual")
+            .expect("manual collection");
+        library
+            .set_collection_schedule(
+                first,
+                ScheduleCadence::interval(300).expect("interval"),
+                30,
+                false,
+                Some(200),
+            )
+            .expect("first schedule");
+        library
+            .set_collection_schedule(
+                second,
+                ScheduleCadence::daily_utc(7 * 60 * 60).expect("daily"),
+                600,
+                false,
+                Some(100),
+            )
+            .expect("second schedule");
+        library
+            .set_collection_schedule(manual, ScheduleCadence::Manual, 0, false, None)
+            .expect("manual schedule");
+
+        assert_eq!(
+            library
+                .due_schedules(200, 1)
+                .expect("bounded due schedules")
+                .iter()
+                .map(|schedule| schedule.collection_id)
+                .collect::<Vec<_>>(),
+            [second]
+        );
+        assert_eq!(
+            library
+                .due_schedules(200, 10)
+                .expect("due schedules")
+                .iter()
+                .map(|schedule| schedule.collection_id)
+                .collect::<Vec<_>>(),
+            [second, first]
+        );
+        drop(library);
+
+        let reopened = Library::open(directory.path()).expect("reopen library");
+        assert_eq!(reopened.schedules().expect("list schedules").len(), 3);
+        assert_eq!(
+            reopened
+                .collection_schedule(first)
+                .expect("read schedule")
+                .expect("first schedule"),
+            CollectionSchedule {
+                collection_id: first,
+                cadence: ScheduleCadence::interval(300).expect("interval"),
+                jitter_seconds: 30,
+                paused: false,
+                next_run_at: Some(200),
+                last_started_at: None,
+            }
+        );
+    }
+
+    #[test]
+    fn due_schedule_claim_is_atomic_and_survives_restart_and_sleep() {
+        let (directory, mut first_writer) = test_library();
+        let wiki_id = first_writer
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = first_writer
+            .create_explicit_collection(wiki_id, "Atomic")
+            .expect("create collection");
+        first_writer
+            .set_collection_schedule(
+                collection_id,
+                ScheduleCadence::interval(300).expect("interval"),
+                10,
+                false,
+                Some(100),
+            )
+            .expect("set schedule");
+        let mut second_writer = Library::open(directory.path()).expect("second writer");
+        assert_eq!(
+            second_writer
+                .due_schedules(10_000, 1)
+                .expect("observe due schedule")[0]
+                .next_run_at,
+            Some(100)
+        );
+
+        let claimed = first_writer
+            .claim_due_schedule(collection_id, 100, 10_000, 10_300)
+            .expect("claim due schedule")
+            .expect("won claim");
+        assert_eq!(claimed.last_started_at, Some(10_000));
+        assert_eq!(claimed.next_run_at, Some(10_300));
+        assert!(
+            second_writer
+                .claim_due_schedule(collection_id, 100, 10_000, 10_300)
+                .expect("lose stale claim")
+                .is_none()
+        );
+        drop(first_writer);
+        drop(second_writer);
+
+        let reopened = Library::open(directory.path()).expect("reopen library");
+        let recovered = reopened
+            .collection_schedule(collection_id)
+            .expect("read recovered schedule")
+            .expect("persisted schedule");
+        assert_eq!(recovered.last_started_at, Some(10_000));
+        assert_eq!(recovered.next_run_at, Some(10_300));
+        assert!(
+            reopened
+                .due_schedules(10_299, 1)
+                .expect("not due yet")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5948,6 +6785,61 @@ mod tests {
             .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Update, 1_200)
             .expect("next overlap run");
         assert_eq!(next.status.window_start, 940);
+    }
+
+    #[test]
+    fn running_collection_reconciliations_are_bounded_and_oldest_first() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let first_collection = library
+            .create_explicit_collection(wiki_id, "First")
+            .expect("create first collection");
+        let second_collection = library
+            .create_explicit_collection(wiki_id, "Second")
+            .expect("create second collection");
+        let first = library
+            .start_or_resume_sync_run(
+                wiki_id,
+                Some(first_collection),
+                SyncRunKind::Reconciliation,
+                100,
+            )
+            .expect("start first reconciliation");
+        let second = library
+            .start_or_resume_sync_run(
+                wiki_id,
+                Some(second_collection),
+                SyncRunKind::Reconciliation,
+                101,
+            )
+            .expect("start second reconciliation");
+        library
+            .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Update, 102)
+            .expect("start source update");
+
+        let running = library
+            .running_collection_reconciliations(100)
+            .expect("list running reconciliations");
+        assert_eq!(
+            running
+                .iter()
+                .map(|status| status.run_id)
+                .collect::<Vec<_>>(),
+            vec![first.status.run_id, second.status.run_id]
+        );
+        assert_eq!(
+            library
+                .running_collection_reconciliations(1)
+                .expect("bounded list")[0]
+                .run_id,
+            first.status.run_id
+        );
+        assert!(matches!(
+            library.running_collection_reconciliations(0),
+            Err(StoreError::InvalidConfig(_))
+        ));
     }
 
     #[test]

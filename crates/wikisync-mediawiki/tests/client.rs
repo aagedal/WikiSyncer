@@ -1,11 +1,12 @@
 mod support;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use support::{FixtureResponse, FixtureServer};
 use wikisync_core::{PageId, PageTitle};
 use wikisync_mediawiki::{
-    CategoryMemberKind, ClientConfig, ClientError, MediaWikiClient, RevisionOrder, TitleResolution,
+    CategoryMemberKind, ClientConfig, ClientError, MediaWikiClient, RetryPolicy, RevisionOrder,
+    TitleResolution,
 };
 
 const TITLE_RESOLUTION: &str = include_str!("../../../fixtures/mediawiki/title-resolution.json");
@@ -25,6 +26,24 @@ fn fixture_client(server: &FixtureServer) -> MediaWikiClient {
         "WikiSyncer/0.1 fixture-tests (https://github.com/aagedal/WikiSyncer)",
     )
     .expect("valid fixture config");
+    MediaWikiClient::new(config).expect("fixture client")
+}
+
+fn fast_retry_policy(maximum_attempts: usize) -> RetryPolicy {
+    RetryPolicy::new(
+        maximum_attempts,
+        Duration::from_millis(1),
+        Duration::from_millis(20),
+    )
+    .expect("fast retry policy")
+    .with_circuit_breaker(3, Duration::from_millis(100))
+    .expect("fast circuit breaker")
+}
+
+fn fixture_client_with_policy(server: &FixtureServer, policy: RetryPolicy) -> MediaWikiClient {
+    let config = ClientConfig::new(server.endpoint(), "WikiSyncer/0.1 retry-tests")
+        .expect("valid fixture config")
+        .with_retry_policy(policy);
     MediaWikiClient::new(config).expect("fixture client")
 }
 
@@ -208,7 +227,7 @@ async fn maxlag_errors_preserve_retry_guidance() {
         body: MAXLAG,
         retry_after: Some(7),
     }]);
-    let client = fixture_client(&server);
+    let client = fixture_client_with_policy(&server, fast_retry_policy(1));
     let error = client
         .resolve_titles(&[PageTitle::new("Rust").expect("valid title")])
         .await
@@ -221,6 +240,124 @@ async fn maxlag_errors_preserve_retry_guidance() {
         ClientError::Api(ref api) if api.code == "maxlag"
     ));
     server.finish();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retryable_status_then_success_repeats_the_same_bounded_request() {
+    let server = FixtureServer::start(vec![
+        FixtureResponse {
+            status: 503,
+            body: "{}",
+            retry_after: None,
+        },
+        FixtureResponse::json(TITLE_RESOLUTION),
+    ]);
+    let client = fixture_client_with_policy(&server, fast_retry_policy(2));
+    let results = client
+        .resolve_titles(&[PageTitle::new("Rust").expect("title")])
+        .await
+        .expect("retry succeeds");
+    assert!(matches!(results.first(), Some(TitleResolution::Found(_))));
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].lines().next(),
+        requests[1].lines().next(),
+        "the retry must repeat exactly the same API page"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retryable_failures_stop_at_the_configured_attempt_ceiling() {
+    let throttled = FixtureResponse {
+        status: 503,
+        body: "{}",
+        retry_after: None,
+    };
+    let server = FixtureServer::start(vec![throttled, throttled, throttled]);
+    let client = fixture_client_with_policy(&server, fast_retry_policy(3));
+    let error = client
+        .resolve_titles(&[PageTitle::new("Rust").expect("title")])
+        .await
+        .expect_err("retry budget must be exhausted");
+    assert!(matches!(
+        error,
+        ClientError::HttpStatus { status, .. }
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+    ));
+    assert_eq!(server.finish().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_after_is_honored_up_to_the_configured_safety_ceiling() {
+    let server = FixtureServer::start(vec![
+        FixtureResponse {
+            status: 429,
+            body: "{}",
+            retry_after: Some(1),
+        },
+        FixtureResponse::json(TITLE_RESOLUTION),
+    ]);
+    let client = fixture_client_with_policy(&server, fast_retry_policy(2));
+    let started = Instant::now();
+    client
+        .resolve_titles(&[PageTitle::new("Rust").expect("title")])
+        .await
+        .expect("retry after throttle");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(15),
+        "server delay should be clamped to and honor the 20 ms safety ceiling: {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(1));
+    assert_eq!(server.finish().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nonretryable_status_is_attempted_only_once() {
+    let server = FixtureServer::start(vec![FixtureResponse {
+        status: 400,
+        body: "{}",
+        retry_after: None,
+    }]);
+    let client = fixture_client_with_policy(&server, fast_retry_policy(4));
+    let error = client
+        .resolve_titles(&[PageTitle::new("Rust").expect("title")])
+        .await
+        .expect_err("bad request is not retryable");
+    assert!(!error.is_retryable());
+    assert!(matches!(
+        error,
+        ClientError::HttpStatus { status, .. } if status == reqwest::StatusCode::BAD_REQUEST
+    ));
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cloned_clients_share_an_open_circuit_without_an_extra_request() {
+    let server = FixtureServer::start(vec![FixtureResponse {
+        status: 503,
+        body: "{}",
+        retry_after: None,
+    }]);
+    let policy = fast_retry_policy(1)
+        .with_circuit_breaker(1, Duration::from_secs(1))
+        .expect("single-failure circuit");
+    let client = fixture_client_with_policy(&server, policy);
+    let clone = client.clone();
+    client
+        .resolve_titles(&[PageTitle::new("Rust").expect("title")])
+        .await
+        .expect_err("first request opens the circuit");
+    let error = clone
+        .resolve_titles(&[PageTitle::new("Ferris").expect("title")])
+        .await
+        .expect_err("shared circuit rejects the clone without networking");
+    assert!(matches!(error, ClientError::CircuitOpen { .. }));
+    assert!(error.is_retryable());
+    assert!(error.retry_after().is_some_and(|delay| !delay.is_zero()));
+    assert_eq!(server.finish().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

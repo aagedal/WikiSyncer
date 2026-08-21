@@ -9,10 +9,11 @@ use wikisync_mediawiki::{ClientConfig, MediaWikiClient};
 use wikisync_search::{SearchIndex, SearchQuery, SqliteSearchIndex};
 use wikisync_store::{Library, SyncRunKind, SyncRunState};
 use wikisync_sync::{
-    CategoryPreviewError, CategoryPreviewLimits, ReconciliationLimits,
+    CaptureError, CategoryPreviewError, CategoryPreviewLimits, ReconciliationLimits,
     capture_committed_collection, capture_explicit_titles, capture_revision_history,
     commit_collection_preview, parse_title_list, preview_category_selection,
-    preview_collection_rule, reconcile_collection_heads, reconcile_collection_heads_with_limits,
+    preview_collection_rule, reconcile_collection_heads,
+    reconcile_collection_heads_with_cancellation, reconcile_collection_heads_with_limits,
 };
 
 const TITLE_RESOLUTION: &str = include_str!("../../../fixtures/mediawiki/title-resolution.json");
@@ -604,6 +605,128 @@ async fn failed_reconciliation_keeps_partial_content_but_not_head_or_checkpoint(
 
     let requests = server.finish();
     assert_eq!(requests.len(), 6);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_reconciliation_resumes_from_durable_content_before_advancing_head() {
+    let server = FixtureServer::start(vec![
+        FixtureResponse::json(TITLE_RESOLUTION),
+        FixtureResponse::json(REVISION_CONTENT),
+        FixtureResponse::json(RECONCILIATION_TITLE_RESOLUTION),
+        FixtureResponse::json(RECONCILIATION_REVISIONS),
+        FixtureResponse::json(RECONCILIATION_CONTENT_MIDDLE),
+        FixtureResponse::json(RECONCILIATION_TITLE_RESOLUTION),
+        FixtureResponse::json(RECONCILIATION_REVISIONS_FROM_MIDDLE),
+        FixtureResponse::json(RECONCILIATION_CONTENT_HEAD),
+    ]);
+    let client = MediaWikiClient::new(
+        ClientConfig::new(server.endpoint(), "WikiSyncer/0.1 cancellation-test")
+            .expect("client configuration"),
+    )
+    .expect("client");
+    let directory = tempfile::tempdir().expect("temporary library");
+    let mut library = Library::open(directory.path()).expect("library");
+    let wiki_id = library
+        .register_wiki(server.endpoint(), "en")
+        .expect("wiki");
+    let collection_id = library
+        .create_explicit_collection(wiki_id, "Fixture pages")
+        .expect("collection");
+    let selection =
+        TitleSelection::new([PageTitle::new("Rust_programming_language").expect("title")])
+            .expect("selection");
+    let initial =
+        capture_explicit_titles(&client, &mut library, wiki_id, collection_id, &selection)
+            .await
+            .expect("initial capture");
+    let original_head = initial.pages[0].revision_id;
+    let middle_revision = RevisionId::new(1_300_000_002).expect("middle revision");
+
+    let cancel_after_middle_is_durable = || {
+        Library::open(directory.path())
+            .expect("observe cancellation boundary")
+            .revision(wiki_id, middle_revision)
+            .expect("middle revision lookup")
+            .is_some()
+    };
+    let error = reconcile_collection_heads_with_cancellation(
+        &client,
+        &mut library,
+        wiki_id,
+        collection_id,
+        1_776_945_600,
+        &cancel_after_middle_is_durable,
+    )
+    .await
+    .expect_err("durable middle revision triggers cancellation");
+    assert!(matches!(error, CaptureError::Cancelled));
+
+    let middle = library
+        .revision(wiki_id, middle_revision)
+        .expect("middle revision lookup")
+        .expect("middle revision remains durable");
+    assert_eq!(
+        library
+            .page(wiki_id, initial.pages[0].page_id)
+            .expect("page lookup")
+            .expect("page")
+            .current_revision_id,
+        Some(original_head),
+        "a cancelled gap must not expose its uncompleted remote head"
+    );
+    assert_eq!(
+        library.sync_checkpoints().expect("checkpoint")[0].committed_through,
+        0
+    );
+    let interrupted = library.sync_run_statuses(1).expect("run status").remove(0);
+    assert_eq!(interrupted.state, SyncRunState::Running);
+    assert_eq!(interrupted.running_jobs, 1);
+    assert_eq!(interrupted.failed_jobs, 0);
+    assert!(interrupted.latest_error.is_none());
+
+    let completed = reconcile_collection_heads_with_cancellation(
+        &client,
+        &mut library,
+        wiki_id,
+        collection_id,
+        1_776_945_700,
+        &|| false,
+    )
+    .await
+    .expect("resume cancelled reconciliation");
+    assert!(completed.resumed);
+    assert_eq!(completed.status.run_id, interrupted.run_id);
+    assert_eq!(completed.status.state, SyncRunState::Succeeded);
+    assert_eq!(completed.status.checkpoint_candidate, 1_776_945_600);
+    assert_eq!(completed.revisions_captured, 1);
+    assert_eq!(
+        library
+            .revision(wiki_id, middle_revision)
+            .expect("middle revision lookup after resume")
+            .expect("middle revision after resume")
+            .content_object_id,
+        middle.content_object_id,
+        "resume must reuse the canonical object captured before cancellation"
+    );
+    assert_eq!(
+        library
+            .page(wiki_id, initial.pages[0].page_id)
+            .expect("page lookup after resume")
+            .expect("page after resume")
+            .current_revision_id
+            .expect("completed head")
+            .get(),
+        1_300_000_003
+    );
+    assert_eq!(
+        library.sync_checkpoints().expect("completed checkpoint")[0].committed_through,
+        1_776_945_600
+    );
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 8);
+    assert!(requests[3].contains("rvstartid=1300000001"));
+    assert!(requests[6].contains("rvstartid=1300000002"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

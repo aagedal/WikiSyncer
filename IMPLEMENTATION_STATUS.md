@@ -82,12 +82,13 @@ stable-v1 work as specified by the plan.
 
 ## Milestone 4 progress
 
-The first daemon checkpoint is implemented and validated:
+The daemon foundation, scheduling, service-durability, socket-recovery, and offline-
+diagnostics checkpoints are implemented and validated:
 
 - a versioned, bounded local Unix-socket contract with private library-local daemon
   and cooperative writer-lease sockets;
-- race-safe writer discovery for GUI/CLI callers, with fail-closed handling of stale
-  or unexpected socket paths;
+- race-safe writer discovery for GUI/CLI callers, coordinated recovery of confirmed
+  stale sockets, and fail-closed handling of live or unexpected socket paths;
 - a single-threaded application dispatcher for collection reconciliation, bounded
   quick/full logical-object verification, and immutable-object compaction;
 - CLI `sync`, `verify`, and `compact` commands that forward to the daemon when it owns
@@ -100,10 +101,50 @@ The first daemon checkpoint is implemented and validated:
 - a pre-beta threat model plus service, backup/restore/migration, and redacted manual
   diagnostics documentation.
 
-Focused daemon, CLI, GUI, and CLI-to-daemon forwarding tests pass. This is partial
-Milestone 4 behavior, not its gate: interval/daily scheduling, GUI schedule controls,
-sleep/wake and cancellation gates, graceful `SIGTERM`/`SIGINT`, safe stale-socket
-recovery, signed packages/installers, and an automated `doctor` bundle remain.
+Scheduling now includes:
+
+- schema migration 7 with durable per-collection manual, bounded interval, and daily-
+  UTC schedules; pause state; bounded jitter; next-run and last-started cursors; and
+  atomic compare-and-swap claims that prevent duplicate starts;
+- deterministic delay-only jitter and restart/sleep recovery that coalesces any
+  number of missed occurrences into one resumable synchronization before advancing
+  directly to a future occurrence;
+- daemon background dispatch of at most one claimed schedule at a time through the
+  existing reconciliation path, retaining the single-writer boundary;
+- GUI controls for schedules during collection creation and for later cadence,
+  jitter, and pause edits, whether the GUI holds the direct writer lease or forwards
+  to the daemon; and
+- cooperative `SIGTERM`/`SIGINT` handling plus a real-daemon restart test proving an
+  overdue occurrence runs once and is not duplicated after restart.
+
+Service durability and diagnostics now include:
+
+- cancellation-aware long-gap reconciliation with checks at bounded job, request,
+  batch, revision, page-head, search, and checkpoint boundaries; already durable
+  canonical revisions are retained while the active job/run remains resumable;
+- bounded retry attempts, capped equal-jitter exponential backoff, bounded
+  `Retry-After` handling, and a shared in-process circuit breaker for retryable
+  MediaWiki failures;
+- durable discovery of unfinished collection reconciliations before later schedule
+  occurrences, plus a real-daemon throttle/partial-failure/restart gate proving that
+  the old head and checkpoint remain authoritative and the intermediate revision is
+  reused when the same run resumes;
+- signal tests showing `SIGTERM`/`SIGINT` reach active work, interrupted mutations are
+  not counted as complete, and writer/socket resources are released;
+- advisory-lock serialization of socket startup/recovery, device/inode rechecks,
+  private lock permissions, live/unexpected-path preservation, concurrent-owner
+  exclusion, and non-mutating control-plane inspection; and
+- `wikisync doctor` human/JSON output and create-new `0600` bundles using a strict
+  aggregate allowlist, immutable read-only checkpointed database access, bounded
+  canonical quick verification, redacted section failures, and tests proving no
+  MediaWiki connection or seeded sensitive-value disclosure.
+
+Workspace formatting, warning-denied Clippy, and all workspace tests pass. The
+`cargo-deny` subcommand is unavailable in this environment; the only new external
+crate (`fs2` 0.4.3 from crates.io, MIT/Apache-2.0) matches the repository's existing
+source and license allowlists. Milestone 4 delivery is still partial: metered-network
+avoidance, explicit bandwidth/concurrency controls, source/redirect allowlisting,
+signed packages/installers, and optional online reachability in `doctor` remain.
 
 ## Plan audit notes
 
@@ -117,9 +158,11 @@ described as manifest-chain or whole-archive trust verification.
 
 ## Next checkpoint
 
-Add durable interval/daily schedule configuration with jitter and GUI controls, then
-exercise restart and sleep/wake recovery through the real daemon. Add graceful Unix
-signal handling before treating launchd termination as cooperative shutdown.
+Add metered-network avoidance where the target OS exposes it reliably and explicit
+per-run bandwidth/concurrency controls. Then close the remaining pre-beta source and
+redirect allowlist plus signed-package work without weakening the offline fixture
+test policy. Predecessor-linked manifests and the broader verification/export gaps
+remain separately tracked milestone work.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening

@@ -6,20 +6,26 @@
 //! when no daemon is present, and reports a busy library in every other case.
 
 mod application;
+mod schedule;
 
 pub use application::ApplicationHandler;
+pub use schedule::{
+    RecoveryDecision, jittered_occurrence, next_nominal_after, next_occurrence_after, recover,
+};
 
 use std::error::Error;
 use std::fmt;
-use std::fs::{self, Permissions};
+use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Cursor, Read, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+use fs2::FileExt;
 
 /// Current on-wire request and response contract version.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -31,10 +37,14 @@ pub const MAX_MUTATION_PAYLOAD_BYTES: usize = 60 * 1024;
 pub const DAEMON_SOCKET_NAME: &str = ".wikisyncd.sock";
 /// Library-local cooperative writer lease socket name.
 pub const WRITER_SOCKET_NAME: &str = ".wikisync-writer.sock";
+const IPC_LOCK_NAME: &str = ".wikisync-ipc.lock";
+/// Versioned extension name used to configure one collection schedule.
+pub const SET_COLLECTION_SCHEDULE_EXTENSION: &str = "set-collection-schedule-v1";
 
 const REQUEST_MAGIC: &[u8; 4] = b"WKSR";
 const RESPONSE_MAGIC: &[u8; 4] = b"WKSP";
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const LONG_OPERATION_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_STRING_BYTES: usize = 4 * 1024;
@@ -49,6 +59,45 @@ pub fn daemon_socket_path(library_root: impl AsRef<Path>) -> PathBuf {
 #[must_use]
 pub fn writer_socket_path(library_root: impl AsRef<Path>) -> PathBuf {
     library_root.as_ref().join(WRITER_SOCKET_NAME)
+}
+
+/// Read-only state of one library-local control socket path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalSocketState {
+    /// No filesystem entry exists at the expected path.
+    Missing,
+    /// A Unix socket accepts local connections at the expected path.
+    Active,
+    /// A Unix socket entry remains but no listener responds.
+    Stale,
+    /// A symlink or non-socket entry occupies the expected path.
+    UnexpectedPath,
+}
+
+/// Read-only state of the daemon request socket and cooperative writer lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ControlPlaneState {
+    /// Daemon request socket state.
+    pub daemon: LocalSocketState,
+    /// Cooperative writer lease socket state.
+    pub writer: LocalSocketState,
+}
+
+/// Inspects both library-local control sockets without changing the library.
+///
+/// An existing IPC startup lock is honored. If the lock has not been created yet,
+/// inspection takes a bounded read-only snapshot that tolerates concurrent changes.
+/// This never creates, removes, or replaces a filesystem entry. The result
+/// deliberately contains no paths so it can be included in redacted diagnostics.
+pub fn inspect_control_plane(
+    library_root: impl AsRef<Path>,
+) -> Result<ControlPlaneState, DaemonError> {
+    let root = canonical_library_root(library_root.as_ref())?;
+    let _lock = IpcLock::acquire_existing(&root)?;
+    Ok(ControlPlaneState {
+        daemon: inspect_socket(&daemon_socket_path(&root))?.public_state(),
+        writer: inspect_socket(&writer_socket_path(&root))?.public_state(),
+    })
 }
 
 /// A versioned request envelope.
@@ -191,7 +240,73 @@ pub trait RequestHandler: fmt::Debug + Send + 'static {
 
     /// Performs one mutation synchronously under daemon writer ownership.
     /// Returning success must mean the requested work actually completed.
-    fn mutate(&mut self, mutation: Mutation) -> Result<MutationOutcome, OperationError>;
+    fn mutate(
+        &mut self,
+        mutation: Mutation,
+        control: OperationControl,
+    ) -> Result<MutationOutcome, OperationError>;
+
+    /// Polls for at most one durably claimed background operation between requests.
+    fn poll_background(
+        &mut self,
+        _control: OperationControl,
+    ) -> Result<Option<MutationOutcome>, OperationError> {
+        Ok(None)
+    }
+}
+
+/// Cooperative cancellation state for one active foreground or background operation.
+///
+/// The control shares the daemon's shutdown flag. Long-running handlers should clone
+/// it as needed and check [`Self::is_shutdown_requested`] at bounded intervals before
+/// claiming more work and between durable checkpoints.
+#[derive(Clone, Debug)]
+pub struct OperationControl {
+    running: Arc<AtomicBool>,
+}
+
+impl OperationControl {
+    /// Creates an independent control for a short-lived direct operation.
+    ///
+    /// This control begins in the running state and is not connected to daemon
+    /// process signals or any [`ShutdownHandle`].
+    #[must_use]
+    pub fn running() -> Self {
+        Self {
+            running: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Returns whether shutdown was requested through this control's associated owner.
+    #[must_use]
+    pub fn is_shutdown_requested(&self) -> bool {
+        !self.running.load(Ordering::Acquire)
+    }
+}
+
+/// Creates the bounded version-one extension mutation for a collection schedule.
+#[must_use]
+pub fn set_collection_schedule_mutation(
+    collection_id: u64,
+    cadence: wikisync_store::ScheduleCadence,
+    jitter_seconds: u32,
+    paused: bool,
+) -> Mutation {
+    let (kind, value) = match cadence {
+        wikisync_store::ScheduleCadence::Manual => (0_u8, 0_u32),
+        wikisync_store::ScheduleCadence::Interval(interval) => (1, interval.seconds()),
+        wikisync_store::ScheduleCadence::DailyUtc(time) => (2, time.seconds_after_midnight()),
+    };
+    let mut payload = Vec::with_capacity(18);
+    payload.extend_from_slice(&collection_id.to_be_bytes());
+    payload.push(kind);
+    payload.extend_from_slice(&value.to_be_bytes());
+    payload.extend_from_slice(&jitter_seconds.to_be_bytes());
+    payload.push(u8::from(paused));
+    Mutation::Extension {
+        name: SET_COLLECTION_SCHEDULE_EXTENSION.to_owned(),
+        payload,
+    }
 }
 
 /// Structured application-service failure.
@@ -254,7 +369,11 @@ impl RequestHandler for FoundationHandler {
         }
     }
 
-    fn mutate(&mut self, _mutation: Mutation) -> Result<MutationOutcome, OperationError> {
+    fn mutate(
+        &mut self,
+        _mutation: Mutation,
+        _control: OperationControl,
+    ) -> Result<MutationOutcome, OperationError> {
         Err(OperationError::unsupported(
             "this daemon build has no application-service mutation dispatcher",
         ))
@@ -277,8 +396,8 @@ impl WriterLease {
     /// Acquires exclusive writer ownership for this library.
     pub fn acquire(library_root: impl AsRef<Path>) -> Result<Self, DaemonError> {
         let root = canonical_library_root(library_root.as_ref())?;
-        let path = writer_socket_path(root);
-        let (listener, socket) = bind_exclusive(&path, BusyKind::Writer)?;
+        let path = writer_socket_path(&root);
+        let (listener, socket) = bind_exclusive(&root, &path, BusyKind::Writer)?;
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
         let monitor_stop = Arc::clone(&stop);
@@ -288,7 +407,12 @@ impl WriterLease {
                 while !monitor_stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((_stream, _address)) => {}
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                            ) =>
+                        {
                             thread::sleep(SOCKET_POLL_INTERVAL);
                         }
                         Err(_) => break,
@@ -462,6 +586,7 @@ pub struct Daemon<H: RequestHandler> {
     running: Arc<AtomicBool>,
     started: Instant,
     completed_mutations: u64,
+    last_background_poll: Instant,
 }
 
 impl<H: RequestHandler> Daemon<H> {
@@ -470,7 +595,7 @@ impl<H: RequestHandler> Daemon<H> {
         let root = canonical_library_root(library_root.as_ref())?;
         let writer_lease = WriterLease::acquire(&root)?;
         let path = daemon_socket_path(&root);
-        let (listener, socket) = bind_exclusive(&path, BusyKind::Daemon)?;
+        let (listener, socket) = bind_exclusive(&root, &path, BusyKind::Daemon)?;
         listener.set_nonblocking(true)?;
         Ok(Self {
             listener,
@@ -480,6 +605,7 @@ impl<H: RequestHandler> Daemon<H> {
             running: Arc::new(AtomicBool::new(true)),
             started: Instant::now(),
             completed_mutations: 0,
+            last_background_poll: Instant::now(),
         })
     }
 
@@ -487,6 +613,12 @@ impl<H: RequestHandler> Daemon<H> {
     #[must_use]
     pub fn shutdown_handle(&self) -> ShutdownHandle {
         ShutdownHandle {
+            running: Arc::clone(&self.running),
+        }
+    }
+
+    fn operation_control(&self) -> OperationControl {
+        OperationControl {
             running: Arc::clone(&self.running),
         }
     }
@@ -506,7 +638,19 @@ impl<H: RequestHandler> Daemon<H> {
                     // by `serve_one` when the connection is still writable.
                     let _ = self.serve_one(&mut stream);
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    if self.last_background_poll.elapsed() >= BACKGROUND_POLL_INTERVAL {
+                        self.last_background_poll = Instant::now();
+                        let control = self.operation_control();
+                        if matches!(self.handler.poll_background(control), Ok(Some(_))) {
+                            self.completed_mutations = self.completed_mutations.saturating_add(1);
+                        }
+                    }
                     thread::sleep(SOCKET_POLL_INTERVAL);
                 }
                 Err(error) => return Err(error.into()),
@@ -582,23 +726,15 @@ impl<H: RequestHandler> Daemon<H> {
                     })
                 }
             }
-            RequestKind::Mutate(mutation) => match self.handler.mutate(mutation) {
-                Ok(outcome)
-                    if outcome.result.len() <= MAX_STRING_BYTES
-                        && outcome.payload.len() <= MAX_MUTATION_PAYLOAD_BYTES =>
-                {
-                    self.completed_mutations = self.completed_mutations.saturating_add(1);
-                    ResponseKind::Mutated(outcome)
-                }
-                Ok(_) => ResponseKind::Error(ResponseError {
-                    code: ErrorCode::Internal,
-                    message: "handler returned an oversized mutation result".to_owned(),
-                }),
-                Err(error) => ResponseKind::Error(ResponseError {
-                    code: error.code,
-                    message: bounded_message(error.message),
-                }),
-            },
+            RequestKind::Mutate(mutation) => {
+                let control = self.operation_control();
+                dispatch_mutation(
+                    &mut self.handler,
+                    mutation,
+                    control,
+                    &mut self.completed_mutations,
+                )
+            }
             RequestKind::Shutdown => {
                 self.running.store(false, Ordering::Release);
                 ResponseKind::ShutdownAccepted
@@ -609,6 +745,31 @@ impl<H: RequestHandler> Daemon<H> {
             request_id: request.request_id,
             kind,
         }
+    }
+}
+
+fn dispatch_mutation<H: RequestHandler>(
+    handler: &mut H,
+    mutation: Mutation,
+    control: OperationControl,
+    completed_mutations: &mut u64,
+) -> ResponseKind {
+    match handler.mutate(mutation, control) {
+        Ok(outcome)
+            if outcome.result.len() <= MAX_STRING_BYTES
+                && outcome.payload.len() <= MAX_MUTATION_PAYLOAD_BYTES =>
+        {
+            *completed_mutations = completed_mutations.saturating_add(1);
+            ResponseKind::Mutated(outcome)
+        }
+        Ok(_) => ResponseKind::Error(ResponseError {
+            code: ErrorCode::Internal,
+            message: "handler returned an oversized mutation result".to_owned(),
+        }),
+        Err(error) => ResponseKind::Error(ResponseError {
+            code: error.code,
+            message: bounded_message(error.message),
+        }),
     }
 }
 
@@ -636,8 +797,7 @@ pub enum DaemonError {
     WriterBusy,
     /// The library root is absent or not a directory.
     InvalidLibrary(PathBuf),
-    /// An inactive socket name exists and is not automatically removed because
-    /// replacement cannot be made race-free with portable safe Unix APIs.
+    /// A stale socket changed identity before coordinated recovery could remove it.
     StaleSocket(PathBuf),
     /// A bounded frame exceeded [`MAX_FRAME_BYTES`].
     FrameTooLarge { size: usize },
@@ -660,7 +820,7 @@ impl fmt::Display for DaemonError {
             ),
             Self::StaleSocket(path) => write!(
                 formatter,
-                "stale socket {} must be inspected and removed before retrying",
+                "stale socket {} changed during recovery; retry without removing it manually",
                 path.display()
             ),
             Self::FrameTooLarge { size } => write!(
@@ -730,33 +890,195 @@ enum BusyKind {
     Writer,
 }
 
-fn bind_exclusive(path: &Path, busy: BusyKind) -> Result<(UnixListener, SocketGuard), DaemonError> {
-    match UnixListener::bind(path) {
-        Ok(listener) => {
-            let guard = SocketGuard::new(path.to_path_buf())?;
-            Ok((listener, guard))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SocketInspection {
+    Missing,
+    Active,
+    Stale(SocketIdentity),
+    UnexpectedPath,
+}
+
+impl SocketInspection {
+    const fn public_state(self) -> LocalSocketState {
+        match self {
+            Self::Missing => LocalSocketState::Missing,
+            Self::Active => LocalSocketState::Active,
+            Self::Stale(_) => LocalSocketState::Stale,
+            Self::UnexpectedPath => LocalSocketState::UnexpectedPath,
         }
-        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-            let metadata = fs::symlink_metadata(path)?;
-            if !metadata.file_type().is_socket() {
-                return Err(DaemonError::Io(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("refusing to replace non-socket path {}", path.display()),
-                )));
+    }
+}
+
+#[derive(Debug)]
+struct IpcLock {
+    _file: File,
+}
+
+impl IpcLock {
+    fn acquire(library_root: &Path) -> Result<Self, DaemonError> {
+        let path = library_root.join(IPC_LOCK_NAME);
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                reject_unexpected_lock_path(&path)?;
+                OpenOptions::new().read(true).write(true).open(&path)?
             }
-            if UnixStream::connect(path).is_ok() {
-                return Err(match busy {
-                    BusyKind::Daemon => DaemonError::AlreadyRunning,
-                    BusyKind::Writer => DaemonError::WriterBusy,
-                });
-            }
-            // Do not unlink here. Between a failed connect and unlink, another
-            // process could replace the path with its new live socket. Failing
-            // closed makes stale recovery explicit and preserves exclusivity.
-            Err(DaemonError::StaleSocket(path.to_path_buf()))
+            Err(error) => return Err(error.into()),
+        };
+        validate_open_lock_file(&path, &file)?;
+        file.set_permissions(Permissions::from_mode(0o600))?;
+        FileExt::lock_exclusive(&file)?;
+        validate_open_lock_file(&path, &file)?;
+        Ok(Self { _file: file })
+    }
+
+    fn acquire_existing(library_root: &Path) -> Result<Option<Self>, DaemonError> {
+        let path = library_root.join(IPC_LOCK_NAME);
+        let file = match OpenOptions::new().read(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        validate_open_lock_file(&path, &file)?;
+        FileExt::lock_exclusive(&file)?;
+        validate_open_lock_file(&path, &file)?;
+        Ok(Some(Self { _file: file }))
+    }
+}
+
+fn reject_unexpected_lock_path(path: &Path) -> Result<(), DaemonError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(unexpected_path_error(path, "IPC lock"));
+    }
+    Ok(())
+}
+
+fn validate_open_lock_file(path: &Path, file: &File) -> Result<(), DaemonError> {
+    let path_metadata = fs::symlink_metadata(path)?;
+    let file_metadata = file.metadata()?;
+    if !path_metadata.file_type().is_file()
+        || path_metadata.dev() != file_metadata.dev()
+        || path_metadata.ino() != file_metadata.ino()
+    {
+        return Err(unexpected_path_error(path, "IPC lock"));
+    }
+    Ok(())
+}
+
+fn bind_exclusive(
+    library_root: &Path,
+    path: &Path,
+    busy: BusyKind,
+) -> Result<(UnixListener, SocketGuard), DaemonError> {
+    let _lock = IpcLock::acquire(library_root)?;
+    match inspect_socket(path)? {
+        SocketInspection::Missing => bind_new_socket(path),
+        SocketInspection::Active => Err(busy_error(busy)),
+        SocketInspection::UnexpectedPath => Err(unexpected_path_error(path, "control socket")),
+        SocketInspection::Stale(identity) => {
+            remove_confirmed_stale_socket(path, identity)?;
+            bind_new_socket(path)
         }
+    }
+}
+
+fn bind_new_socket(path: &Path) -> Result<(UnixListener, SocketGuard), DaemonError> {
+    let listener = UnixListener::bind(path)?;
+    let guard = SocketGuard::new(path.to_path_buf())?;
+    Ok((listener, guard))
+}
+
+fn busy_error(busy: BusyKind) -> DaemonError {
+    match busy {
+        BusyKind::Daemon => DaemonError::AlreadyRunning,
+        BusyKind::Writer => DaemonError::WriterBusy,
+    }
+}
+
+fn inspect_socket(path: &Path) -> Result<SocketInspection, DaemonError> {
+    for _attempt in 0..3 {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(SocketInspection::Missing);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.file_type().is_socket() {
+            return Ok(SocketInspection::UnexpectedPath);
+        }
+        let identity = SocketIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        match UnixStream::connect(path) {
+            Ok(_) => return Ok(SocketInspection::Active),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                match socket_identity(path)? {
+                    None => return Ok(SocketInspection::Missing),
+                    Some(current) if current == identity => {
+                        return Ok(SocketInspection::Stale(identity));
+                    }
+                    Some(_) => continue,
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(DaemonError::Io(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "control socket changed repeatedly during inspection",
+    )))
+}
+
+fn socket_identity(path: &Path) -> Result<Option<SocketIdentity>, DaemonError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => Ok(Some(SocketIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+fn remove_confirmed_stale_socket(path: &Path, expected: SocketIdentity) -> Result<(), DaemonError> {
+    if socket_identity(path)? != Some(expected) {
+        return Err(DaemonError::StaleSocket(path.to_path_buf()));
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+fn unexpected_path_error(path: &Path, kind: &str) -> DaemonError {
+    DaemonError::Io(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "refusing to replace unexpected {kind} path {}",
+            path.display()
+        ),
+    ))
 }
 
 fn canonical_library_root(path: &Path) -> Result<PathBuf, DaemonError> {
@@ -1185,7 +1507,7 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Barrier, Mutex};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1229,12 +1551,46 @@ mod tests {
             }
         }
 
-        fn mutate(&mut self, mutation: Mutation) -> Result<MutationOutcome, OperationError> {
+        fn mutate(
+            &mut self,
+            mutation: Mutation,
+            _control: OperationControl,
+        ) -> Result<MutationOutcome, OperationError> {
             self.mutations.lock().expect("mutation lock").push(mutation);
             Ok(MutationOutcome {
                 result: "completed".to_owned(),
                 payload: b"fixture receipt".to_vec(),
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct CooperativeCancellationHandler {
+        started: std::sync::mpsc::Sender<()>,
+    }
+
+    impl RequestHandler for CooperativeCancellationHandler {
+        fn status(&self) -> HandlerStatus {
+            HandlerStatus {
+                state: "running".to_owned(),
+                detail: "cooperative cancellation fixture".to_owned(),
+            }
+        }
+
+        fn mutate(
+            &mut self,
+            _mutation: Mutation,
+            control: OperationControl,
+        ) -> Result<MutationOutcome, OperationError> {
+            self.started.send(()).expect("announce mutation start");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !control.is_shutdown_requested() {
+                assert!(Instant::now() < deadline, "shutdown did not reach handler");
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(OperationError::failed(
+                "operation interrupted by daemon shutdown",
+            ))
         }
     }
 
@@ -1245,6 +1601,9 @@ mod tests {
         let daemon = Daemon::bind(library.path(), handler).expect("bind daemon");
         let client = Client::for_library(library.path()).expect("client");
         let thread = thread::spawn(move || daemon.run());
+        client
+            .health()
+            .expect("daemon must answer a readiness probe before the test continues");
         (client, thread)
     }
 
@@ -1272,6 +1631,59 @@ mod tests {
             let encoded = encode_request(&request).expect("encode request");
             assert_eq!(decode_request(&encoded).expect("decode request"), request);
         }
+    }
+
+    #[test]
+    fn operation_control_tracks_process_local_shutdown_across_clones() {
+        assert!(!OperationControl::running().is_shutdown_requested());
+
+        let running = Arc::new(AtomicBool::new(true));
+        let control = OperationControl {
+            running: Arc::clone(&running),
+        };
+        let clone = control.clone();
+        let shutdown = ShutdownHandle { running };
+
+        assert!(!control.is_shutdown_requested());
+        assert!(!clone.is_shutdown_requested());
+        shutdown.shutdown();
+        assert!(control.is_shutdown_requested());
+        assert!(clone.is_shutdown_requested());
+    }
+
+    #[test]
+    fn active_interrupted_mutation_is_not_counted_as_completed() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let control = OperationControl {
+            running: Arc::clone(&running),
+        };
+        let shutdown = ShutdownHandle { running };
+        let shutdown_thread = thread::spawn(move || {
+            started_rx.recv().expect("mutation start");
+            shutdown.shutdown();
+        });
+        let mut handler = CooperativeCancellationHandler {
+            started: started_tx,
+        };
+        let mut completed_mutations = 0;
+
+        let response = dispatch_mutation(
+            &mut handler,
+            Mutation::SyncAll,
+            control,
+            &mut completed_mutations,
+        );
+        shutdown_thread.join().expect("shutdown thread");
+
+        assert!(matches!(
+            response,
+            ResponseKind::Error(ResponseError {
+                code: ErrorCode::OperationFailed,
+                ..
+            })
+        ));
+        assert_eq!(completed_mutations, 0);
     }
 
     #[test]
@@ -1357,15 +1769,26 @@ mod tests {
     }
 
     #[test]
-    fn stale_and_non_socket_paths_fail_closed_and_are_never_removed() {
+    fn stale_socket_is_recovered_but_unexpected_paths_are_never_removed() {
         let library = TempLibrary::new();
         let stale = UnixListener::bind(writer_socket_path(library.path())).expect("stale bind");
         drop(stale);
-        assert!(matches!(
-            WriterLease::acquire(library.path()),
-            Err(DaemonError::StaleSocket(path)) if path == writer_socket_path(library.path())
-        ));
-        assert!(writer_socket_path(library.path()).exists());
+        assert_eq!(
+            inspect_control_plane(library.path()).expect("inspect stale writer"),
+            ControlPlaneState {
+                daemon: LocalSocketState::Missing,
+                writer: LocalSocketState::Stale,
+            }
+        );
+        let lease = WriterLease::acquire(library.path()).expect("recover stale writer socket");
+        assert_eq!(
+            inspect_control_plane(library.path()).expect("inspect recovered writer"),
+            ControlPlaneState {
+                daemon: LocalSocketState::Missing,
+                writer: LocalSocketState::Active,
+            }
+        );
+        drop(lease);
 
         let other = TempLibrary::new();
         fs::write(writer_socket_path(other.path()), b"do not remove").expect("fixture file");
@@ -1377,6 +1800,162 @@ mod tests {
             fs::read(writer_socket_path(other.path())).expect("fixture retained"),
             b"do not remove"
         );
+
+        let symlink_library = TempLibrary::new();
+        let target = symlink_library.path().join("target");
+        fs::write(&target, b"do not follow").expect("symlink target");
+        std::os::unix::fs::symlink(&target, writer_socket_path(symlink_library.path()))
+            .expect("fixture symlink");
+        assert_eq!(
+            inspect_control_plane(symlink_library.path()).expect("inspect symlink"),
+            ControlPlaneState {
+                daemon: LocalSocketState::Missing,
+                writer: LocalSocketState::UnexpectedPath,
+            }
+        );
+        assert!(matches!(
+            WriterLease::acquire(symlink_library.path()),
+            Err(DaemonError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert!(
+            fs::symlink_metadata(writer_socket_path(symlink_library.path()))
+                .expect("symlink retained")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(target).expect("target retained"), b"do not follow");
+    }
+
+    #[test]
+    fn control_plane_inspection_is_read_only_when_the_lock_is_absent() {
+        let library = TempLibrary::new();
+        let entries_before = directory_entry_names(library.path());
+
+        assert_eq!(
+            inspect_control_plane(library.path()).expect("inspect empty control plane"),
+            ControlPlaneState {
+                daemon: LocalSocketState::Missing,
+                writer: LocalSocketState::Missing,
+            }
+        );
+        assert_eq!(directory_entry_names(library.path()), entries_before);
+        assert!(!library.path().join(IPC_LOCK_NAME).exists());
+    }
+
+    #[test]
+    fn concurrent_stale_recovery_selects_exactly_one_writer_owner() {
+        let library = TempLibrary::new();
+        let stale = UnixListener::bind(writer_socket_path(library.path())).expect("stale bind");
+        drop(stale);
+        let start = Arc::new(Barrier::new(3));
+        let finished = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+
+        for _ in 0..2 {
+            let path = library.path().to_path_buf();
+            let start = Arc::clone(&start);
+            let finished = Arc::clone(&finished);
+            threads.push(thread::spawn(move || {
+                start.wait();
+                let result = WriterLease::acquire(path);
+                let outcome = match &result {
+                    Ok(_) => "owner",
+                    Err(DaemonError::WriterBusy) => "busy",
+                    Err(_) => "unexpected-error",
+                };
+                finished.wait();
+                drop(result);
+                outcome
+            }));
+        }
+
+        start.wait();
+        finished.wait();
+        let outcomes = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("recovery thread"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == "owner")
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == "busy")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn daemon_recovers_both_stale_sockets_and_creates_a_private_lock() {
+        let library = TempLibrary::new();
+        let stale_writer =
+            UnixListener::bind(writer_socket_path(library.path())).expect("stale writer bind");
+        let stale_daemon =
+            UnixListener::bind(daemon_socket_path(library.path())).expect("stale daemon bind");
+        drop((stale_writer, stale_daemon));
+
+        let daemon = Daemon::bind(library.path(), FoundationHandler).expect("recover both sockets");
+        assert_eq!(
+            inspect_control_plane(library.path()).expect("inspect recovered daemon"),
+            ControlPlaneState {
+                daemon: LocalSocketState::Active,
+                writer: LocalSocketState::Active,
+            }
+        );
+        let lock_metadata =
+            fs::symlink_metadata(library.path().join(IPC_LOCK_NAME)).expect("IPC lock metadata");
+        assert!(lock_metadata.file_type().is_file());
+        assert_eq!(lock_metadata.permissions().mode() & 0o777, 0o600);
+
+        drop(daemon);
+        assert_eq!(
+            inspect_control_plane(library.path()).expect("inspect stopped daemon"),
+            ControlPlaneState {
+                daemon: LocalSocketState::Missing,
+                writer: LocalSocketState::Missing,
+            }
+        );
+    }
+
+    #[test]
+    fn active_socket_is_preserved_when_an_owner_does_not_use_the_ipc_lock() {
+        let library = TempLibrary::new();
+        let path = writer_socket_path(library.path());
+        let listener = UnixListener::bind(&path).expect("active fixture bind");
+        let metadata = fs::symlink_metadata(&path).expect("active socket metadata");
+
+        assert_eq!(
+            inspect_control_plane(library.path()).expect("inspect active socket"),
+            ControlPlaneState {
+                daemon: LocalSocketState::Missing,
+                writer: LocalSocketState::Active,
+            }
+        );
+        assert!(matches!(
+            WriterLease::acquire(library.path()),
+            Err(DaemonError::WriterBusy)
+        ));
+        let retained = fs::symlink_metadata(&path).expect("active socket retained");
+        assert_eq!(
+            (retained.dev(), retained.ino()),
+            (metadata.dev(), metadata.ino())
+        );
+        drop(listener);
+    }
+
+    fn directory_entry_names(path: &Path) -> Vec<std::ffi::OsString> {
+        let mut entries = fs::read_dir(path)
+            .expect("read fixture directory")
+            .map(|entry| entry.expect("fixture entry").file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
     }
 
     #[test]
@@ -1408,13 +1987,17 @@ mod tests {
     fn foundation_never_claims_an_unimplemented_mutation_succeeded() {
         let library = TempLibrary::new();
         let (client, daemon) = running_daemon(&library, FoundationHandler);
-        assert!(matches!(
-            client.forward_mutation(Mutation::SyncAll),
-            Err(DaemonError::Remote(ResponseError {
-                code: ErrorCode::Unsupported,
-                ..
-            }))
-        ));
+        let result = client.forward_mutation(Mutation::SyncAll);
+        assert!(
+            matches!(
+                result,
+                Err(DaemonError::Remote(ResponseError {
+                    code: ErrorCode::Unsupported,
+                    ..
+                }))
+            ),
+            "foundation returned an unexpected mutation result: {result:?}"
+        );
         client.shutdown().expect("shutdown");
         daemon.join().expect("join").expect("daemon result");
     }

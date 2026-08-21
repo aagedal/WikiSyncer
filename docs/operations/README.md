@@ -2,8 +2,9 @@
 
 This guide describes the behavior present in the repository, not a signed beta
 installer. WikiSyncer currently provides source builds and parameterized user-service
-templates. It does not yet provide signed macOS or Linux packages, a stable backup
-format, a `doctor` diagnostic bundle, or a released schedule editor.
+templates. It does not yet provide signed macOS or Linux packages or a stable backup
+format. The CLI provides an offline redacted `doctor` report/bundle, and the GUI
+includes the current schedule editor.
 
 - [Service management](service-management.md): install, start, stop, uninstall,
   permission, and sleep/wake guidance.

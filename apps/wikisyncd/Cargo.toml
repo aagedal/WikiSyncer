@@ -15,9 +15,11 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+fs2 = "0.4"
+signal-hook = "0.3"
 tokio = { version = "1.0", features = ["net", "rt", "time"] }
-wikisync-core = { path = "../../crates/wikisync-core" }
-wikisync-integrity = { path = "../../crates/wikisync-integrity" }
-wikisync-mediawiki = { path = "../../crates/wikisync-mediawiki" }
-wikisync-store = { path = "../../crates/wikisync-store" }
-wikisync-sync = { path = "../../crates/wikisync-sync" }
+wikisync-core = { version = "=0.1.0", path = "../../crates/wikisync-core" }
+wikisync-integrity = { version = "=0.1.0", path = "../../crates/wikisync-integrity" }
+wikisync-mediawiki = { version = "=0.1.0", path = "../../crates/wikisync-mediawiki" }
+wikisync-store = { version = "=0.1.0", path = "../../crates/wikisync-store" }
+wikisync-sync = { version = "=0.1.0", path = "../../crates/wikisync-sync" }

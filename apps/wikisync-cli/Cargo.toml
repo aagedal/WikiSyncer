@@ -17,14 +17,15 @@ workspace = true
 [dependencies]
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["net", "rt"] }
-wikisync-content = { path = "../../crates/wikisync-content" }
-wikisync-core = { path = "../../crates/wikisync-core" }
-wikisync-mediawiki = { path = "../../crates/wikisync-mediawiki" }
-wikisync-search = { path = "../../crates/wikisync-search" }
-wikisync-store = { path = "../../crates/wikisync-store" }
-wikisync-sync = { path = "../../crates/wikisync-sync" }
-wikisync-web = { path = "../../crates/wikisync-web" }
-wikisyncd = { path = "../wikisyncd" }
+wikisync-content = { version = "=0.1.0", path = "../../crates/wikisync-content" }
+wikisync-core = { version = "=0.1.0", path = "../../crates/wikisync-core" }
+wikisync-integrity = { version = "=0.1.0", path = "../../crates/wikisync-integrity" }
+wikisync-mediawiki = { version = "=0.1.0", path = "../../crates/wikisync-mediawiki" }
+wikisync-search = { version = "=0.1.0", path = "../../crates/wikisync-search" }
+wikisync-store = { version = "=0.1.0", path = "../../crates/wikisync-store" }
+wikisync-sync = { version = "=0.1.0", path = "../../crates/wikisync-sync" }
+wikisync-web = { version = "=0.1.0", path = "../../crates/wikisync-web" }
+wikisyncd = { version = "=0.1.0", path = "../wikisyncd" }
 
 [dev-dependencies]
 axum = "0.8"

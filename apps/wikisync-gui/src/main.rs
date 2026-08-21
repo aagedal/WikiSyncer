@@ -17,14 +17,19 @@ use wikisync_core::{
 };
 use wikisync_integrity::{VerificationReport, VerificationScope, verify_library};
 use wikisync_mediawiki::ClientConfig;
-use wikisync_store::{Library, StoredCollection, SyncCheckpoint, SyncRunState, SyncRunStatus};
+use wikisync_store::{
+    CollectionSchedule, Library, ScheduleCadence, StoredCollection, SyncCheckpoint, SyncRunState,
+    SyncRunStatus,
+};
 use wikisync_sync::{
     CategoryPreviewLimits, CollectionSelectionPreview, bootstrap_collection,
     commit_collection_preview, parse_title_list, preview_collection_rule,
     reconcile_collection_heads,
 };
 use wikisync_web::ReaderHandle;
-use wikisyncd::{Mutation, WriterAccess, WriterLease};
+use wikisyncd::{
+    Mutation, WriterAccess, WriterLease, next_occurrence_after, set_collection_schedule_mutation,
+};
 
 const DATABASE_NAME: &str = "library.sqlite3";
 const RECENT_REVISION_LIMIT: u32 = 12;
@@ -49,6 +54,7 @@ struct App {
     latest_probe_id: u64,
     path_status: PathStatus,
     collection_form: CollectionForm,
+    schedule_editor: Option<ScheduleEditor>,
     selection_preview: Option<CollectionSelectionPreview>,
     verification: VerificationState,
     reader: Option<Arc<ReaderHandle>>,
@@ -73,6 +79,7 @@ impl App {
             latest_probe_id: probe_key.id,
             path_status: PathStatus::Checking,
             collection_form: CollectionForm::default(),
+            schedule_editor: None,
             selection_preview: None,
             verification: VerificationState::NotRun,
             reader: None,
@@ -222,6 +229,26 @@ impl App {
                     self.collection_form.maximum_bytes = value;
                 }
             }
+            Message::CreateScheduleModeChanged(value) => {
+                if !self.is_busy() {
+                    self.collection_form.schedule_mode = value;
+                }
+            }
+            Message::CreateScheduleValueChanged(value) => {
+                if !self.is_busy() {
+                    self.collection_form.schedule_value = value;
+                }
+            }
+            Message::CreateScheduleJitterChanged(value) => {
+                if !self.is_busy() {
+                    self.collection_form.schedule_jitter_minutes = value;
+                }
+            }
+            Message::CreateSchedulePaused(value) => {
+                if !self.is_busy() {
+                    self.collection_form.schedule_paused = value;
+                }
+            }
             Message::PreviewCollection => {
                 if self.is_busy() {
                     return Task::none();
@@ -287,6 +314,13 @@ impl App {
                             return Task::none();
                         }
                     },
+                    schedule: match self.collection_form.schedule() {
+                        Ok(schedule) => schedule,
+                        Err(error) => {
+                            self.notice = Some(Notice::error(error));
+                            return Task::none();
+                        }
+                    },
                 };
                 let key = self.begin_request(path);
                 return collection_task(key, request);
@@ -327,6 +361,90 @@ impl App {
                         self.notice = Some(Notice::success(
                             "Collection update completed; every discovered intermediate revision is durable.",
                         ));
+                    }
+                    Err(error) => self.notice = Some(Notice::error(error)),
+                }
+            }
+            Message::EditSchedule(collection_id) => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let schedule = self.snapshot.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .schedules
+                        .iter()
+                        .find(|schedule| schedule.collection_id == collection_id)
+                        .copied()
+                });
+                self.schedule_editor = Some(ScheduleEditor::from_schedule(
+                    collection_id,
+                    schedule.unwrap_or(CollectionSchedule {
+                        collection_id,
+                        cadence: ScheduleCadence::Manual,
+                        jitter_seconds: 0,
+                        paused: false,
+                        next_run_at: None,
+                        last_started_at: None,
+                    }),
+                ));
+            }
+            Message::EditScheduleModeChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.schedule_editor {
+                        editor.mode = value;
+                    }
+                }
+            }
+            Message::EditScheduleValueChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.schedule_editor {
+                        editor.value = value;
+                    }
+                }
+            }
+            Message::EditScheduleJitterChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.schedule_editor {
+                        editor.jitter_minutes = value;
+                    }
+                }
+            }
+            Message::EditSchedulePaused(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.schedule_editor {
+                        editor.paused = value;
+                    }
+                }
+            }
+            Message::SaveSchedule => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let Some(editor) = &self.schedule_editor else {
+                    return Task::none();
+                };
+                let schedule = match editor.settings() {
+                    Ok(schedule) => schedule,
+                    Err(error) => {
+                        self.notice = Some(Notice::error(error));
+                        return Task::none();
+                    }
+                };
+                let collection_id = editor.collection_id;
+                self.notice = None;
+                let path = PathBuf::from(&self.library_path);
+                let key = self.begin_request(path.clone());
+                return save_schedule_task(key, path, collection_id, schedule);
+            }
+            Message::ScheduleSaved(completion) => {
+                if !self.finish_request(&completion.key) {
+                    return Task::none();
+                }
+                match completion.result {
+                    Ok(snapshot) => {
+                        self.snapshot = Some(snapshot);
+                        self.schedule_editor = None;
+                        self.notice = Some(Notice::success("Schedule saved."));
                     }
                     Err(error) => self.notice = Some(Notice::error(error)),
                 }
@@ -596,8 +714,57 @@ impl App {
             list = list.push(text("No collections yet. Create one below."));
         } else {
             for collection in &snapshot.collections {
-                list = list.push(collection_row(collection, !self.is_busy()));
+                let schedule = snapshot
+                    .schedules
+                    .iter()
+                    .find(|schedule| schedule.collection_id == collection.collection_id);
+                list = list.push(collection_row(collection, schedule, !self.is_busy()));
             }
+        }
+
+        if let Some(editor) = &self.schedule_editor {
+            let schedule_modes = row![
+                schedule_button(
+                    "Manual",
+                    ScheduleMode::Manual,
+                    editor.mode,
+                    Message::EditScheduleModeChanged,
+                ),
+                schedule_button(
+                    "Interval",
+                    ScheduleMode::Interval,
+                    editor.mode,
+                    Message::EditScheduleModeChanged,
+                ),
+                schedule_button(
+                    "Daily UTC",
+                    ScheduleMode::DailyUtc,
+                    editor.mode,
+                    Message::EditScheduleModeChanged,
+                ),
+            ]
+            .spacing(8);
+            let value_hint = schedule_value_hint(editor.mode);
+            list = list.push(
+                container(
+                    column![
+                        text(format!("Schedule collection {}", editor.collection_id)).size(20),
+                        schedule_modes,
+                        text_input(value_hint, &editor.value)
+                            .on_input(Message::EditScheduleValueChanged)
+                            .padding(10),
+                        text_input("Maximum jitter in minutes", &editor.jitter_minutes)
+                            .on_input(Message::EditScheduleJitterChanged)
+                            .padding(10),
+                        checkbox("Pause automatic synchronization", editor.paused)
+                            .on_toggle(Message::EditSchedulePaused),
+                        button("Save schedule")
+                            .on_press_maybe((!self.is_busy()).then_some(Message::SaveSchedule)),
+                    ]
+                    .spacing(9),
+                )
+                .padding(12),
+            );
         }
 
         let preview_enabled = !self.is_busy()
@@ -649,6 +816,27 @@ impl App {
                 "Complete",
                 HistoryMode::Complete,
                 self.collection_form.history_mode
+            ),
+        ]
+        .spacing(8);
+        let schedule_buttons = row![
+            schedule_button(
+                "Manual",
+                ScheduleMode::Manual,
+                self.collection_form.schedule_mode,
+                Message::CreateScheduleModeChanged,
+            ),
+            schedule_button(
+                "Interval",
+                ScheduleMode::Interval,
+                self.collection_form.schedule_mode,
+                Message::CreateScheduleModeChanged,
+            ),
+            schedule_button(
+                "Daily UTC",
+                ScheduleMode::DailyUtc,
+                self.collection_form.schedule_mode,
+                Message::CreateScheduleModeChanged,
             ),
         ]
         .spacing(8);
@@ -706,6 +894,25 @@ impl App {
                     .on_input(Message::MaximumBytesChanged)
                     .padding(10),
             ].spacing(10),
+            text("Automatic synchronization schedule").size(17),
+            schedule_buttons,
+            text_input(
+                schedule_value_hint(self.collection_form.schedule_mode),
+                &self.collection_form.schedule_value,
+            )
+            .on_input(Message::CreateScheduleValueChanged)
+            .padding(10),
+            text_input(
+                "Maximum jitter in minutes",
+                &self.collection_form.schedule_jitter_minutes,
+            )
+            .on_input(Message::CreateScheduleJitterChanged)
+            .padding(10),
+            checkbox(
+                "Create schedule paused",
+                self.collection_form.schedule_paused,
+            )
+            .on_toggle(Message::CreateSchedulePaused),
             text("If a page leaves a category, WikiSyncer stops tracking it but retains every already captured revision."),
             row![
                 button("Preview selection")
@@ -872,12 +1079,23 @@ enum Message {
     HistoryValueChanged(String),
     MaximumPagesChanged(String),
     MaximumBytesChanged(String),
+    CreateScheduleModeChanged(ScheduleMode),
+    CreateScheduleValueChanged(String),
+    CreateScheduleJitterChanged(String),
+    CreateSchedulePaused(bool),
     PreviewCollection,
     CollectionPreviewed(ScopedResult<CollectionSelectionPreview>),
     CreateCollection,
     CollectionCreated(ScopedResult<DashboardSnapshot>),
     UpdateCollection(CollectionId),
     CollectionUpdated(ScopedResult<DashboardSnapshot>),
+    EditSchedule(CollectionId),
+    EditScheduleModeChanged(ScheduleMode),
+    EditScheduleValueChanged(String),
+    EditScheduleJitterChanged(String),
+    EditSchedulePaused(bool),
+    SaveSchedule,
+    ScheduleSaved(ScopedResult<DashboardSnapshot>),
     VerifyFull,
     VerificationFinished(ScopedResult<VerificationReport>),
     OpenReader,
@@ -908,6 +1126,7 @@ enum PathStatus {
 struct DashboardSnapshot {
     path: PathBuf,
     collections: Vec<StoredCollection>,
+    schedules: Vec<CollectionSchedule>,
     runs: Vec<SyncRunStatus>,
     checkpoints: Vec<SyncCheckpoint>,
     recent_revisions: Vec<RecentRevision>,
@@ -944,6 +1163,10 @@ struct CollectionForm {
     history_value: String,
     maximum_pages: String,
     maximum_bytes: String,
+    schedule_mode: ScheduleMode,
+    schedule_value: String,
+    schedule_jitter_minutes: String,
+    schedule_paused: bool,
 }
 
 impl Default for CollectionForm {
@@ -959,6 +1182,10 @@ impl Default for CollectionForm {
             history_value: String::new(),
             maximum_pages: "10000".to_owned(),
             maximum_bytes: String::new(),
+            schedule_mode: ScheduleMode::Manual,
+            schedule_value: String::new(),
+            schedule_jitter_minutes: "0".to_owned(),
+            schedule_paused: false,
         }
     }
 }
@@ -1035,6 +1262,15 @@ impl CollectionForm {
         }
         Ok(budget)
     }
+
+    fn schedule(&self) -> Result<ScheduleSettings, String> {
+        parse_schedule_settings(
+            self.schedule_mode,
+            &self.schedule_value,
+            &self.schedule_jitter_minutes,
+            self.schedule_paused,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1052,6 +1288,59 @@ enum HistoryMode {
     Complete,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScheduleMode {
+    Manual,
+    Interval,
+    DailyUtc,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScheduleSettings {
+    cadence: ScheduleCadence,
+    jitter_seconds: u32,
+    paused: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ScheduleEditor {
+    collection_id: CollectionId,
+    mode: ScheduleMode,
+    value: String,
+    jitter_minutes: String,
+    paused: bool,
+}
+
+impl ScheduleEditor {
+    fn from_schedule(collection_id: CollectionId, schedule: CollectionSchedule) -> Self {
+        let (mode, value) = match schedule.cadence {
+            ScheduleCadence::Manual => (ScheduleMode::Manual, String::new()),
+            ScheduleCadence::Interval(interval) => (
+                ScheduleMode::Interval,
+                (interval.seconds() / 60).to_string(),
+            ),
+            ScheduleCadence::DailyUtc(time) => {
+                let seconds = time.seconds_after_midnight();
+                (
+                    ScheduleMode::DailyUtc,
+                    format!("{:02}:{:02}", seconds / 3_600, (seconds % 3_600) / 60),
+                )
+            }
+        };
+        Self {
+            collection_id,
+            mode,
+            value,
+            jitter_minutes: (schedule.jitter_seconds / 60).to_string(),
+            paused: schedule.paused,
+        }
+    }
+
+    fn settings(&self) -> Result<ScheduleSettings, String> {
+        parse_schedule_settings(self.mode, &self.value, &self.jitter_minutes, self.paused)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PreviewCollectionRequest {
     api_endpoint: String,
@@ -1067,6 +1356,7 @@ struct CreateCollectionRequest {
     preview: CollectionSelectionPreview,
     history_policy: HistoryPolicy,
     budget: CollectionBudget,
+    schedule: ScheduleSettings,
 }
 
 #[derive(Clone, Debug)]
@@ -1156,6 +1446,21 @@ fn update_collection_task(
             ScopedResult { key, result }
         },
         Message::CollectionUpdated,
+    )
+}
+
+fn save_schedule_task(
+    key: RequestKey,
+    path: PathBuf,
+    collection_id: CollectionId,
+    schedule: ScheduleSettings,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = save_collection_schedule(path, collection_id, schedule).await;
+            ScopedResult { key, result }
+        },
+        Message::ScheduleSaved,
     )
 }
 
@@ -1288,6 +1593,22 @@ async fn create_collection_and_sync(
         CollectionRemovalPolicy::StopTrackingRetainHistory,
     )
     .map_err(|error| error.to_string())?;
+    let now = unix_time_seconds()?;
+    let next_run_at = next_occurrence_after(
+        request.schedule.cadence,
+        collection_id.get(),
+        request.schedule.jitter_seconds,
+        now,
+    );
+    library
+        .set_collection_schedule(
+            collection_id,
+            request.schedule.cadence,
+            request.schedule.jitter_seconds,
+            request.schedule.paused,
+            next_run_at,
+        )
+        .map_err(|error| error.to_string())?;
     let client = wikisync_mediawiki::MediaWikiClient::new(client_config)
         .map_err(|error| error.to_string())?;
     bootstrap_collection(&client, &mut library, collection_id)
@@ -1342,6 +1663,52 @@ async fn update_collection(
     snapshot(&library)
 }
 
+async fn save_collection_schedule(
+    path: PathBuf,
+    collection_id: CollectionId,
+    schedule: ScheduleSettings,
+) -> Result<DashboardSnapshot, String> {
+    match WriterAccess::discover(&path).map_err(|error| error.to_string())? {
+        WriterAccess::Daemon(client) => {
+            client
+                .forward_mutation(set_collection_schedule_mutation(
+                    collection_id.get(),
+                    schedule.cadence,
+                    schedule.jitter_seconds,
+                    schedule.paused,
+                ))
+                .map_err(|error| error.to_string())?;
+        }
+        WriterAccess::Direct(_lease) => {
+            let mut library = Library::open(&path).map_err(|error| error.to_string())?;
+            let next_run_at = next_occurrence_after(
+                schedule.cadence,
+                collection_id.get(),
+                schedule.jitter_seconds,
+                unix_time_seconds()?,
+            );
+            library
+                .set_collection_schedule(
+                    collection_id,
+                    schedule.cadence,
+                    schedule.jitter_seconds,
+                    schedule.paused,
+                    next_run_at,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    let library = Library::open(&path).map_err(|error| error.to_string())?;
+    snapshot(&library)
+}
+
+fn unix_time_seconds() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| "System clock is before the Unix epoch.".to_owned())
+}
+
 async fn verify_all_objects(path: PathBuf) -> Result<VerificationReport, String> {
     let library = Library::open(path).map_err(|error| error.to_string())?;
     verify_library(&library, VerificationScope::Full).map_err(|error| error.to_string())
@@ -1364,6 +1731,7 @@ fn open_system_browser(url: &str) -> Result<(), String> {
 
 fn snapshot(library: &Library) -> Result<DashboardSnapshot, String> {
     let collections = library.collections().map_err(|error| error.to_string())?;
+    let schedules = library.schedules().map_err(|error| error.to_string())?;
     let mut unique_pages = BTreeSet::new();
     for collection in &collections {
         for page in library
@@ -1412,6 +1780,7 @@ fn snapshot(library: &Library) -> Result<DashboardSnapshot, String> {
     Ok(DashboardSnapshot {
         path: library.root().to_path_buf(),
         collections,
+        schedules,
         runs,
         checkpoints,
         recent_revisions,
@@ -1492,6 +1861,90 @@ fn history_button(
         .into()
 }
 
+fn schedule_button(
+    label: &str,
+    mode: ScheduleMode,
+    selected: ScheduleMode,
+    message: fn(ScheduleMode) -> Message,
+) -> Element<'static, Message> {
+    let label = if mode == selected {
+        format!("• {label}")
+    } else {
+        label.to_owned()
+    };
+    button(text(label)).on_press(message(mode)).into()
+}
+
+fn schedule_value_hint(mode: ScheduleMode) -> &'static str {
+    match mode {
+        ScheduleMode::Manual => "No automatic schedule",
+        ScheduleMode::Interval => "Interval in minutes (1–527040)",
+        ScheduleMode::DailyUtc => "Daily UTC time (HH:MM)",
+    }
+}
+
+fn parse_schedule_settings(
+    mode: ScheduleMode,
+    value: &str,
+    jitter_minutes: &str,
+    paused: bool,
+) -> Result<ScheduleSettings, String> {
+    let jitter_minutes = jitter_minutes
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| "Schedule jitter must be a non-negative number of minutes.".to_owned())?;
+    let jitter_seconds = jitter_minutes
+        .checked_mul(60)
+        .ok_or_else(|| "Schedule jitter is too large.".to_owned())?;
+    let cadence = match mode {
+        ScheduleMode::Manual => {
+            if jitter_seconds != 0 {
+                return Err("Manual schedules cannot have jitter.".to_owned());
+            }
+            ScheduleCadence::Manual
+        }
+        ScheduleMode::Interval => {
+            let minutes = value.trim().parse::<u32>().map_err(|_| {
+                "Interval schedule requires a positive number of minutes.".to_owned()
+            })?;
+            let seconds = minutes
+                .checked_mul(60)
+                .ok_or_else(|| "Schedule interval is too large.".to_owned())?;
+            ScheduleCadence::interval(seconds).map_err(|error| error.to_string())?
+        }
+        ScheduleMode::DailyUtc => {
+            let (hours, minutes) = value
+                .trim()
+                .split_once(':')
+                .ok_or_else(|| "Daily UTC schedule must use HH:MM.".to_owned())?;
+            let hours = hours
+                .parse::<u32>()
+                .map_err(|_| "Daily UTC hour must be between 00 and 23.".to_owned())?;
+            let minutes = minutes
+                .parse::<u32>()
+                .map_err(|_| "Daily UTC minute must be between 00 and 59.".to_owned())?;
+            if hours >= 24 || minutes >= 60 {
+                return Err("Daily UTC schedule must use a time from 00:00 to 23:59.".to_owned());
+            }
+            ScheduleCadence::daily_utc(hours * 3_600 + minutes * 60)
+                .map_err(|error| error.to_string())?
+        }
+    };
+    if let ScheduleCadence::Interval(interval) = cadence
+        && jitter_seconds > interval.seconds()
+    {
+        return Err("Schedule jitter cannot exceed the interval.".to_owned());
+    }
+    if jitter_seconds > 86_400 {
+        return Err("Schedule jitter cannot exceed 1,440 minutes.".to_owned());
+    }
+    Ok(ScheduleSettings {
+        cadence,
+        jitter_seconds,
+        paused,
+    })
+}
+
 fn metric<'a>(label: &'a str, value: String) -> Element<'a, Message> {
     container(column![text(value).size(25), text(label).size(13)].spacing(3))
         .padding(12)
@@ -1499,7 +1952,35 @@ fn metric<'a>(label: &'a str, value: String) -> Element<'a, Message> {
         .into()
 }
 
-fn collection_row(collection: &StoredCollection, update_enabled: bool) -> Element<'_, Message> {
+fn collection_row<'a>(
+    collection: &'a StoredCollection,
+    schedule: Option<&CollectionSchedule>,
+    update_enabled: bool,
+) -> Element<'a, Message> {
+    let schedule = schedule.map_or_else(
+        || "Manual".to_owned(),
+        |schedule| {
+            let cadence = match schedule.cadence {
+                ScheduleCadence::Manual => "Manual".to_owned(),
+                ScheduleCadence::Interval(interval) => {
+                    format!("Every {} min", interval.seconds() / 60)
+                }
+                ScheduleCadence::DailyUtc(time) => {
+                    let seconds = time.seconds_after_midnight();
+                    format!(
+                        "Daily {:02}:{:02} UTC",
+                        seconds / 3_600,
+                        (seconds % 3_600) / 60
+                    )
+                }
+            };
+            if schedule.paused {
+                format!("{cadence} · paused")
+            } else {
+                cadence
+            }
+        },
+    );
     container(row![
         column![
             text(&collection.name).size(19),
@@ -1508,11 +1989,15 @@ fn collection_row(collection: &StoredCollection, update_enabled: bool) -> Elemen
                 collection.collection_id, collection.wiki_id
             ))
             .size(13),
+            text(schedule).size(13),
         ],
         Space::new(Length::Fill, Length::Shrink),
         text(format!("{} pages", collection.page_count)),
         button("Update").on_press_maybe(
             update_enabled.then_some(Message::UpdateCollection(collection.collection_id))
+        ),
+        button("Schedule").on_press_maybe(
+            update_enabled.then_some(Message::EditSchedule(collection.collection_id))
         ),
     ])
     .padding(12)
@@ -1688,7 +2173,7 @@ mod tests {
 
         let created = load_library_snapshot(&root, true).expect("create library");
         assert_eq!(created.path, root);
-        assert_eq!(created.schema_version, 6);
+        assert_eq!(created.schema_version, 7);
         assert!(root.join(DATABASE_NAME).is_file());
 
         let reopened = load_library_snapshot(&root, false).expect("reopen library");
@@ -1711,6 +2196,21 @@ mod tests {
         let budget = form.budget().expect("budget");
         assert_eq!(budget.maximum_pages().unwrap().get(), 100);
         assert_eq!(budget.maximum_bytes().unwrap().get(), 1_048_576);
+    }
+
+    #[test]
+    fn schedule_controls_parse_interval_daily_jitter_and_pause() {
+        let interval = parse_schedule_settings(ScheduleMode::Interval, "90", "10", true)
+            .expect("interval schedule");
+        assert!(matches!(interval.cadence, ScheduleCadence::Interval(_)));
+        assert_eq!(interval.jitter_seconds, 600);
+        assert!(interval.paused);
+
+        let daily = parse_schedule_settings(ScheduleMode::DailyUtc, "06:45", "5", false)
+            .expect("daily schedule");
+        assert!(matches!(daily.cadence, ScheduleCadence::DailyUtc(_)));
+        assert_eq!(daily.jitter_seconds, 300);
+        assert!(parse_schedule_settings(ScheduleMode::DailyUtc, "24:00", "0", false).is_err());
     }
 
     #[test]
@@ -1855,11 +2355,20 @@ mod tests {
                 .unwrap()
                 .with_maximum_bytes(1_000_000)
                 .unwrap(),
+            schedule: ScheduleSettings {
+                cadence: ScheduleCadence::interval(3_600).unwrap(),
+                jitter_seconds: 300,
+                paused: false,
+            },
         })
         .await
         .expect("create and sync");
         assert_eq!(created.collections[0].page_count, 1);
         let collection_id = created.collections[0].collection_id;
+        assert!(matches!(
+            created.schedules[0].cadence,
+            ScheduleCadence::Interval(_)
+        ));
 
         let updated = update_collection(temporary.path().to_path_buf(), collection_id)
             .await

@@ -614,6 +614,43 @@ pub struct ReconciliationLimits {
     pub max_revisions_per_page: usize,
 }
 
+/// Cooperative interruption check used at bounded reconciliation boundaries.
+///
+/// Cancellation is deliberately caller-owned: the synchronization engine observes
+/// the probe between durable jobs, requests, batches, revisions, and final metadata
+/// advancement. An in-flight bounded request or local transaction is allowed to
+/// finish before cancellation is reported.
+pub trait CancellationProbe: Sync {
+    /// Returns whether the caller has requested that reconciliation stop.
+    fn is_cancelled(&self) -> bool;
+}
+
+impl<F> CancellationProbe for F
+where
+    F: Fn() -> bool + Sync,
+{
+    fn is_cancelled(&self) -> bool {
+        self()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NeverCancelled;
+
+impl CancellationProbe for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+fn check_cancellation(cancellation: &dyn CancellationProbe) -> Result<(), CaptureError> {
+    if cancellation.is_cancelled() {
+        Err(CaptureError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
 impl Default for ReconciliationLimits {
     fn default() -> Self {
         Self {
@@ -1139,13 +1176,39 @@ pub async fn reconcile_collection_heads(
     collection_id: CollectionId,
     checkpoint_candidate: u64,
 ) -> Result<ReconciliationReport, CaptureError> {
-    reconcile_collection_heads_with_limits(
+    reconcile_collection_heads_with_limits_and_cancellation(
         client,
         library,
         wiki_id,
         collection_id,
         checkpoint_candidate,
         ReconciliationLimits::default(),
+        &NeverCancelled,
+    )
+    .await
+}
+
+/// Reconciles selected heads while cooperatively observing caller cancellation.
+///
+/// Cancellation leaves the durable run unfinished and resumable. Already completed
+/// jobs and canonical revision objects remain durable, while the page head and source
+/// checkpoint advance only after their bounded reconciliation work completes.
+pub async fn reconcile_collection_heads_with_cancellation(
+    client: &MediaWikiClient,
+    library: &mut Library,
+    wiki_id: WikiId,
+    collection_id: CollectionId,
+    checkpoint_candidate: u64,
+    cancellation: &dyn CancellationProbe,
+) -> Result<ReconciliationReport, CaptureError> {
+    reconcile_collection_heads_with_limits_and_cancellation(
+        client,
+        library,
+        wiki_id,
+        collection_id,
+        checkpoint_candidate,
+        ReconciliationLimits::default(),
+        cancellation,
     )
     .await
 }
@@ -1159,9 +1222,32 @@ pub async fn reconcile_collection_heads_with_limits(
     checkpoint_candidate: u64,
     limits: ReconciliationLimits,
 ) -> Result<ReconciliationReport, CaptureError> {
+    reconcile_collection_heads_with_limits_and_cancellation(
+        client,
+        library,
+        wiki_id,
+        collection_id,
+        checkpoint_candidate,
+        limits,
+        &NeverCancelled,
+    )
+    .await
+}
+
+/// Reconciles selected heads under explicit limits and cooperative cancellation.
+pub async fn reconcile_collection_heads_with_limits_and_cancellation(
+    client: &MediaWikiClient,
+    library: &mut Library,
+    wiki_id: WikiId,
+    collection_id: CollectionId,
+    checkpoint_candidate: u64,
+    limits: ReconciliationLimits,
+    cancellation: &dyn CancellationProbe,
+) -> Result<ReconciliationReport, CaptureError> {
     if limits.max_batches_per_page == 0 || limits.max_revisions_per_page == 0 {
         return Err(CaptureError::InvalidReconciliationLimits);
     }
+    check_cancellation(cancellation)?;
     let started = library.start_or_resume_sync_run(
         wiki_id,
         Some(collection_id),
@@ -1173,6 +1259,7 @@ pub async fn reconcile_collection_heads_with_limits(
     // Enqueue on both new and resumed runs to close the crash window between
     // creating a run and persisting its complete job set.
     for page in library.collection_pages(wiki_id, collection_id)? {
+        check_cancellation(cancellation)?;
         let key = format!("reconcile-page:{}", page.page_id);
         let subject = page.page_id.to_string();
         library.enqueue_sync_job(run_id, &key, "reconcile-page-head", Some(&subject))?;
@@ -1189,8 +1276,13 @@ pub async fn reconcile_collection_heads_with_limits(
         revisions_captured: 0,
         revisions_reused: 0,
     };
-    while let Some(job) = library.claim_next_sync_job(run_id)? {
+    loop {
+        check_cancellation(cancellation)?;
+        let Some(job) = library.claim_next_sync_job(run_id)? else {
+            break;
+        };
         let result = async {
+            check_cancellation(cancellation)?;
             let raw_page_id = job
                 .subject
                 .as_deref()
@@ -1202,12 +1294,22 @@ pub async fn reconcile_collection_heads_with_limits(
             let page = library
                 .page(wiki_id, page_id)?
                 .ok_or(StoreError::PageNotFound { wiki_id, page_id })?;
-            reconcile_page_head(client, library, wiki_id, collection_id, &page, limits).await
+            reconcile_page_head(
+                client,
+                library,
+                wiki_id,
+                collection_id,
+                &page,
+                limits,
+                cancellation,
+            )
+            .await
         }
         .await;
 
         match result {
             Ok(page_report) => {
+                check_cancellation(cancellation)?;
                 library.complete_sync_job(job.job_id)?;
                 report.pages_checked += 1;
                 report.differing_heads += usize::from(page_report.head_differed);
@@ -1217,6 +1319,7 @@ pub async fn reconcile_collection_heads_with_limits(
                 report.revisions_captured += page_report.revisions_captured;
                 report.revisions_reused += page_report.revisions_reused;
             }
+            Err(CaptureError::Cancelled) => return Err(CaptureError::Cancelled),
             Err(error) => {
                 let retryable = error.is_retryable();
                 library.fail_sync_job(job.job_id, error.code(), &error.to_string(), retryable)?;
@@ -1228,6 +1331,7 @@ pub async fn reconcile_collection_heads_with_limits(
         }
     }
 
+    check_cancellation(cancellation)?;
     report.status = library.complete_sync_run(run_id, None)?;
     Ok(report)
 }
@@ -1239,10 +1343,13 @@ async fn reconcile_page_head(
     collection_id: CollectionId,
     stored_page: &StoredPage,
     limits: ReconciliationLimits,
+    cancellation: &dyn CancellationProbe,
 ) -> Result<PageReconciliationReport, CaptureError> {
+    check_cancellation(cancellation)?;
     let page = match client.resolve_page_head(stored_page.page_id).await? {
         PageHeadResolution::Found(page) => page,
         PageHeadResolution::Missing { page_id } => {
+            check_cancellation(cancellation)?;
             library.mark_page_missing(wiki_id, collection_id, page_id)?;
             return Ok(PageReconciliationReport {
                 missing: true,
@@ -1250,6 +1357,7 @@ async fn reconcile_page_head(
             });
         }
     };
+    check_cancellation(cancellation)?;
     let head = page
         .current_revision
         .ok_or(CaptureError::MissingCurrentRevision(page.page_id))?;
@@ -1279,11 +1387,15 @@ async fn reconcile_page_head(
                 &durable_tip,
                 limits,
                 &mut report,
+                cancellation,
             )
             .await?;
         }
     }
 
+    // Head and search-index advancement form one bounded completion boundary.
+    // Do not observe cancellation between them and expose a half-updated page.
+    check_cancellation(cancellation)?;
     library.reconcile_current_revision(
         wiki_id,
         collection_id,
@@ -1313,12 +1425,14 @@ async fn stream_forward_gap(
     durable_tip: &wikisync_store::StoredRevision,
     limits: ReconciliationLimits,
     report: &mut PageReconciliationReport,
+    cancellation: &dyn CancellationProbe,
 ) -> Result<(), CaptureError> {
     let mut continuation = None;
     let mut previous_revision = durable_tip.revision_id;
     let mut observed_anchor = false;
     let mut reached_remote_head = false;
     loop {
+        check_cancellation(cancellation)?;
         if report.revision_batches == limits.max_batches_per_page {
             return Err(CaptureError::ReconciliationLimitExceeded {
                 page_id,
@@ -1334,8 +1448,10 @@ async fn stream_forward_gap(
                 continuation.as_ref(),
             )
             .await?;
+        check_cancellation(cancellation)?;
         report.revision_batches += 1;
         for metadata in batch.revisions {
+            check_cancellation(cancellation)?;
             if !observed_anchor {
                 observed_anchor = true;
                 if metadata.revision_id != durable_tip.revision_id {
@@ -1366,9 +1482,11 @@ async fn stream_forward_gap(
                 validate_existing_revision(&existing, page_id, &metadata)?;
                 report.revisions_reused += 1;
             } else {
+                check_cancellation(cancellation)?;
                 let content = client
                     .revision_content(page_id, metadata.revision_id)
                     .await?;
+                check_cancellation(cancellation)?;
                 if content.metadata.parent_id != metadata.parent_id
                     || content.metadata.timestamp != metadata.timestamp
                 {
@@ -1388,6 +1506,7 @@ async fn stream_forward_gap(
                     &revision_capture(&content.metadata, &content.source),
                 )?;
                 report.revisions_captured += 1;
+                check_cancellation(cancellation)?;
             }
             previous_revision = metadata.revision_id;
             if metadata.revision_id == remote_head.revision_id {
@@ -1405,6 +1524,7 @@ async fn stream_forward_gap(
         if reached_remote_head {
             break;
         }
+        check_cancellation(cancellation)?;
         continuation = batch.continuation;
         if continuation.is_none() {
             break;
@@ -1417,6 +1537,7 @@ async fn stream_forward_gap(
             remote_head: remote_head.revision_id,
         });
     }
+    check_cancellation(cancellation)?;
     Ok(())
 }
 
@@ -1557,6 +1678,8 @@ fn mediawiki_sha1(bytes: &[u8]) -> String {
 /// A source, validation, or persistence failure during current-revision capture.
 #[derive(Debug)]
 pub enum CaptureError {
+    /// The caller cooperatively interrupted reconciliation at a durable boundary.
+    Cancelled,
     /// MediaWiki access failed.
     Source(ClientError),
     /// Durable local storage failed.
@@ -1641,6 +1764,7 @@ pub enum CaptureError {
 impl fmt::Display for CaptureError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str("synchronization was cancelled"),
             Self::Source(error) => error.fmt(formatter),
             Self::Store(error) => error.fmt(formatter),
             Self::Search(error) => error.fmt(formatter),
@@ -1732,6 +1856,7 @@ impl fmt::Display for CaptureError {
 impl CaptureError {
     fn code(&self) -> &'static str {
         match self {
+            Self::Cancelled => "cancelled",
             Self::Source(_) => "mediawiki-source",
             Self::Store(_) => "local-store",
             Self::Search(_) => "search-index",
@@ -1756,6 +1881,7 @@ impl CaptureError {
 
     fn is_retryable(&self) -> bool {
         match self {
+            Self::Cancelled => false,
             Self::Source(error) => error.is_retryable(),
             Self::Store(_) | Self::Search(_) => true,
             _ => false,

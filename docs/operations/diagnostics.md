@@ -1,10 +1,22 @@
 # Diagnostics and incident collection
 
-WikiSyncer does not yet implement the planned `wikisync doctor` command or a redacted
-diagnostic bundle. Until it does, collect the smallest useful evidence manually and
-review every file before sharing it. Never attach the library database, canonical
-objects, article/search text, socket files, or an unreviewed service log to a public
-issue.
+`wikisync doctor` collects a bounded, offline, allowlist-only diagnostic report. It
+can print human-readable output or JSON and can create a private JSON bundle without
+overwriting an existing file:
+
+```sh
+wikisync --library /absolute/path/to/library doctor
+wikisync --library /absolute/path/to/library doctor --json
+wikisync --library /absolute/path/to/library doctor --bundle ./wikisync-doctor.json
+```
+
+The bundle is created with mode `0600`. It contains versions, OS/architecture,
+filesystem and database-file aggregates, source/collection/schedule counts, bounded
+run/error aggregates, local control-plane state, and a quick logical-object integrity
+summary. It omits source endpoints, titles, collection names, paths, raw errors,
+content, object IDs, environment variables, and logs. Review every bundle before
+sharing it. Never attach the library database, canonical objects, article/search
+text, socket files, or an unreviewed service log to a public issue.
 
 ## Local checks
 
@@ -14,6 +26,7 @@ These commands inspect daemon control state without contacting MediaWiki:
 /absolute/path/to/wikisyncd --library /absolute/path/to/library health
 /absolute/path/to/wikisyncd --library /absolute/path/to/library status
 wikisync --library /absolute/path/to/library status --json
+wikisync --library /absolute/path/to/library doctor --json
 ```
 
 When connected, daemon status reports its PID, uptime, successful mutation count, and
@@ -23,7 +36,10 @@ rather than returning an offline status. CLI status separately reports durable s
 checkpoints, recent runs, job counts, and the latest recorded error. None of these is
 a whole-library integrity check or proof of upstream completeness. A daemon state of
 `idle` means that IPC and application dispatch are ready; it does not mean scheduling
-is configured or that the archive is current.
+is configured or that the archive is current. Doctor opens the database as an
+immutable read-only checkpointed snapshot so it creates no WAL/SHM files or migrations;
+while a daemon has uncheckpointed WAL data, its catalog and run counts may lag live
+state. Section failures are reported as redacted error codes rather than raw details.
 
 Inspect the service manager and recent logs:
 
@@ -59,13 +75,14 @@ SQLite database, WAL/SHM files, and daemon sockets should be `0600`. A permissiv
 unexpected owner is an incident to correct before restarting. Also check free space:
 SQLite and object installation require room for temporary and durable files.
 
-Do not delete `.wikisyncd.sock`, `.wikisync-writer.sock`, `tmp/`, loose objects, packs,
-or WAL files as a generic repair step. First stop every process, retain a backup, and
-determine whether the file is active or recoverable state. Normal IPC shutdown removes
-both sockets. After a crash, automatic startup deliberately refuses to unlink a stale
-socket. Only after service-manager and process inspection prove that neither path is
-owned may an operator remove the confirmed stale socket files; do not remove any
-database or object-store file with them.
+Do not delete `.wikisyncd.sock`, `.wikisync-writer.sock`, `.wikisync-ipc.lock`, `tmp/`,
+loose objects, packs, or WAL files as a generic repair step. Normal IPC shutdown
+removes both sockets. After a crash, cooperating WikiSyncer processes serialize
+startup through the private advisory lock and replace only a nonresponsive socket
+whose device/inode identity remains unchanged. Active sockets, symlinks, and regular
+files are preserved and cause startup to fail safely. Manual socket removal should
+therefore be unnecessary; investigate any repeated recovery failure before changing
+the library.
 
 ## Database checks versus canonical verification
 

@@ -1,3 +1,5 @@
+mod doctor;
+
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -20,7 +22,7 @@ use wikisync_store::{
     Library, StoreError, StoredPage, StoredRevision, SyncCheckpoint, SyncRunState, SyncRunStatus,
 };
 use wikisync_sync::{CategoryPreviewLimits, preview_category_selection};
-use wikisyncd::{ApplicationHandler, Mutation, RequestHandler, WriterAccess};
+use wikisyncd::{ApplicationHandler, Mutation, OperationControl, RequestHandler, WriterAccess};
 
 const USAGE: &str = "WikiSyncer offline reader
 
@@ -34,6 +36,7 @@ Usage:
   wikisync --library <path> verify [--full]
   wikisync --library <path> compact
   wikisync --library <path> status [--json]
+  wikisync --library <path> doctor [--json] [--bundle <new-file>]
   wikisync --library <path> serve [--port <port>]
   wikisync --help
   wikisync --version
@@ -78,6 +81,9 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                 )));
             }
             let library_root = library;
+            if let Command::Doctor { json, bundle } = &command {
+                return doctor::run(&library_root, *json, bundle.as_deref()).map_err(Into::into);
+            }
             match command {
                 Command::Sync { collection_id } => {
                     let mutation = collection_id
@@ -131,6 +137,9 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                 Command::Sync { .. } | Command::Verify { .. } | Command::Compact => {
                     unreachable!("mutating commands returned before opening a reader")
                 }
+                Command::Doctor { .. } => {
+                    unreachable!("doctor returned before opening the normal reader")
+                }
             }
         }
     }
@@ -141,7 +150,7 @@ fn mutate_library(library_root: &std::path::Path, mutation: Mutation) -> Result<
         WriterAccess::Daemon(client) => client.forward_mutation(mutation)?,
         WriterAccess::Direct(_lease) => {
             let mut handler = ApplicationHandler::new(library_root)?;
-            handler.mutate(mutation)?
+            handler.mutate(mutation, OperationControl::running())?
         }
     };
     println!("{}", outcome.result);
@@ -740,6 +749,10 @@ enum Command {
     Status {
         json: bool,
     },
+    Doctor {
+        json: bool,
+        bundle: Option<PathBuf>,
+    },
     Serve {
         port: u16,
     },
@@ -769,7 +782,7 @@ fn parse(
             Some("--version" | "-V") => return Ok(Action::Version),
             Some(
                 "category-preview" | "search" | "show" | "history" | "diff" | "sync" | "verify"
-                | "compact" | "status" | "serve",
+                | "compact" | "status" | "doctor" | "serve",
             ) => break argument,
             Some(value) => return Err(CliError::usage(format!("unknown command {value:?}"))),
             None => return Err(CliError::usage("arguments must be valid UTF-8")),
@@ -797,6 +810,7 @@ fn parse(
         Some("verify") => parse_verify(values)?,
         Some("compact") => parse_compact(values)?,
         Some("status") => parse_status(values)?,
+        Some("doctor") => parse_doctor(values)?,
         Some("serve") => parse_serve(values)?,
         _ => unreachable!("validated command"),
     };
@@ -871,6 +885,25 @@ fn parse_status(values: Vec<String>) -> Result<Command, CliError> {
         }
     }
     Ok(Command::Status { json })
+}
+
+fn parse_doctor(values: Vec<String>) -> Result<Command, CliError> {
+    let mut json = false;
+    let mut bundle = None;
+    let mut values = values.into_iter();
+    while let Some(value) = values.next() {
+        match value.as_str() {
+            "--json" => json = true,
+            "--bundle" => {
+                let path = PathBuf::from(required_value(&mut values, "--bundle")?);
+                if bundle.replace(path).is_some() {
+                    return Err(CliError::usage("--bundle may only be supplied once"));
+                }
+            }
+            _ => return Err(CliError::usage(format!("unknown doctor option {value:?}"))),
+        }
+    }
+    Ok(Command::Doctor { json, bundle })
 }
 
 fn parse_sync(values: Vec<String>) -> Result<Command, CliError> {
@@ -1138,6 +1171,12 @@ impl From<wikisyncd::OperationError> for CliError {
     }
 }
 
+impl From<doctor::DoctorError> for CliError {
+    fn from(error: doctor::DoctorError) -> Self {
+        Self::message(error.to_string())
+    }
+}
+
 impl From<wikisync_mediawiki::ConfigError> for CliError {
     fn from(error: wikisync_mediawiki::ConfigError) -> Self {
         Self::message(error.to_string())
@@ -1315,6 +1354,40 @@ mod tests {
                 library: PathBuf::from("/tmp/wiki"),
                 command: Command::Compact,
             }
+        );
+    }
+
+    #[test]
+    fn parses_offline_doctor_outputs() {
+        assert_eq!(
+            parse([
+                "--library",
+                "/tmp/wiki",
+                "doctor",
+                "--json",
+                "--bundle",
+                "/tmp/doctor.json",
+            ])
+            .expect("doctor parse"),
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::Doctor {
+                    json: true,
+                    bundle: Some(PathBuf::from("/tmp/doctor.json")),
+                },
+            }
+        );
+        assert!(
+            parse([
+                "--library",
+                "/tmp/wiki",
+                "doctor",
+                "--bundle",
+                "one",
+                "--bundle",
+                "two",
+            ])
+            .is_err()
         );
     }
 

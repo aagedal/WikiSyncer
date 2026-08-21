@@ -5,10 +5,10 @@ create a library, configure synchronization schedules, or grant system-wide acce
 The daemon remains in the foreground under the service manager and is the long-lived
 writer for one library.
 
-The current daemon has a graceful IPC `shutdown` command but no `SIGTERM`/`SIGINT`
-handler. The systemd unit uses `ExecStop` to request IPC shutdown. launchd has no
-equivalent stop hook, so operators must call `shutdown` before `bootout`; logout and
-other signal-driven termination remain an explicit beta limitation.
+The daemon handles its IPC `shutdown` command, `SIGTERM`, and `SIGINT` through the
+same cooperative stop path after the active operation completes. The systemd unit
+uses `ExecStop` to request IPC shutdown; operators should still call `shutdown`
+before a deliberate launchd `bootout` so failures are visible.
 
 Replace every template token before installation:
 
@@ -27,7 +27,8 @@ escaping for `&`, `<`, and `>`; choosing ordinary absolute paths avoids that iss
 optional and only runs the local `health` command every 15 minutes. It is not a sync
 schedule, does not contact MediaWiki, and does not restart an intentionally disabled
 daemon. Explicit GUI/CLI requests can forward synchronization, verification, and
-compaction through the daemon, but schedule dispatch remains unfinished.
+compaction through the daemon. Synchronization schedules are durable library
+configuration edited in the GUI; they are not service-manager timers.
 
 See [service-management.md](../docs/operations/service-management.md) for a cautious,
 manual installation procedure. Packaging automation should perform the same token

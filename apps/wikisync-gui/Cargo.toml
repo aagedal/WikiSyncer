@@ -12,13 +12,13 @@ workspace = true
 
 [dependencies]
 iced = { version = "0.13", default-features = false, features = ["tiny-skia", "tokio"] }
-wikisync-core = { path = "../../crates/wikisync-core" }
-wikisync-integrity = { path = "../../crates/wikisync-integrity" }
-wikisync-mediawiki = { path = "../../crates/wikisync-mediawiki" }
-wikisync-store = { path = "../../crates/wikisync-store" }
-wikisync-sync = { path = "../../crates/wikisync-sync" }
-wikisync-web = { path = "../../crates/wikisync-web" }
-wikisyncd = { path = "../wikisyncd" }
+wikisync-core = { version = "=0.1.0", path = "../../crates/wikisync-core" }
+wikisync-integrity = { version = "=0.1.0", path = "../../crates/wikisync-integrity" }
+wikisync-mediawiki = { version = "=0.1.0", path = "../../crates/wikisync-mediawiki" }
+wikisync-store = { version = "=0.1.0", path = "../../crates/wikisync-store" }
+wikisync-sync = { version = "=0.1.0", path = "../../crates/wikisync-sync" }
+wikisync-web = { version = "=0.1.0", path = "../../crates/wikisync-web" }
+wikisyncd = { version = "=0.1.0", path = "../wikisyncd" }
 
 [dev-dependencies]
 tempfile = "3.20"

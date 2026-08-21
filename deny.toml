@@ -1,5 +1,15 @@
 [advisories]
 yanked = "deny"
+ignore = [
+    # Iced 0.13 pulls `instant` through its wasm-only timer support. The advisory
+    # reports unmaintained status and offers no safe compatible upgrade.
+    "RUSTSEC-2024-0384",
+    # Iced 0.13's text stack currently pins rustybuzz/cosmic-text versions that
+    # transitively use the unmaintained ttf-parser line. Neither advisory reports
+    # a vulnerability or offers a safe upgrade within the current Iced release.
+    "RUSTSEC-2026-0192",
+    "RUSTSEC-2026-0206",
+]
 
 [bans]
 multiple-versions = "warn"
