@@ -7,11 +7,14 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use wikisync_core::{CollectionId, PageId, PageTitle, RevisionId, WikiId};
@@ -672,6 +675,59 @@ pub struct Library {
     config: StoreConfig,
 }
 
+fn prepare_library_directories(root: &Path) -> io::Result<()> {
+    for directory in [
+        root.to_path_buf(),
+        root.join("objects"),
+        root.join("objects/loose"),
+        root.join("objects/loose/b3"),
+        root.join("objects/packs"),
+        root.join("tmp"),
+    ] {
+        create_private_dir_all(&directory)?;
+    }
+    Ok(())
+}
+
+fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn prepare_private_database_file(path: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "library database cannot be a symbolic link",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    drop(options.open(path)?);
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+fn restrict_sqlite_file_permissions(database_path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    for suffix in ["", "-wal", "-shm"] {
+        let mut path = database_path.as_os_str().to_os_string();
+        path.push(suffix);
+        let path = PathBuf::from(path);
+        if path.exists() {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = database_path;
+    Ok(())
+}
+
 impl Library {
     /// Opens or creates a library using default object bounds.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -684,16 +740,17 @@ impl Library {
         config: StoreConfig,
     ) -> Result<Self, StoreError> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(root.join("objects/loose/b3"))?;
-        fs::create_dir_all(root.join("objects/packs"))?;
-        fs::create_dir_all(root.join("tmp"))?;
+        prepare_library_directories(&root)?;
 
-        let connection = Connection::open(root.join(DATABASE_NAME))?;
+        let database_path = root.join(DATABASE_NAME);
+        prepare_private_database_file(&database_path)?;
+        let connection = Connection::open(&database_path)?;
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         migrate(&connection)?;
+        restrict_sqlite_file_permissions(&database_path)?;
 
         Ok(Self {
             root,
@@ -1434,6 +1491,178 @@ impl Library {
             .transpose()
     }
 
+    /// Lists the pages currently selected by one collection in stable page-ID order.
+    pub fn collection_pages(
+        &self,
+        wiki_id: WikiId,
+        collection_id: CollectionId,
+    ) -> Result<Vec<StoredPage>, StoreError> {
+        let owns_collection: bool = self.connection.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM collections WHERE collection_id = ?1 AND wiki_id = ?2
+             )",
+            params![
+                to_sql_integer(collection_id.get())?,
+                to_sql_integer(wiki_id.get())?
+            ],
+            |row| row.get(0),
+        )?;
+        if !owns_collection {
+            return Err(StoreError::CollectionWikiMismatch);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT pages.page_id, pages.namespace, pages.current_title,
+                    pages.current_revision_id
+             FROM collection_pages
+             JOIN pages USING (wiki_id, page_id)
+             WHERE collection_pages.collection_id = ?1 AND pages.wiki_id = ?2
+             ORDER BY pages.page_id",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    to_sql_integer(collection_id.get())?,
+                    to_sql_integer(wiki_id.get())?
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i32>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(raw_page_id, namespace, title, raw_revision_id)| {
+                Ok(StoredPage {
+                    wiki_id,
+                    page_id: sql_id(raw_page_id, "invalid stored page ID")?,
+                    namespace,
+                    title: PageTitle::new(title)
+                        .map_err(|_| StoreError::CorruptMetadata("invalid stored page title"))?,
+                    current_revision_id: raw_revision_id
+                        .map(|value| sql_id(value, "invalid stored revision ID"))
+                        .transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    /// Marks a selected page currently unavailable while retaining its captured head
+    /// and complete local history.
+    pub fn mark_page_missing(
+        &mut self,
+        wiki_id: WikiId,
+        collection_id: CollectionId,
+        page_id: PageId,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE pages SET state = 'missing', updated_at = ?4
+             WHERE wiki_id = ?1 AND page_id = ?2
+               AND EXISTS (
+                   SELECT 1 FROM collection_pages
+                   JOIN collections USING (collection_id)
+                   WHERE collection_pages.collection_id = ?3
+                     AND collection_pages.wiki_id = ?1
+                     AND collection_pages.page_id = ?2
+                     AND collections.wiki_id = ?1
+               )",
+            params![
+                to_sql_integer(wiki_id.get())?,
+                to_sql_integer(page_id.get())?,
+                to_sql_integer(collection_id.get())?,
+                unix_time()?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::PageNotFound { wiki_id, page_id });
+        }
+        Ok(())
+    }
+
+    /// Records an observed page title and head after that revision is durable.
+    ///
+    /// The page must already belong to the collection and the revision must already
+    /// be captured for that page. This transaction changes only mutable page-head
+    /// metadata; immutable revision and content-object records are never rewritten.
+    pub fn reconcile_current_revision(
+        &mut self,
+        wiki_id: WikiId,
+        collection_id: CollectionId,
+        page_id: PageId,
+        namespace: i32,
+        title: &PageTitle,
+        revision_id: RevisionId,
+    ) -> Result<(), StoreError> {
+        let now = unix_time()?;
+        let raw_wiki_id = to_sql_integer(wiki_id.get())?;
+        let raw_collection_id = to_sql_integer(collection_id.get())?;
+        let raw_page_id = to_sql_integer(page_id.get())?;
+        let raw_revision_id = to_sql_integer(revision_id.get())?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let selected: bool = transaction.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM collection_pages
+                JOIN collections USING (collection_id)
+                WHERE collection_pages.collection_id = ?1
+                  AND collection_pages.wiki_id = ?2
+                  AND collection_pages.page_id = ?3
+                  AND collections.wiki_id = ?2
+             )",
+            params![raw_collection_id, raw_wiki_id, raw_page_id],
+            |row| row.get(0),
+        )?;
+        if !selected {
+            return Err(StoreError::PageNotFound { wiki_id, page_id });
+        }
+        let revision_time: Option<String> = transaction
+            .query_row(
+                "SELECT revision_time FROM revisions
+                 WHERE wiki_id = ?1 AND page_id = ?2 AND revision_id = ?3",
+                params![raw_wiki_id, raw_page_id, raw_revision_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(revision_time) = revision_time else {
+            return Err(StoreError::RevisionNotFound(revision_id));
+        };
+
+        transaction.execute(
+            "UPDATE pages SET namespace = ?3, current_title = ?4,
+                    current_revision_id = ?5, current_revision_time = ?6,
+                    state = 'active', updated_at = ?7
+             WHERE wiki_id = ?1 AND page_id = ?2",
+            params![
+                raw_wiki_id,
+                raw_page_id,
+                namespace,
+                title.as_str(),
+                raw_revision_id,
+                revision_time,
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO page_titles (
+                wiki_id, page_id, title, first_observed_at, last_observed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(wiki_id, page_id, title) DO UPDATE SET
+                last_observed_at = excluded.last_observed_at",
+            params![raw_wiki_id, raw_page_id, title.as_str(), now],
+        )?;
+        transaction.execute(
+            "DELETE FROM unresolved_titles WHERE collection_id = ?1 AND title = ?2",
+            params![raw_collection_id, title.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Finds pages with a remote ID across configured wikis.
     ///
     /// Remote page IDs are unique only within a wiki, so callers should report
@@ -1599,6 +1828,32 @@ impl Library {
             .collect()
     }
 
+    /// Returns the newest durable revision for a page without loading its history.
+    pub fn newest_revision_for_page(
+        &self,
+        wiki_id: WikiId,
+        page_id: PageId,
+    ) -> Result<Option<StoredRevision>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT wiki_id, revision_id, page_id, parent_revision_id,
+                        revision_time, author_name, author_id, comment, is_minor,
+                        source_size, upstream_sha1, content_model, content_object_id,
+                        captured_at
+                 FROM revisions
+                 WHERE wiki_id = ?1 AND page_id = ?2
+                 ORDER BY revision_time DESC, revision_id DESC LIMIT 1",
+                params![
+                    to_sql_integer(wiki_id.get())?,
+                    to_sql_integer(page_id.get())?
+                ],
+                revision_row,
+            )
+            .optional()?
+            .map(|row| stored_revision(row).map(|(_, revision)| revision))
+            .transpose()
+    }
+
     /// Finds revisions with a remote ID across configured wikis.
     ///
     /// Remote revision IDs are unique only within a wiki, so callers should report
@@ -1757,7 +2012,7 @@ impl Library {
         let parent = absolute_path.parent().ok_or(StoreError::CorruptMetadata(
             "loose object path has no parent",
         ))?;
-        fs::create_dir_all(parent)?;
+        create_private_dir_all(parent)?;
 
         // Replacing an existing path is safe: the content-derived target name can
         // only be reached by the same canonical bytes. `persist` uses an atomic
@@ -3526,6 +3781,8 @@ pub enum StoreError {
         /// Stable remote page identity.
         page_id: PageId,
     },
+    /// A page head referred to a revision that is not durable locally.
+    RevisionNotFound(RevisionId),
     /// An existing remote revision was observed with different immutable identity data.
     ConflictingRevision(RevisionId),
     /// A checkpoint boundary preceded the required overlap-window start.
@@ -3601,6 +3858,9 @@ impl fmt::Display for StoreError {
                     formatter,
                     "page {page_id} from wiki {wiki_id} is not captured"
                 )
+            }
+            Self::RevisionNotFound(revision_id) => {
+                write!(formatter, "revision {revision_id} is not captured")
             }
             Self::ConflictingRevision(revision_id) => write!(
                 formatter,
@@ -3684,6 +3944,69 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary library");
         let library = Library::open(directory.path()).expect("open library");
         (directory, library)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_a_library_enforces_user_only_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary parent");
+        let root = directory.path().join("library");
+        fs::create_dir(&root).expect("library root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755))
+            .expect("insecure root permissions");
+        let database = root.join(DATABASE_NAME);
+        fs::write(&database, []).expect("empty database");
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o644))
+            .expect("insecure database permissions");
+
+        let mut library = Library::open(&root).expect("open and harden library");
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        for relative in [
+            "objects",
+            "objects/loose",
+            "objects/loose/b3",
+            "objects/packs",
+            "tmp",
+        ] {
+            assert_eq!(
+                fs::metadata(root.join(relative))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "{relative} must be private"
+            );
+        }
+
+        let object = library
+            .put_bytes(ObjectKind::Wikitext, b"private object")
+            .expect("store object");
+        let relative_path: String = library
+            .connection()
+            .query_row(
+                "SELECT relative_path FROM object_locations WHERE object_id = ?1",
+                [object.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("object path");
+        assert_eq!(
+            fs::metadata(root.join(relative_path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -4238,6 +4561,25 @@ mod tests {
                 .expect("canonical source"),
             capture.source
         );
+    }
+
+    #[test]
+    fn collection_page_listing_rejects_a_collection_from_another_wiki() {
+        let (_directory, mut library) = test_library();
+        let first_wiki = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("first wiki");
+        let second_wiki = library
+            .register_wiki("https://de.wikipedia.org/w/api.php", "de")
+            .expect("second wiki");
+        let collection = library
+            .create_explicit_collection(first_wiki, "Fixture collection")
+            .expect("collection");
+
+        assert!(matches!(
+            library.collection_pages(second_wiki, collection),
+            Err(StoreError::CollectionWikiMismatch)
+        ));
     }
 
     #[test]

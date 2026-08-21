@@ -1,0 +1,12 @@
+{
+  "continue": {
+    "cmcontinue": "page|42455441|0|BETA",
+    "continue": "-||"
+  },
+  "query": {
+    "categorymembers": [
+      {"pageid": 101, "ns": 0, "title": "Alpha"},
+      {"pageid": 201, "ns": 14, "title": "Category:Subtopic"}
+    ]
+  }
+}

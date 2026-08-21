@@ -12,16 +12,19 @@ use wikisync_content::{
     ContentDiff, DiffLine, DiffMode, DiffTag, diff as content_diff, to_markdown, to_plain_text,
 };
 use wikisync_core::{PageTitle, RevisionId, WikiId};
+use wikisync_mediawiki::{ClientConfig, MediaWikiClient};
 use wikisync_search::{
     MAX_SEARCH_RESULTS, SearchError, SearchIndex, SearchQuery, SqliteSearchIndex,
 };
 use wikisync_store::{
     Library, StoreError, StoredPage, StoredRevision, SyncCheckpoint, SyncRunState, SyncRunStatus,
 };
+use wikisync_sync::{CategoryPreviewLimits, preview_category_selection};
 
 const USAGE: &str = "WikiSyncer offline reader
 
 Usage:
+  wikisync category-preview --api-endpoint <url> [--depth <edges>] [--json] <Category:title>
   wikisync --library <path> search [--wiki <id>] [--limit <count>] [--json] <query>
   wikisync --library <path> show [--wiki <id>] [--revision <id>] [--json] [--source] <title>
   wikisync --library <path> history [--wiki <id>] [--json] <title>
@@ -31,7 +34,11 @@ Usage:
   wikisync --help
   wikisync --version
 
-The WIKISYNC_LIBRARY environment variable may replace --library.";
+The WIKISYNC_LIBRARY environment variable may replace --library.
+
+category-preview is network-only and does not change collection membership. It selects
+only main-namespace pages, traverses namespace-14 subcategories, and defaults to bounds
+of 16 levels, 1,000 categories, 10,000 pages, and 20,000 API responses.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1)) {
@@ -53,6 +60,12 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
             println!("wikisync {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        Action::CategoryPreview {
+            api_endpoint,
+            category,
+            depth,
+            json,
+        } => category_preview(&api_endpoint, &category, depth, json),
         Action::Command { library, command } => {
             if !library.join("library.sqlite3").is_file() {
                 return Err(CliError::message(format!(
@@ -102,6 +115,70 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
             }
         }
     }
+}
+
+fn category_preview(
+    api_endpoint: &str,
+    category: &PageTitle,
+    depth: u16,
+    json_output: bool,
+) -> Result<(), CliError> {
+    let config = ClientConfig::new(
+        api_endpoint,
+        format!(
+            "WikiSyncer/{} ({})",
+            env!("CARGO_PKG_VERSION"),
+            env!("CARGO_PKG_REPOSITORY")
+        ),
+    )?;
+    let client = MediaWikiClient::new(config)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let limits = CategoryPreviewLimits::default();
+    let preview = runtime.block_on(preview_category_selection(&client, category, depth, limits))?;
+
+    if json_output {
+        write_json(&json!({
+            "root": preview.root.as_str(),
+            "recursion_depth": preview.recursion_depth,
+            "page_count": preview.pages.len(),
+            "category_count": preview.categories.len(),
+            "batches": preview.batches,
+            "limits": {
+                "max_recursion_depth": limits.max_recursion_depth,
+                "max_categories": limits.max_categories,
+                "max_pages": limits.max_pages,
+                "max_batches": limits.max_batches,
+            },
+            "categories": preview.categories.iter().map(|category| json!({
+                "title": category.title.as_str(),
+                "depth": category.depth,
+            })).collect::<Vec<_>>(),
+            "pages": preview.pages.iter().map(|page| json!({
+                "page_id": page.page_id.get(),
+                "namespace": page.namespace,
+                "title": page.title.as_str(),
+            })).collect::<Vec<_>>(),
+        }))?;
+    } else {
+        println!(
+            "Category preview: {} (depth {}, {} pages, {} categories, {} API responses)",
+            preview.root,
+            preview.recursion_depth,
+            preview.pages.len(),
+            preview.categories.len(),
+            preview.batches,
+        );
+        println!(
+            "Bounds: depth {}, categories {}, pages {}, API responses {}",
+            limits.max_recursion_depth, limits.max_categories, limits.max_pages, limits.max_batches,
+        );
+        for page in preview.pages {
+            println!("{}\t{}", page.page_id, page.title);
+        }
+    }
+    Ok(())
 }
 
 fn status(library: &Library, json_output: bool) -> Result<(), CliError> {
@@ -577,7 +654,16 @@ fn write_json(value: &serde_json::Value) -> Result<(), CliError> {
 enum Action {
     Help,
     Version,
-    Command { library: PathBuf, command: Command },
+    CategoryPreview {
+        api_endpoint: String,
+        category: PageTitle,
+        depth: u16,
+        json: bool,
+    },
+    Command {
+        library: PathBuf,
+        command: Command,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -637,14 +723,13 @@ fn parse(
             }
             Some("--help" | "-h") => return Ok(Action::Help),
             Some("--version" | "-V") => return Ok(Action::Version),
-            Some("search" | "show" | "history" | "diff" | "status" | "serve") => break argument,
+            Some(
+                "category-preview" | "search" | "show" | "history" | "diff" | "status" | "serve",
+            ) => break argument,
             Some(value) => return Err(CliError::usage(format!("unknown command {value:?}"))),
             None => return Err(CliError::usage("arguments must be valid UTF-8")),
         }
     };
-    let library = library.ok_or_else(|| {
-        CliError::usage("--library <path> or WIKISYNC_LIBRARY is required for offline commands")
-    })?;
     let values = arguments
         .map(|value| {
             value
@@ -652,6 +737,12 @@ fn parse(
                 .map_err(|_| CliError::usage("arguments must be valid UTF-8"))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if command.to_str() == Some("category-preview") {
+        return parse_category_preview(values);
+    }
+    let library = library.ok_or_else(|| {
+        CliError::usage("--library <path> or WIKISYNC_LIBRARY is required for offline commands")
+    })?;
     let command = match command.to_str() {
         Some("search") => parse_search(values)?,
         Some("show") => parse_show(values)?,
@@ -662,6 +753,44 @@ fn parse(
         _ => unreachable!("validated command"),
     };
     Ok(Action::Command { library, command })
+}
+
+fn parse_category_preview(values: Vec<String>) -> Result<Action, CliError> {
+    let mut api_endpoint = None;
+    let mut depth = 0_u16;
+    let mut json = false;
+    let mut category = Vec::new();
+    let mut values = values.into_iter();
+    while let Some(value) = values.next() {
+        match value.as_str() {
+            "--api-endpoint" => api_endpoint = Some(required_value(&mut values, "--api-endpoint")?),
+            "--depth" => {
+                depth = required_value(&mut values, "--depth")?
+                    .parse::<u16>()
+                    .map_err(|_| CliError::usage("--depth requires an integer from 0 to 65535"))?;
+            }
+            "--json" => json = true,
+            value if value.starts_with('-') => {
+                return Err(CliError::usage(format!(
+                    "unknown category-preview option {value:?}"
+                )));
+            }
+            _ => category.push(value),
+        }
+    }
+    let api_endpoint = api_endpoint
+        .ok_or_else(|| CliError::usage("category-preview requires --api-endpoint <url>"))?;
+    let category = PageTitle::new(category.join(" ")).map_err(|error| {
+        CliError::usage(format!(
+            "category-preview requires a fully qualified category title: {error}"
+        ))
+    })?;
+    Ok(Action::CategoryPreview {
+        api_endpoint,
+        category,
+        depth,
+        json,
+    })
 }
 
 fn parse_serve(values: Vec<String>) -> Result<Command, CliError> {
@@ -910,6 +1039,24 @@ impl From<wikisync_web::ServeError> for CliError {
     }
 }
 
+impl From<wikisync_mediawiki::ConfigError> for CliError {
+    fn from(error: wikisync_mediawiki::ConfigError) -> Self {
+        Self::message(error.to_string())
+    }
+}
+
+impl From<wikisync_mediawiki::ClientError> for CliError {
+    fn from(error: wikisync_mediawiki::ClientError) -> Self {
+        Self::message(error.to_string())
+    }
+}
+
+impl From<wikisync_sync::CategoryPreviewError> for CliError {
+    fn from(error: wikisync_sync::CategoryPreviewError) -> Self {
+        Self::message(error.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,6 +1086,29 @@ mod tests {
                     limit: 7,
                     json: true,
                 }
+            }
+        );
+    }
+
+    #[test]
+    fn parses_standalone_category_preview_without_a_library() {
+        let action = parse([
+            "category-preview",
+            "--api-endpoint",
+            "https://en.wikipedia.org/w/api.php",
+            "--depth",
+            "2",
+            "--json",
+            "Category:Rust",
+        ])
+        .expect("category preview");
+        assert_eq!(
+            action,
+            Action::CategoryPreview {
+                api_endpoint: "https://en.wikipedia.org/w/api.php".to_owned(),
+                category: PageTitle::new("Category:Rust").expect("category"),
+                depth: 2,
+                json: true,
             }
         );
     }

@@ -1,0 +1,9 @@
+{
+  "batchcomplete": true,
+  "query": {
+    "categorymembers": [
+      {"pageid": 102, "ns": 0, "title": "Beta"},
+      {"pageid": 101, "ns": 0, "title": "Alpha"}
+    ]
+  }
+}

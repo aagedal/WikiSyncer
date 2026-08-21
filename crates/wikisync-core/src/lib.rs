@@ -5,6 +5,12 @@ use std::error::Error;
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
 
+/// MediaWiki's main/article namespace, selected by default for offline reading.
+pub const MAIN_NAMESPACE: i32 = 0;
+
+/// MediaWiki's category namespace, traversed but not selected as article content.
+pub const CATEGORY_NAMESPACE: i32 = 14;
+
 macro_rules! numeric_id {
     ($name:ident, $label:literal) => {
         #[doc = concat!("A validated ", $label, ".")]

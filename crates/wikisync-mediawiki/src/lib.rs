@@ -19,6 +19,7 @@ const DEFAULT_RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
 const DEFAULT_TITLES_PER_OPERATION: usize = 1_000;
 const DEFAULT_TITLES_PER_REQUEST: usize = 50;
 const DEFAULT_REVISIONS_PER_REQUEST: usize = 500;
+const DEFAULT_CATEGORY_MEMBERS_PER_REQUEST: usize = 500;
 
 /// Limits and source identity used by a [`MediaWikiClient`].
 #[derive(Clone, Debug)]
@@ -33,6 +34,7 @@ pub struct ClientConfig {
     max_titles_per_operation: NonZeroUsize,
     titles_per_request: NonZeroUsize,
     revisions_per_request: NonZeroUsize,
+    category_members_per_request: NonZeroUsize,
 }
 
 impl ClientConfig {
@@ -61,6 +63,7 @@ impl ClientConfig {
             max_titles_per_operation: nonzero(DEFAULT_TITLES_PER_OPERATION),
             titles_per_request: nonzero(DEFAULT_TITLES_PER_REQUEST),
             revisions_per_request: nonzero(DEFAULT_REVISIONS_PER_REQUEST),
+            category_members_per_request: nonzero(DEFAULT_CATEGORY_MEMBERS_PER_REQUEST),
         })
     }
 
@@ -105,6 +108,21 @@ impl ClientConfig {
     #[must_use]
     pub fn endpoint(&self) -> &Url {
         &self.endpoint
+    }
+
+    /// Sets the number of category members requested in one bounded response.
+    ///
+    /// MediaWiki caps this at 500 for normal users. A smaller value is useful for
+    /// constrained clients and deterministic continuation tests.
+    pub fn with_category_members_per_request(mut self, count: usize) -> Result<Self, ConfigError> {
+        if !(1..=500).contains(&count) {
+            return Err(ConfigError::InvalidLimit {
+                name: "category members per request",
+                maximum: 500,
+            });
+        }
+        self.category_members_per_request = nonzero(count);
+        Ok(self)
     }
 }
 
@@ -155,6 +173,13 @@ pub enum ConfigError {
         /// Human-readable name of the invalid limit.
         name: &'static str,
     },
+    /// A configurable request limit exceeded MediaWiki's supported maximum.
+    InvalidLimit {
+        /// Human-readable name of the invalid limit.
+        name: &'static str,
+        /// Largest accepted value.
+        maximum: usize,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -171,6 +196,9 @@ impl fmt::Display for ConfigError {
                 formatter.write_str("User-Agent must be non-empty and contain no controls")
             }
             Self::ZeroLimit { name } => write!(formatter, "{name} must be greater than zero"),
+            Self::InvalidLimit { name, maximum } => {
+                write!(formatter, "{name} must be between 1 and {maximum}")
+            }
         }
     }
 }
@@ -241,6 +269,51 @@ impl MediaWikiClient {
         Ok(resolved)
     }
 
+    /// Resolves the current public head for one stable MediaWiki page ID.
+    ///
+    /// Unlike title resolution, this remains attached to the same page across moves.
+    /// A missing response preserves the requested identity so callers can safely mark
+    /// the page unavailable without discarding its captured history.
+    pub async fn resolve_page_head(
+        &self,
+        page_id: PageId,
+    ) -> Result<PageHeadResolution, ClientError> {
+        let page_id_text = page_id.to_string();
+        let response: QueryResponse<PagesQuery> = self
+            .get_json(&[
+                ("action", "query"),
+                ("prop", "revisions"),
+                ("pageids", &page_id_text),
+                ("rvprop", "ids|timestamp|size|sha1"),
+                ("rvslots", "main"),
+            ])
+            .await?;
+        let mut pages = response.query.pages.into_iter();
+        let page = pages.next().ok_or(ClientError::InvalidResponse(
+            "page-head response did not contain the requested page",
+        ))?;
+        if pages.next().is_some() {
+            return Err(ClientError::InvalidResponse(
+                "page-head response contained more than one page",
+            ));
+        }
+        if page.missing {
+            return Ok(PageHeadResolution::Missing { page_id });
+        }
+        let resolved = match TitleResolution::try_from(page)? {
+            TitleResolution::Found(page) => page,
+            TitleResolution::Missing { .. } => {
+                return Ok(PageHeadResolution::Missing { page_id });
+            }
+        };
+        if resolved.page_id != page_id {
+            return Err(ClientError::InvalidResponse(
+                "page-head response returned a different page ID",
+            ));
+        }
+        Ok(PageHeadResolution::Found(Box::new(resolved)))
+    }
+
     /// Fetches one bounded page of revision metadata.
     ///
     /// Pass the returned continuation back to this method to obtain the next page.
@@ -248,6 +321,21 @@ impl MediaWikiClient {
     pub async fn revision_batch(
         &self,
         page_id: PageId,
+        order: RevisionOrder,
+        continuation: Option<&RevisionContinuation>,
+    ) -> Result<RevisionBatch, ClientError> {
+        self.revision_batch_from(page_id, None, order, continuation)
+            .await
+    }
+
+    /// Fetches one bounded revision-metadata page from an optional inclusive anchor.
+    ///
+    /// With [`RevisionOrder::OldestFirst`], an anchor lets reconciliation stream
+    /// forward from its newest durable revision without retaining the whole gap.
+    pub async fn revision_batch_from(
+        &self,
+        page_id: PageId,
+        start_revision: Option<RevisionId>,
         order: RevisionOrder,
         continuation: Option<&RevisionContinuation>,
     ) -> Result<RevisionBatch, ClientError> {
@@ -266,6 +354,11 @@ impl MediaWikiClient {
             ("rvdir", order.as_api_value()),
         ];
 
+        let start_revision_text = start_revision.map(|revision_id| revision_id.to_string());
+        if let Some(start_revision) = start_revision_text.as_deref() {
+            params.push(("rvstartid", start_revision));
+        }
+
         if let Some(continuation) = continuation {
             params.push(("continue", continuation.generic.as_str()));
             params.push(("rvcontinue", continuation.revisions.as_str()));
@@ -276,7 +369,7 @@ impl MediaWikiClient {
             .query
             .pages
             .into_iter()
-            .find(|page| page.page_id == Some(page_id.get()))
+            .find(|page| page.page_id == i64::try_from(page_id.get()).ok())
             .ok_or(ClientError::InvalidResponse(
                 "revision response did not contain the requested page",
             ))?;
@@ -290,7 +383,51 @@ impl MediaWikiClient {
 
         Ok(RevisionBatch {
             revisions,
-            continuation: response.continuation.map(Into::into),
+            continuation: response
+                .continuation
+                .map(RevisionContinuation::try_from)
+                .transpose()?,
+        })
+    }
+
+    /// Fetches one bounded page of main-namespace pages and subcategories.
+    ///
+    /// Pass the returned opaque continuation to the next call for the same
+    /// category. The source-side namespace filter excludes talk, file, user, and
+    /// other namespaces; response validation enforces that contract locally.
+    pub async fn category_members_batch(
+        &self,
+        category: &PageTitle,
+        continuation: Option<&CategoryContinuation>,
+    ) -> Result<CategoryMembersBatch, ClientError> {
+        let request_limit = self.config.category_members_per_request.get().to_string();
+        let mut params = vec![
+            ("action", "query"),
+            ("list", "categorymembers"),
+            ("cmtitle", category.as_str()),
+            ("cmtype", "page|subcat"),
+            ("cmnamespace", "0|14"),
+            ("cmlimit", &request_limit),
+        ];
+        if let Some(continuation) = continuation {
+            params.push(("continue", continuation.generic.as_str()));
+            params.push(("cmcontinue", continuation.category_members.as_str()));
+        }
+
+        let response: QueryResponse<CategoryMembersQuery> = self.get_json(&params).await?;
+        let members = response
+            .query
+            .category_members
+            .into_iter()
+            .map(CategoryMember::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let continuation = response
+            .continuation
+            .map(CategoryContinuation::try_from)
+            .transpose()?;
+        Ok(CategoryMembersBatch {
+            members,
+            continuation,
         })
     }
 
@@ -324,7 +461,7 @@ impl MediaWikiClient {
             .query
             .pages
             .into_iter()
-            .find(|page| page.page_id == Some(page_id.get()))
+            .find(|page| page.page_id == i64::try_from(page_id.get()).ok())
             .ok_or(ClientError::InvalidResponse(
                 "revision-content response did not contain the requested page",
             ))?;
@@ -460,6 +597,18 @@ pub enum TitleResolution {
     },
 }
 
+/// Current public state of one stable MediaWiki page identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PageHeadResolution {
+    /// The page remains public, with its current canonical title and revision.
+    Found(Box<ResolvedPage>),
+    /// The requested stable identity is not currently public.
+    Missing {
+        /// Stable identity supplied by the caller.
+        page_id: PageId,
+    },
+}
+
 /// Stable page metadata returned during title resolution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedPage {
@@ -521,6 +670,42 @@ pub struct RevisionBatch {
 pub struct RevisionContinuation {
     generic: String,
     revisions: String,
+}
+
+/// One main-namespace page or subcategory returned by category enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CategoryMember {
+    /// Stable MediaWiki page identity.
+    pub page_id: PageId,
+    /// Current canonical title.
+    pub title: PageTitle,
+    /// Whether this member is selectable article content or a traversal edge.
+    pub kind: CategoryMemberKind,
+}
+
+/// The namespace role of a category member.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CategoryMemberKind {
+    /// A page in MediaWiki's main namespace (namespace 0).
+    Page,
+    /// A category in MediaWiki's category namespace (namespace 14).
+    Subcategory,
+}
+
+/// One response page of category members and its opaque next-page token.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CategoryMembersBatch {
+    /// Main-namespace pages and subcategories in source order.
+    pub members: Vec<CategoryMember>,
+    /// Token for the next request for this category, or `None` at the end.
+    pub continuation: Option<CategoryContinuation>,
+}
+
+/// Opaque MediaWiki continuation values for category-member enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CategoryContinuation {
+    generic: String,
+    category_members: String,
 }
 
 /// A transport, bound, protocol, or remote API error.
@@ -672,15 +857,33 @@ struct QueryResponse<T> {
 struct ContinuationPayload {
     #[serde(rename = "continue")]
     generic: String,
-    rvcontinue: String,
+    rvcontinue: Option<String>,
+    cmcontinue: Option<String>,
 }
 
-impl From<ContinuationPayload> for RevisionContinuation {
-    fn from(value: ContinuationPayload) -> Self {
-        Self {
+impl TryFrom<ContinuationPayload> for RevisionContinuation {
+    type Error = ClientError;
+
+    fn try_from(value: ContinuationPayload) -> Result<Self, Self::Error> {
+        Ok(Self {
             generic: value.generic,
-            revisions: value.rvcontinue,
-        }
+            revisions: value.rvcontinue.ok_or(ClientError::InvalidResponse(
+                "revision continuation omitted rvcontinue",
+            ))?,
+        })
+    }
+}
+
+impl TryFrom<ContinuationPayload> for CategoryContinuation {
+    type Error = ClientError;
+
+    fn try_from(value: ContinuationPayload) -> Result<Self, Self::Error> {
+        Ok(Self {
+            generic: value.generic,
+            category_members: value.cmcontinue.ok_or(ClientError::InvalidResponse(
+                "category continuation omitted cmcontinue",
+            ))?,
+        })
     }
 }
 
@@ -690,9 +893,51 @@ struct PagesQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct CategoryMembersQuery {
+    #[serde(rename = "categorymembers")]
+    category_members: Vec<CategoryMemberPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CategoryMemberPayload {
+    #[serde(rename = "pageid")]
+    page_id: u64,
+    ns: i32,
+    title: String,
+}
+
+impl TryFrom<CategoryMemberPayload> for CategoryMember {
+    type Error = ClientError;
+
+    fn try_from(member: CategoryMemberPayload) -> Result<Self, Self::Error> {
+        let page_id = member
+            .page_id
+            .try_into()
+            .map_err(|_| ClientError::InvalidResponse("category member had a zero page ID"))?;
+        let title = PageTitle::new(member.title).map_err(|_| {
+            ClientError::InvalidResponse("MediaWiki returned an invalid category-member title")
+        })?;
+        let kind = match member.ns {
+            wikisync_core::MAIN_NAMESPACE => CategoryMemberKind::Page,
+            wikisync_core::CATEGORY_NAMESPACE => CategoryMemberKind::Subcategory,
+            _ => {
+                return Err(ClientError::InvalidResponse(
+                    "category response contained a member outside namespaces 0 and 14",
+                ));
+            }
+        };
+        Ok(Self {
+            page_id,
+            title,
+            kind,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct PagePayload {
     #[serde(rename = "pageid")]
-    page_id: Option<u64>,
+    page_id: Option<i64>,
     ns: i32,
     title: String,
     #[serde(default)]
@@ -713,9 +958,11 @@ impl TryFrom<PagePayload> for TitleResolution {
             });
         }
 
-        let page_id = page
+        let raw_page_id = page
             .page_id
-            .ok_or(ClientError::InvalidResponse("existing page had no page ID"))?
+            .ok_or(ClientError::InvalidResponse("existing page had no page ID"))?;
+        let page_id = u64::try_from(raw_page_id)
+            .map_err(|_| ClientError::InvalidResponse("MediaWiki returned an invalid page ID"))?
             .try_into()
             .map_err(|_| ClientError::InvalidResponse("MediaWiki returned a zero page ID"))?;
         let current_revision = page

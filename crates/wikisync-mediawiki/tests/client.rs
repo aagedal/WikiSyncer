@@ -5,7 +5,7 @@ use std::time::Duration;
 use support::{FixtureResponse, FixtureServer};
 use wikisync_core::{PageId, PageTitle};
 use wikisync_mediawiki::{
-    ClientConfig, ClientError, MediaWikiClient, RevisionOrder, TitleResolution,
+    CategoryMemberKind, ClientConfig, ClientError, MediaWikiClient, RevisionOrder, TitleResolution,
 };
 
 const TITLE_RESOLUTION: &str = include_str!("../../../fixtures/mediawiki/title-resolution.json");
@@ -14,6 +14,10 @@ const REVISIONS_PAGE_2: &str = include_str!("../../../fixtures/mediawiki/revisio
 const REVISION_CONTENT: &str = include_str!("../../../fixtures/mediawiki/revision-content.json");
 const MAXLAG: &str = include_str!("../../../fixtures/mediawiki/maxlag.json");
 const EMPTY_PAGES: &str = include_str!("../../../fixtures/mediawiki/empty-pages.json");
+const CATEGORY_MEMBERS_PAGE_1: &str =
+    include_str!("../../../fixtures/mediawiki/category-members-page-1.json");
+const CATEGORY_MEMBERS_PAGE_2: &str =
+    include_str!("../../../fixtures/mediawiki/category-members-page-2.json");
 
 fn fixture_client(server: &FixtureServer) -> MediaWikiClient {
     let config = ClientConfig::new(
@@ -132,6 +136,43 @@ async fn revision_continuation_round_trips_as_opaque_values() {
     assert!(requests[1].contains("rvcontinue=20260818100000%7C1299999999"));
     assert!(requests[1].contains("rvdir=older"));
     assert!(requests[1].contains("rvlimit=500"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn category_members_are_namespace_filtered_and_continuation_round_trips() {
+    let server = FixtureServer::start(vec![
+        FixtureResponse::json(CATEGORY_MEMBERS_PAGE_1),
+        FixtureResponse::json(CATEGORY_MEMBERS_PAGE_2),
+    ]);
+    let client = fixture_client(&server);
+    let category = PageTitle::new("Category:Root").expect("category title");
+
+    let first = client
+        .category_members_batch(&category, None)
+        .await
+        .expect("first category page");
+    assert_eq!(first.members.len(), 2);
+    assert_eq!(first.members[0].kind, CategoryMemberKind::Page);
+    assert_eq!(first.members[1].kind, CategoryMemberKind::Subcategory);
+    let continuation = first.continuation.expect("continuation");
+
+    let second = client
+        .category_members_batch(&category, Some(&continuation))
+        .await
+        .expect("second category page");
+    assert_eq!(second.members.len(), 2);
+    assert!(second.continuation.is_none());
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("list=categorymembers"));
+    assert!(requests[0].contains("cmtitle=Category%3ARoot"));
+    assert!(requests[0].contains("cmtype=page%7Csubcat"));
+    assert!(requests[0].contains("cmnamespace=0%7C14"));
+    assert!(requests[0].contains("cmlimit=500"));
+    assert!(!requests[0].contains("cmcontinue="));
+    assert!(requests[1].contains("continue=-%7C%7C"));
+    assert!(requests[1].contains("cmcontinue=page%7C42455441%7C0%7CBETA"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

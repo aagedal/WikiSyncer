@@ -1,9 +1,11 @@
 # WikiSyncer
 
 WikiSyncer is a selective, tamper-evident offline history of Wikipedia source
-revisions. The project is in its architecture-spike phase; see
-[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the planned capabilities and
-delivery milestones.
+revisions. Active implementation has reached category preview, long-gap
+reconciliation, and the initial Iced GUI; see
+[IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for the current checkpoint and
+[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for planned capabilities and delivery
+milestones.
 
 ## Development
 

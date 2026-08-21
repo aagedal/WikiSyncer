@@ -1,0 +1,35 @@
+{
+  "batchcomplete": true,
+  "query": {
+    "pages": [
+      {
+        "pageid": 25357340,
+        "ns": 0,
+        "title": "Rust language",
+        "revisions": [
+          {
+            "revid": 1300000001,
+            "parentid": 1300000000,
+            "timestamp": "2026-08-19T12:34:56Z",
+            "size": 42,
+            "slots": { "main": { "contentmodel": "wikitext" } }
+          },
+          {
+            "revid": 1300000002,
+            "parentid": 1300000001,
+            "timestamp": "2026-08-20T12:00:00Z",
+            "size": 57,
+            "slots": { "main": { "contentmodel": "wikitext" } }
+          },
+          {
+            "revid": 1300000003,
+            "parentid": 1300000002,
+            "timestamp": "2026-08-21T12:00:00Z",
+            "size": 64,
+            "slots": { "main": { "contentmodel": "wikitext" } }
+          }
+        ]
+      }
+    ]
+  }
+}

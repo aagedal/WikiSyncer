@@ -1,0 +1,21 @@
+{
+  "batchcomplete": true,
+  "query": {
+    "pages": [
+      {
+        "pageid": 25357340,
+        "ns": 0,
+        "title": "Rust (programming language)",
+        "revisions": [
+          {
+            "revid": 1300000001,
+            "parentid": 1300000000,
+            "timestamp": "2026-08-19T12:34:56Z",
+            "size": 42,
+            "sha1": "mz6rzjalvs99ygh9s19aseznld8m1pu"
+          }
+        ]
+      }
+    ]
+  }
+}
