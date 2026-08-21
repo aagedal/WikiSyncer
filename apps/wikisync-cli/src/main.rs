@@ -11,7 +11,7 @@ use serde_json::json;
 use wikisync_content::{
     ContentDiff, DiffLine, DiffMode, DiffTag, diff as content_diff, to_markdown, to_plain_text,
 };
-use wikisync_core::{PageTitle, RevisionId, WikiId};
+use wikisync_core::{CollectionId, PageTitle, RevisionId, WikiId};
 use wikisync_mediawiki::{ClientConfig, MediaWikiClient};
 use wikisync_search::{
     MAX_SEARCH_RESULTS, SearchError, SearchIndex, SearchQuery, SqliteSearchIndex,
@@ -20,6 +20,7 @@ use wikisync_store::{
     Library, StoreError, StoredPage, StoredRevision, SyncCheckpoint, SyncRunState, SyncRunStatus,
 };
 use wikisync_sync::{CategoryPreviewLimits, preview_category_selection};
+use wikisyncd::{ApplicationHandler, Mutation, RequestHandler, WriterAccess};
 
 const USAGE: &str = "WikiSyncer offline reader
 
@@ -29,6 +30,9 @@ Usage:
   wikisync --library <path> show [--wiki <id>] [--revision <id>] [--json] [--source] <title>
   wikisync --library <path> history [--wiki <id>] [--json] <title>
   wikisync --library <path> diff [--wiki <id>] [--reading] [--json] <from-revision> <to-revision>
+  wikisync --library <path> sync [--collection <id>]
+  wikisync --library <path> verify [--full]
+  wikisync --library <path> compact
   wikisync --library <path> status [--json]
   wikisync --library <path> serve [--port <port>]
   wikisync --help
@@ -74,6 +78,18 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                 )));
             }
             let library_root = library;
+            match command {
+                Command::Sync { collection_id } => {
+                    let mutation = collection_id
+                        .map_or(Mutation::SyncAll, |id| Mutation::SyncCollection(id.get()));
+                    return mutate_library(&library_root, mutation);
+                }
+                Command::Verify { full } => {
+                    return mutate_library(&library_root, Mutation::Verify { full });
+                }
+                Command::Compact => return mutate_library(&library_root, Mutation::Compact),
+                _ => {}
+            }
             let library = Library::open(&library_root)?;
             match command {
                 Command::Search {
@@ -112,9 +128,29 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                     runtime.block_on(wikisync_web::serve(library_root, address))?;
                     Ok(())
                 }
+                Command::Sync { .. } | Command::Verify { .. } | Command::Compact => {
+                    unreachable!("mutating commands returned before opening a reader")
+                }
             }
         }
     }
+}
+
+fn mutate_library(library_root: &std::path::Path, mutation: Mutation) -> Result<(), CliError> {
+    let outcome = match WriterAccess::discover(library_root)? {
+        WriterAccess::Daemon(client) => client.forward_mutation(mutation)?,
+        WriterAccess::Direct(_lease) => {
+            let mut handler = ApplicationHandler::new(library_root)?;
+            handler.mutate(mutation)?
+        }
+    };
+    println!("{}", outcome.result);
+    if !outcome.payload.is_empty() {
+        let detail = str::from_utf8(&outcome.payload)
+            .map_err(|_| CliError::data("daemon mutation receipt is not valid UTF-8"))?;
+        println!("{detail}");
+    }
+    Ok(())
 }
 
 fn category_preview(
@@ -694,6 +730,13 @@ enum Command {
         reading: bool,
         json: bool,
     },
+    Sync {
+        collection_id: Option<CollectionId>,
+    },
+    Verify {
+        full: bool,
+    },
+    Compact,
     Status {
         json: bool,
     },
@@ -725,7 +768,8 @@ fn parse(
             Some("--help" | "-h") => return Ok(Action::Help),
             Some("--version" | "-V") => return Ok(Action::Version),
             Some(
-                "category-preview" | "search" | "show" | "history" | "diff" | "status" | "serve",
+                "category-preview" | "search" | "show" | "history" | "diff" | "sync" | "verify"
+                | "compact" | "status" | "serve",
             ) => break argument,
             Some(value) => return Err(CliError::usage(format!("unknown command {value:?}"))),
             None => return Err(CliError::usage("arguments must be valid UTF-8")),
@@ -749,6 +793,9 @@ fn parse(
         Some("show") => parse_show(values)?,
         Some("history") => parse_history(values)?,
         Some("diff") => parse_diff(values)?,
+        Some("sync") => parse_sync(values)?,
+        Some("verify") => parse_verify(values)?,
+        Some("compact") => parse_compact(values)?,
         Some("status") => parse_status(values)?,
         Some("serve") => parse_serve(values)?,
         _ => unreachable!("validated command"),
@@ -824,6 +871,45 @@ fn parse_status(values: Vec<String>) -> Result<Command, CliError> {
         }
     }
     Ok(Command::Status { json })
+}
+
+fn parse_sync(values: Vec<String>) -> Result<Command, CliError> {
+    let mut collection_id = None;
+    let mut values = values.into_iter();
+    while let Some(value) = values.next() {
+        match value.as_str() {
+            "--collection" => {
+                let raw = required_value(&mut values, "--collection")?
+                    .parse::<u64>()
+                    .map_err(|_| CliError::usage("--collection requires a positive integer"))?;
+                let parsed =
+                    CollectionId::new(raw).map_err(|error| CliError::usage(error.to_string()))?;
+                if collection_id.replace(parsed).is_some() {
+                    return Err(CliError::usage("--collection may only be supplied once"));
+                }
+            }
+            _ => return Err(CliError::usage(format!("unknown sync option {value:?}"))),
+        }
+    }
+    Ok(Command::Sync { collection_id })
+}
+
+fn parse_verify(values: Vec<String>) -> Result<Command, CliError> {
+    let mut full = false;
+    for value in values {
+        match value.as_str() {
+            "--full" => full = true,
+            _ => return Err(CliError::usage(format!("unknown verify option {value:?}"))),
+        }
+    }
+    Ok(Command::Verify { full })
+}
+
+fn parse_compact(values: Vec<String>) -> Result<Command, CliError> {
+    if let Some(value) = values.first() {
+        return Err(CliError::usage(format!("unknown compact option {value:?}")));
+    }
+    Ok(Command::Compact)
 }
 
 fn parse_search(values: Vec<String>) -> Result<Command, CliError> {
@@ -1040,6 +1126,18 @@ impl From<wikisync_web::ServeError> for CliError {
     }
 }
 
+impl From<wikisyncd::DaemonError> for CliError {
+    fn from(error: wikisyncd::DaemonError) -> Self {
+        Self::message(error.to_string())
+    }
+}
+
+impl From<wikisyncd::OperationError> for CliError {
+    fn from(error: wikisyncd::OperationError) -> Self {
+        Self::message(error.to_string())
+    }
+}
+
 impl From<wikisync_mediawiki::ConfigError> for CliError {
     fn from(error: wikisync_mediawiki::ConfigError) -> Self {
         Self::message(error.to_string())
@@ -1189,6 +1287,33 @@ mod tests {
             Action::Command {
                 library: PathBuf::from("/tmp/wiki"),
                 command: Command::Serve { port: 8_765 },
+            }
+        );
+    }
+
+    #[test]
+    fn parses_daemon_aware_writer_commands() {
+        assert_eq!(
+            parse(["--library", "/tmp/wiki", "sync", "--collection", "7"]).expect("sync parse"),
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::Sync {
+                    collection_id: Some(CollectionId::new(7).expect("collection")),
+                },
+            }
+        );
+        assert_eq!(
+            parse(["--library", "/tmp/wiki", "verify", "--full"]).expect("verify parse"),
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::Verify { full: true },
+            }
+        );
+        assert_eq!(
+            parse(["--library", "/tmp/wiki", "compact"]).expect("compact parse"),
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::Compact,
             }
         );
     }

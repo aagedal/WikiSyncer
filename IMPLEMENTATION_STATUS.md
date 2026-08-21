@@ -76,14 +76,50 @@ Updated: 2026-08-21
 
 Passed on 2026-08-21. A nontechnical user can create, preview, synchronize, browse,
 verify, and update a collection from Iced without using the CLI. Routine tests remain
-offline and fixture-backed. Scheduling and the single-writer daemon remain Milestone 4
-work; optional media and periodic dynamic-category reconciliation remain stable-v1
-work as specified by the plan.
+offline and fixture-backed. Scheduling and the remaining daemon hardening are
+Milestone 4 work; optional media and periodic dynamic-category reconciliation remain
+stable-v1 work as specified by the plan.
+
+## Milestone 4 progress
+
+The first daemon checkpoint is implemented and validated:
+
+- a versioned, bounded local Unix-socket contract with private library-local daemon
+  and cooperative writer-lease sockets;
+- race-safe writer discovery for GUI/CLI callers, with fail-closed handling of stale
+  or unexpected socket paths;
+- a single-threaded application dispatcher for collection reconciliation, bounded
+  quick/full logical-object verification, and immutable-object compaction;
+- CLI `sync`, `verify`, and `compact` commands that forward to the daemon when it owns
+  the library or hold a short exclusive writer lease when it is absent;
+- GUI collection updates using the same forwarding/direct-writer contract, while
+  collection creation fails clearly if the daemon owns the writer because that
+  mutation is not yet in protocol version 1;
+- parameterized launchd and hardened systemd user-service templates, including a
+  health-only systemd timer that does not pretend to schedule synchronization; and
+- a pre-beta threat model plus service, backup/restore/migration, and redacted manual
+  diagnostics documentation.
+
+Focused daemon, CLI, GUI, and CLI-to-daemon forwarding tests pass. This is partial
+Milestone 4 behavior, not its gate: interval/daily scheduling, GUI schedule controls,
+sleep/wake and cancellation gates, graceful `SIGTERM`/`SIGINT`, safe stale-socket
+recovery, signed packages/installers, and an automated `doctor` bundle remain.
+
+## Plan audit notes
+
+The ordered first implementation backlog (items 1–13) is complete. The broader
+milestone delivery lists are not all closed: predecessor-linked integrity manifests,
+signatures/trusted rollback anchors, full graph/manifest/search verification, the
+planned export and administrative CLI surface, source/redirect allowlisting, and the
+remaining Milestone 4/5 release work are still outstanding. Full verification at this
+checkpoint means a stable scan of every logical canonical object; it must not be
+described as manifest-chain or whole-archive trust verification.
 
 ## Next checkpoint
 
-Begin Milestone 4 with the single-writer daemon and explicit GUI/CLI forwarding
-contract before adding scheduling or service installation.
+Add durable interval/daily schedule configuration with jitter and GUI controls, then
+exercise restart and sleep/wake recovery through the real daemon. Add graceful Unix
+signal handling before treating launchd termination as cooperative shutdown.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening

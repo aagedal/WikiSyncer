@@ -1,0 +1,33 @@
+[Unit]
+Description=WikiSyncer single-writer daemon
+Documentation=file://@DOCUMENTATION_DIRECTORY@/service-management.md
+
+[Service]
+Type=simple
+ExecStart="@WIKISYNCD@" --library "@LIBRARY@" run
+ExecStop="@WIKISYNCD@" --library "@LIBRARY@" shutdown
+# The IPC client returns after shutdown is accepted; wait for the main daemon to
+# drop its owned sockets before systemd applies KillMode to remaining processes.
+ExecStop=/bin/sh -c 'while kill -0 "$MAINPID" 2>/dev/null; do sleep 0.1; done'
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=60s
+UMask=0077
+
+# The foundation creates private Unix sockets in the selected library. Address-family
+# access also permits later configured HTTPS mutation handlers without exposing an
+# inbound listener. The library directory must exist before this unit starts.
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=read-only
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths="@LIBRARY@"
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=default.target

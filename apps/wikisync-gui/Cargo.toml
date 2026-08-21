@@ -18,6 +18,7 @@ wikisync-mediawiki = { path = "../../crates/wikisync-mediawiki" }
 wikisync-store = { path = "../../crates/wikisync-store" }
 wikisync-sync = { path = "../../crates/wikisync-sync" }
 wikisync-web = { path = "../../crates/wikisync-web" }
+wikisyncd = { path = "../wikisyncd" }
 
 [dev-dependencies]
 tempfile = "3.20"

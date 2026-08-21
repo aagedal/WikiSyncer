@@ -1,0 +1,19 @@
+[Unit]
+Description=Check the WikiSyncer daemon health endpoint
+Documentation=file://@DOCUMENTATION_DIRECTORY@/diagnostics.md
+
+[Service]
+Type=oneshot
+ExecStart="@WIKISYNCD@" --library "@LIBRARY@" health
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=read-only
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths="@LIBRARY@"
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes

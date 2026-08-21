@@ -24,6 +24,7 @@ wikisync-search = { path = "../../crates/wikisync-search" }
 wikisync-store = { path = "../../crates/wikisync-store" }
 wikisync-sync = { path = "../../crates/wikisync-sync" }
 wikisync-web = { path = "../../crates/wikisync-web" }
+wikisyncd = { path = "../wikisyncd" }
 
 [dev-dependencies]
 axum = "0.8"

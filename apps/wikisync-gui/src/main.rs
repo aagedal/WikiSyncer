@@ -24,6 +24,7 @@ use wikisync_sync::{
     reconcile_collection_heads,
 };
 use wikisync_web::ReaderHandle;
+use wikisyncd::{Mutation, WriterAccess, WriterLease};
 
 const DATABASE_NAME: &str = "library.sqlite3";
 const RECENT_REVISION_LIMIT: u32 = 12;
@@ -1210,6 +1211,12 @@ fn load_library_snapshot(path: &Path, create: bool) -> Result<DashboardSnapshot,
             path.display()
         ));
     }
+    let _writer_lease = if create {
+        fs::create_dir_all(path).map_err(|error| error.to_string())?;
+        Some(WriterLease::acquire(path).map_err(|error| error.to_string())?)
+    } else {
+        None
+    };
     let library = Library::open(path).map_err(|error| error.to_string())?;
     snapshot(&library)
 }
@@ -1247,6 +1254,17 @@ async fn create_collection_and_sync(
         concat!("WikiSyncer/", env!("CARGO_PKG_VERSION")),
     )
     .map_err(|error| error.to_string())?;
+    let _writer_lease = match WriterAccess::discover(&request.library_path)
+        .map_err(|error| error.to_string())?
+    {
+        WriterAccess::Direct(lease) => lease,
+        WriterAccess::Daemon(_) => {
+            return Err(
+                "The daemon owns this library. Creating collections is not yet supported by the daemon contract; stop it cooperatively and retry."
+                    .to_owned(),
+            );
+        }
+    };
     let mut library = Library::open(&request.library_path).map_err(|error| error.to_string())?;
     let wiki_id = library
         .register_wiki(client_config.endpoint().as_str(), &request.language_code)
@@ -1282,6 +1300,16 @@ async fn update_collection(
     path: PathBuf,
     collection_id: CollectionId,
 ) -> Result<DashboardSnapshot, String> {
+    let _writer_lease = match WriterAccess::discover(&path).map_err(|error| error.to_string())? {
+        WriterAccess::Direct(lease) => lease,
+        WriterAccess::Daemon(client) => {
+            client
+                .forward_mutation(Mutation::SyncCollection(collection_id.get()))
+                .map_err(|error| error.to_string())?;
+            let library = Library::open(&path).map_err(|error| error.to_string())?;
+            return snapshot(&library);
+        }
+    };
     let mut library = Library::open(&path).map_err(|error| error.to_string())?;
     let configuration = library
         .collection_configuration(collection_id)

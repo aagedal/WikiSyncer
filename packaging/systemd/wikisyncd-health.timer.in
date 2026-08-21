@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically probe the local WikiSyncer daemon
+Documentation=file://@DOCUMENTATION_DIRECTORY@/diagnostics.md
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=15m
+AccuracySec=1m
+Unit=wikisyncd-health.service
+
+[Install]
+WantedBy=timers.target

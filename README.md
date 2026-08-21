@@ -1,11 +1,16 @@
 # WikiSyncer
 
 WikiSyncer is a selective, tamper-evident offline history of Wikipedia source
-revisions. Active implementation has reached category preview, long-gap
-reconciliation, and the initial Iced GUI; see
+revisions. Active implementation has passed the Milestone 3 GUI gate and is building
+the Milestone 4 single-writer daemon; see
 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for the current checkpoint and
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for planned capabilities and delivery
 milestones.
+
+Pre-beta security assumptions and operational guidance are tracked in
+[the threat model](docs/security/THREAT_MODEL.md) and
+[the operations guide](docs/operations/README.md). Parameterized user-service assets
+live under [`packaging/`](packaging/README.md); they are not signed installers.
 
 ## Development
 

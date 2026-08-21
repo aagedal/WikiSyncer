@@ -3567,6 +3567,7 @@ dependencies = [
  "wikisync-store",
  "wikisync-sync",
  "wikisync-web",
+ "wikisyncd",
 ]
 
 [[package]]
@@ -3593,6 +3594,7 @@ dependencies = [
  "wikisync-store",
  "wikisync-sync",
  "wikisync-web",
+ "wikisyncd",
 ]
 
 [[package]]
@@ -3670,6 +3672,14 @@ dependencies = [
 [[package]]
 name = "wikisyncd"
 version = "0.1.0"
+dependencies = [
+ "tokio",
+ "wikisync-core",
+ "wikisync-integrity",
+ "wikisync-mediawiki",
+ "wikisync-store",
+ "wikisync-sync",
+]
 
 [[package]]
 name = "winapi"
