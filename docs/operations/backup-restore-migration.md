@@ -60,13 +60,15 @@ Restore into a new empty destination so the existing library remains recoverable
 4. Reject a restore whose `library.sqlite3` is a symbolic link. Do not combine a
    database from one backup with `objects/` from another.
 5. Open the restored path with the same binary version first, inspect status, and run
-   full logical-object verification.
+   full object and manifest-chain verification.
 6. Render a new service definition with the restored absolute path. Stop and remove
    the old service definition before enabling the new one.
 
-A verified restored library demonstrates byte integrity since capture. It does not
-prove completeness relative to Wikimedia, and no current command certifies that the
-backup includes every filesystem artifact expected by a future stable format.
+A restored library whose full check passes demonstrates internal object and manifest-
+chain consistency since capture. Without an externally retained signed manifest head,
+it cannot detect replacement by an older internally consistent backup or prove
+completeness relative to Wikimedia. No current command certifies that the backup
+includes every filesystem artifact expected by a future stable format.
 
 ## Upgrade and schema migration
 

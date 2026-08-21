@@ -139,30 +139,60 @@ Service durability and diagnostics now include:
   canonical quick verification, redacted section failures, and tests proving no
   MediaWiki connection or seeded sensitive-value disclosure.
 
+Transport policy, manifests, and current-head export now include:
+
+- an endpoint-derived normalized source-host allowlist and fail-closed redirect policy
+  that permits only the configured scheme/host/effective-port origin, including tests
+  proving a cross-origin redirect is rejected before the destination is contacted;
+- clone-shared configurable request concurrency and aggregate response-body ceilings
+  (defaults: four in-flight requests and 512 MiB per client/run), enforced across
+  retries without weakening the existing per-response, retry, or circuit bounds;
+- schema migration 8, which snapshots an immutable configuration hash when each new
+  sync run starts, plus bounded canonical JSON manifests with domain-separated BLAKE3
+  identities, strict append sequence and predecessor links, catalog-difference
+  introduced revisions, resulting page heads, durable atomic installation, and
+  idempotent oldest-first repair of the database/file crash gap;
+- automatic manifest append at successful bootstrap/reconciliation boundaries and a
+  bounded pre-network repair step for previously completed runs, with an integration
+  test proving repair and the new append occur without extra source requests;
+- full verification of manifest inventory, canonical encoding/body identity,
+  sequence/predecessor continuity, duplicate or unsuccessful run references, and
+  manifest coverage of eligible successful runs, with structured findings for
+  deletion, tampering, swapping, and concurrent inventory changes; and
+- CLI `export --format markdown|text [--collection <id>]` for deterministic current
+  captured heads, producing bounded private `articles/`, `index.jsonl`, and
+  `manifest.json` outputs with transformer versions, content IDs, capture/revision
+  provenance, source attribution, staged replacement, and symlink/path protections.
+  Historical `--at` export is explicitly rejected rather than silently approximated.
+
 Workspace formatting, warning-denied Clippy, and all workspace tests pass. The
-`cargo-deny` subcommand is unavailable in this environment; the only new external
-crate (`fs2` 0.4.3 from crates.io, MIT/Apache-2.0) matches the repository's existing
-source and license allowlists. Milestone 4 delivery is still partial: metered-network
-avoidance, explicit bandwidth/concurrency controls, source/redirect allowlisting,
-signed packages/installers, and optional online reachability in `doctor` remain.
+`cargo-deny` subcommand is unavailable in this environment. This checkpoint adds no
+new package version; `serde` and `serde_json` became direct store dependencies and
+already match the repository's source/license policy. Milestone 4 delivery is still
+partial: metered-network avoidance, byte-rate shaping and durable GUI bandwidth/
+concurrency policy, private-address/DNS-rebinding review, signed packages/installers,
+and optional online reachability in `doctor` remain.
 
 ## Plan audit notes
 
 The ordered first implementation backlog (items 1–13) is complete. The broader
-milestone delivery lists are not all closed: predecessor-linked integrity manifests,
-signatures/trusted rollback anchors, full graph/manifest/search verification, the
-planned export and administrative CLI surface, source/redirect allowlisting, and the
-remaining Milestone 4/5 release work are still outstanding. Full verification at this
-checkpoint means a stable scan of every logical canonical object; it must not be
-described as manifest-chain or whole-archive trust verification.
+milestone delivery lists are not all closed: signatures/trusted rollback anchors,
+revision/page/checkpoint reachability and search/cache verification, historical
+export and the administrative CLI surface, and the remaining Milestone 4/5 release
+work are still outstanding. Full verification now covers a stable scan of every
+logical canonical object plus the internal unsigned manifest chain and eligible-run
+coverage; it must not be described as signature authentication, external rollback
+protection, or universal whole-archive verification.
 
 ## Next checkpoint
 
-Add metered-network avoidance where the target OS exposes it reliably and explicit
-per-run bandwidth/concurrency controls. Then close the remaining pre-beta source and
-redirect allowlist plus signed-package work without weakening the offline fixture
-test policy. Predecessor-linked manifests and the broader verification/export gaps
-remain separately tracked milestone work.
+Add metered-network avoidance where the target OS exposes it reliably, byte-rate
+shaping, and durable GUI/daemon policy for the implemented aggregate bandwidth and
+concurrency controls. Then add optional Ed25519 manifest signing with an externally
+exportable trusted head, extend full verification to revision/page/checkpoint and
+search/cache reachability, and close signed beta packaging without weakening the
+offline fixture test policy. Historical/time-slice export, administrative CLI work,
+optional media, and dump bootstrap remain separately tracked milestone work.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening

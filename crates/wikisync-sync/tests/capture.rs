@@ -472,6 +472,13 @@ async fn long_gap_reconciliation_captures_every_intermediate_before_advancing_ch
         capture_explicit_titles(&client, &mut library, wiki_id, collection_id, &selection)
             .await
             .expect("initial capture");
+    let prior_run = library
+        .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Update, 1)
+        .expect("prior run");
+    library
+        .complete_sync_run(prior_run.status.run_id, None)
+        .expect("complete prior run without its manifest");
+    assert_eq!(library.manifest_count().expect("no manifest yet"), 0);
 
     let report =
         reconcile_collection_heads(&client, &mut library, wiki_id, collection_id, 1_776_945_600)
@@ -504,6 +511,21 @@ async fn long_gap_reconciliation_captures_every_intermediate_before_advancing_ch
     assert_eq!(checkpoint.committed_through, 1_776_945_600);
     assert_eq!(checkpoint.reconciled_at, Some(1_776_945_600));
     assert_eq!(checkpoint.last_run_id, Some(report.status.run_id));
+    assert_eq!(library.manifest_count().expect("manifest count"), 2);
+    let repaired = library.read_manifest(1).expect("repaired predecessor");
+    assert_eq!(repaired.manifest.run_id, prior_run.status.run_id);
+    assert_eq!(repaired.manifest.introduced_revisions.len(), 1);
+    let manifest = library.read_manifest(2).expect("sync manifest");
+    assert_eq!(manifest.manifest.run_id, report.status.run_id);
+    assert_eq!(manifest.manifest.wiki_id, wiki_id);
+    assert_eq!(manifest.manifest.collection_id, Some(collection_id));
+    assert_eq!(manifest.manifest.page_heads.len(), 1);
+    assert_eq!(manifest.manifest.page_heads[0].page_id, page_id);
+    assert_eq!(
+        manifest.manifest.page_heads[0].revision_id,
+        Some(RevisionId::new(1_300_000_003).expect("manifest head"))
+    );
+    assert_eq!(manifest.manifest.introduced_revisions.len(), 2);
     let search = SqliteSearchIndex::open(&library).expect("search index");
     let hits = search
         .search(SearchQuery::new("safe concurrency"))
@@ -855,7 +877,6 @@ async fn missing_page_is_reported_without_discarding_history_or_wedging_the_scop
         library.sync_checkpoints().expect("checkpoint")[0].committed_through,
         1_776_945_600
     );
-
     let requests = server.finish();
     assert_eq!(requests.len(), 3);
     assert!(requests[2].contains("pageids=25357340"));

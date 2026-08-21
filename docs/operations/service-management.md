@@ -155,8 +155,11 @@ applies bounded retry/backoff and a shared circuit breaker to transient source
 throttling. A real-daemon restart gate proves a retryable partial failure retains its
 old head/checkpoint, reuses the durable intermediate revision, and resumes the same
 run. Cooperative signal cancellation exits at bounded request/transaction boundaries
-and leaves the run resumable. Metered-network avoidance and explicit bandwidth and
-concurrency controls remain Milestone 4 work.
+and leaves the run resumable. Each synchronization client and its clones enforce a
+shared aggregate response-body budget (512 MiB by default) and at most four in-flight
+requests by default; both ceilings are explicitly configurable in the transport API.
+OS metered-network detection, bandwidth rate shaping, and durable GUI policy controls
+remain Milestone 4 work.
 
 Before shutting down the computer, moving the library, or taking a backup, request a
 cooperative stop and confirm both that the service manager has no daemon process and

@@ -10,16 +10,19 @@ use std::error::Error;
 use std::fmt;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use reqwest::{StatusCode, Url, redirect};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use tokio::sync::Semaphore;
 use wikisync_core::{PageId, PageTitle, RevisionId};
 
 const DEFAULT_RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
+const DEFAULT_RUN_DOWNLOAD_LIMIT: usize = 512 * 1024 * 1024;
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 4;
 const DEFAULT_TITLES_PER_OPERATION: usize = 1_000;
 const DEFAULT_TITLES_PER_REQUEST: usize = 50;
 const DEFAULT_REVISIONS_PER_REQUEST: usize = 500;
@@ -118,10 +121,13 @@ impl Default for RetryPolicy {
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
     endpoint: Url,
+    allowed_source_hosts: Vec<String>,
     user_agent: String,
     request_timeout: Duration,
     connect_timeout: Duration,
     max_response_bytes: NonZeroUsize,
+    max_downloaded_response_bytes_per_run: NonZeroUsize,
+    max_concurrent_requests: NonZeroUsize,
     max_redirects: usize,
     max_lag_seconds: u16,
     max_titles_per_operation: NonZeroUsize,
@@ -147,11 +153,19 @@ impl ClientConfig {
         }
 
         Ok(Self {
+            allowed_source_hosts: vec![
+                endpoint
+                    .host_str()
+                    .expect("validated endpoint has a host")
+                    .to_ascii_lowercase(),
+            ],
             endpoint,
             user_agent,
             request_timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
             max_response_bytes: nonzero(DEFAULT_RESPONSE_LIMIT),
+            max_downloaded_response_bytes_per_run: nonzero(DEFAULT_RUN_DOWNLOAD_LIMIT),
+            max_concurrent_requests: nonzero(DEFAULT_MAX_CONCURRENT_REQUESTS),
             max_redirects: 3,
             max_lag_seconds: 5,
             max_titles_per_operation: nonzero(DEFAULT_TITLES_PER_OPERATION),
@@ -168,6 +182,37 @@ impl ClientConfig {
             name: "max response bytes",
         })?;
         Ok(self)
+    }
+
+    /// Sets the aggregate response-body byte budget shared by this client's clones.
+    ///
+    /// Constructing a new client establishes a new run boundary. Every received body
+    /// chunk, including bodies from retry attempts, consumes this budget.
+    pub fn with_max_downloaded_response_bytes_per_run(
+        mut self,
+        bytes: usize,
+    ) -> Result<Self, ConfigError> {
+        self.max_downloaded_response_bytes_per_run =
+            NonZeroUsize::new(bytes).ok_or(ConfigError::ZeroLimit {
+                name: "max downloaded response bytes per run",
+            })?;
+        Ok(self)
+    }
+
+    /// Sets the maximum number of in-flight HTTP requests shared by client clones.
+    pub fn with_max_concurrent_requests(mut self, count: usize) -> Result<Self, ConfigError> {
+        self.max_concurrent_requests = NonZeroUsize::new(count).ok_or(ConfigError::ZeroLimit {
+            name: "max concurrent requests",
+        })?;
+        Ok(self)
+    }
+
+    /// Returns the normalized singleton source-host allowlist.
+    ///
+    /// Redirects must remain on the endpoint's complete origin in addition to
+    /// matching this allowlist; a same-host scheme or port change is rejected.
+    pub fn allowed_source_hosts(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.allowed_source_hosts.iter().map(String::as_str)
     }
 
     /// Sets the maximum number of input titles accepted by one operation.
@@ -323,6 +368,70 @@ pub struct MediaWikiClient {
     config: ClientConfig,
     http: reqwest::Client,
     circuit: Arc<CircuitBreaker>,
+    transport_limits: Arc<TransportLimits>,
+}
+
+#[derive(Debug)]
+struct TransportLimits {
+    request_slots: Semaphore,
+    downloaded_response_bytes: AtomicUsize,
+    max_downloaded_response_bytes: usize,
+}
+
+impl TransportLimits {
+    fn reserve_response_capacity(&self, bytes: usize) -> Result<ResponseBudget<'_>, ClientError> {
+        self.downloaded_response_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |downloaded| {
+                downloaded
+                    .checked_add(bytes)
+                    .filter(|total| *total <= self.max_downloaded_response_bytes)
+            })
+            .map(|_| ResponseBudget {
+                limits: self,
+                reserved: bytes,
+                received: 0,
+            })
+            .map_err(|downloaded| ClientError::DownloadBudgetExceeded {
+                limit: self.max_downloaded_response_bytes,
+                downloaded,
+                next_chunk: bytes,
+            })
+    }
+}
+
+#[derive(Debug)]
+struct ResponseBudget<'a> {
+    limits: &'a TransportLimits,
+    reserved: usize,
+    received: usize,
+}
+
+impl ResponseBudget<'_> {
+    fn record_chunk(&mut self, bytes: usize) -> Result<(), ClientError> {
+        let received = self.received.checked_add(bytes);
+        if received.is_some_and(|received| received <= self.reserved) {
+            self.received = received.expect("checked above");
+            Ok(())
+        } else {
+            Err(ClientError::DownloadBudgetExceeded {
+                limit: self.limits.max_downloaded_response_bytes,
+                downloaded: self
+                    .limits
+                    .downloaded_response_bytes
+                    .load(Ordering::Acquire),
+                next_chunk: bytes,
+            })
+        }
+    }
+}
+
+impl Drop for ResponseBudget<'_> {
+    fn drop(&mut self) {
+        let unused = self.reserved.saturating_sub(self.received);
+        self.limits
+            .downloaded_response_bytes
+            .fetch_sub(unused, Ordering::AcqRel);
+    }
 }
 
 #[derive(Debug)]
@@ -397,19 +506,42 @@ impl MediaWikiClient {
     /// Builds a client with redirects, TLS, timeouts, and a fixed User-Agent policy.
     pub fn new(config: ClientConfig) -> Result<Self, ClientError> {
         let https_only = config.endpoint.scheme() == "https";
+        let redirect_endpoint = config.endpoint.clone();
+        let redirect_allowed_hosts = config.allowed_source_hosts.clone();
+        let max_redirects = config.max_redirects;
         let http = reqwest::Client::builder()
             .user_agent(&config.user_agent)
             .timeout(config.request_timeout)
             .connect_timeout(config.connect_timeout)
-            .redirect(redirect::Policy::limited(config.max_redirects))
+            .redirect(redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() > max_redirects {
+                    return attempt.error("MediaWiki redirect limit exceeded");
+                }
+                if !redirect_destination_allowed(
+                    attempt.url(),
+                    &redirect_endpoint,
+                    &redirect_allowed_hosts,
+                ) {
+                    return attempt
+                        .error("MediaWiki redirect left the explicitly allowed source origin");
+                }
+                attempt.follow()
+            }))
             .https_only(https_only)
             .build()
             .map_err(ClientError::Transport)?;
+
+        let transport_limits = Arc::new(TransportLimits {
+            request_slots: Semaphore::new(config.max_concurrent_requests.get()),
+            downloaded_response_bytes: AtomicUsize::new(0),
+            max_downloaded_response_bytes: config.max_downloaded_response_bytes_per_run.get(),
+        });
 
         Ok(Self {
             config,
             http,
             circuit: Arc::new(CircuitBreaker::new()),
+            transport_limits,
         })
     }
 
@@ -720,6 +852,12 @@ impl MediaWikiClient {
     where
         T: DeserializeOwned,
     {
+        let _request_permit = self
+            .transport_limits
+            .request_slots
+            .acquire()
+            .await
+            .expect("MediaWiki request semaphore is never closed");
         let mut response = self
             .http
             .get(self.config.endpoint.clone())
@@ -743,9 +881,23 @@ impl MediaWikiClient {
                 limit: self.config.max_response_bytes.get(),
             });
         }
+        let declared_length = response
+            .content_length()
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| ClientError::ResponseTooLarge {
+                limit: self.config.max_response_bytes.get(),
+            })?;
+        // Atomically reserve exact declared capacity, or the complete per-response
+        // ceiling for an unknown/chunked body. This closes aggregate-budget races
+        // between cloned clients; unused capacity is returned when the response ends.
+        let mut response_budget = self.transport_limits.reserve_response_capacity(
+            declared_length.unwrap_or(self.config.max_response_bytes.get()),
+        )?;
 
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(ClientError::Transport)? {
+            response_budget.record_chunk(chunk.len())?;
             let new_length =
                 body.len()
                     .checked_add(chunk.len())
@@ -970,6 +1122,15 @@ pub enum ClientError {
         /// Configured byte limit.
         limit: usize,
     },
+    /// Response bodies exhausted the aggregate byte budget for this client run.
+    DownloadBudgetExceeded {
+        /// Configured aggregate byte limit.
+        limit: usize,
+        /// Bytes downloaded or atomically reserved by responses in this run.
+        downloaded: usize,
+        /// Size of the declared response or next chunk that would exceed the limit.
+        next_chunk: usize,
+    },
     /// The caller attempted a larger operation than configured.
     OperationLimitExceeded {
         /// Name of the bounded operation.
@@ -1034,6 +1195,14 @@ impl fmt::Display for ClientError {
                     "MediaWiki response exceeded the {limit}-byte limit"
                 )
             }
+            Self::DownloadBudgetExceeded {
+                limit,
+                downloaded,
+                next_chunk,
+            } => write!(
+                formatter,
+                "MediaWiki run download budget of {limit} bytes was exhausted after {downloaded} bytes before accepting the next {next_chunk} bytes"
+            ),
             Self::OperationLimitExceeded {
                 operation,
                 limit,
@@ -1047,6 +1216,40 @@ impl fmt::Display for ClientError {
             }
         }
     }
+}
+
+fn redirect_destination_allowed(
+    destination: &Url,
+    endpoint: &Url,
+    allowed_source_hosts: &[String],
+) -> bool {
+    if !destination.username().is_empty()
+        || destination.password().is_some()
+        || destination.fragment().is_some()
+    {
+        return false;
+    }
+
+    let Some(host) = destination.host_str() else {
+        return false;
+    };
+    if !allowed_source_hosts
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(host))
+    {
+        return false;
+    }
+    if destination.scheme() != endpoint.scheme()
+        || !endpoint
+            .host_str()
+            .is_some_and(|endpoint_host| endpoint_host.eq_ignore_ascii_case(host))
+        || destination.port_or_known_default() != endpoint.port_or_known_default()
+    {
+        return false;
+    }
+
+    matches!(destination.scheme(), "https")
+        || (destination.scheme() == "http" && is_loopback(destination))
 }
 
 impl Error for ClientError {
@@ -1303,7 +1506,12 @@ mod tests {
 
     #[test]
     fn endpoint_policy_requires_https_except_on_loopback() {
-        assert!(ClientConfig::new("https://en.wikipedia.org/w/api.php", "WikiSyncer/0.1").is_ok());
+        let config = ClientConfig::new("https://EN.WIKIPEDIA.ORG/w/api.php", "WikiSyncer/0.1")
+            .expect("HTTPS source config");
+        assert_eq!(
+            config.allowed_source_hosts().collect::<Vec<_>>(),
+            ["en.wikipedia.org"]
+        );
         assert!(ClientConfig::new("http://127.0.0.1:8080/api.php", "WikiSyncer/0.1").is_ok());
         assert!(matches!(
             ClientConfig::new("http://example.com/api.php", "WikiSyncer/0.1"),
@@ -1363,6 +1571,16 @@ mod tests {
         ));
         assert!(matches!(
             RetryPolicy::default().with_circuit_breaker(0, Duration::from_secs(1)),
+            Err(ConfigError::ZeroLimit { .. })
+        ));
+        let config = ClientConfig::new("https://example.com/api.php", "WikiSyncer/0.1")
+            .expect("valid config");
+        assert!(matches!(
+            config.clone().with_max_concurrent_requests(0),
+            Err(ConfigError::ZeroLimit { .. })
+        ));
+        assert!(matches!(
+            config.with_max_downloaded_response_bytes_per_run(0),
             Err(ConfigError::ZeroLimit { .. })
         ));
     }

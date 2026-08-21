@@ -1,8 +1,9 @@
 # WikiSyncer
 
 WikiSyncer is a selective, tamper-evident offline history of Wikipedia source
-revisions. Active implementation has passed the Milestone 3 GUI gate and is building
-the Milestone 4 single-writer daemon; see
+revisions. Active implementation has passed the Milestone 3 GUI gate and delivered
+the Milestone 4 daemon, scheduling, transport-policy, and unsigned manifest-chain
+foundations; see
 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for the current checkpoint and
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for planned capabilities and delivery
 milestones.
@@ -28,6 +29,15 @@ Inspect durable synchronization progress without network access:
 wikisync --library /path/to/library status
 wikisync --library /path/to/library status --json
 ```
+
+Export current captured heads for local AI tools without network access:
+
+```sh
+wikisync --library /path/to/library export --format markdown
+wikisync --library /path/to/library export --format text --collection 1
+```
+
+Historical `--at` export remains a later checkpoint and currently fails explicitly.
 
 Serve the read-only local encyclopedia on the loopback interface:
 

@@ -1,4 +1,5 @@
 mod doctor;
+mod export;
 
 use std::env;
 use std::error::Error;
@@ -9,6 +10,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str;
 
+use export::ExportFormat;
 use serde_json::json;
 use wikisync_content::{
     ContentDiff, DiffLine, DiffMode, DiffTag, diff as content_diff, to_markdown, to_plain_text,
@@ -36,6 +38,7 @@ Usage:
   wikisync --library <path> verify [--full]
   wikisync --library <path> compact
   wikisync --library <path> status [--json]
+  wikisync --library <path> export --format <markdown|text> [--collection <id>]
   wikisync --library <path> doctor [--json] [--bundle <new-file>]
   wikisync --library <path> serve [--port <port>]
   wikisync --help
@@ -124,6 +127,31 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                     json,
                 } => revision_diff(&library, from, to, wiki_id, reading, json),
                 Command::Status { json } => status(&library, json),
+                Command::Export {
+                    format,
+                    collection_id,
+                } => {
+                    let summary = export::run(&library, format, collection_id)?;
+                    println!(
+                        "Exported {} current article{} ({} canonical bytes) to {}.",
+                        summary.article_count,
+                        if summary.article_count == 1 { "" } else { "s" },
+                        summary.canonical_bytes,
+                        summary.output.display()
+                    );
+                    if summary.uncaptured_page_count > 0 {
+                        println!(
+                            "Skipped {} selected page{} without a captured current revision.",
+                            summary.uncaptured_page_count,
+                            if summary.uncaptured_page_count == 1 {
+                                ""
+                            } else {
+                                "s"
+                            },
+                        );
+                    }
+                    Ok(())
+                }
                 Command::Serve { port } => {
                     drop(library);
                     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
@@ -749,6 +777,10 @@ enum Command {
     Status {
         json: bool,
     },
+    Export {
+        format: ExportFormat,
+        collection_id: Option<CollectionId>,
+    },
     Doctor {
         json: bool,
         bundle: Option<PathBuf>,
@@ -782,7 +814,7 @@ fn parse(
             Some("--version" | "-V") => return Ok(Action::Version),
             Some(
                 "category-preview" | "search" | "show" | "history" | "diff" | "sync" | "verify"
-                | "compact" | "status" | "doctor" | "serve",
+                | "compact" | "status" | "export" | "doctor" | "serve",
             ) => break argument,
             Some(value) => return Err(CliError::usage(format!("unknown command {value:?}"))),
             None => return Err(CliError::usage("arguments must be valid UTF-8")),
@@ -810,6 +842,7 @@ fn parse(
         Some("verify") => parse_verify(values)?,
         Some("compact") => parse_compact(values)?,
         Some("status") => parse_status(values)?,
+        Some("export") => parse_export(values)?,
         Some("doctor") => parse_doctor(values)?,
         Some("serve") => parse_serve(values)?,
         _ => unreachable!("validated command"),
@@ -885,6 +918,51 @@ fn parse_status(values: Vec<String>) -> Result<Command, CliError> {
         }
     }
     Ok(Command::Status { json })
+}
+
+fn parse_export(values: Vec<String>) -> Result<Command, CliError> {
+    let mut format = None;
+    let mut collection_id = None;
+    let mut values = values.into_iter();
+    while let Some(value) = values.next() {
+        match value.as_str() {
+            "--format" => {
+                let parsed = match required_value(&mut values, "--format")?.as_str() {
+                    "markdown" => ExportFormat::Markdown,
+                    "text" => ExportFormat::Text,
+                    _ => {
+                        return Err(CliError::usage("--format must be either markdown or text"));
+                    }
+                };
+                if format.replace(parsed).is_some() {
+                    return Err(CliError::usage("--format may only be supplied once"));
+                }
+            }
+            "--collection" => {
+                let raw = required_value(&mut values, "--collection")?
+                    .parse::<u64>()
+                    .map_err(|_| CliError::usage("--collection requires a positive integer"))?;
+                let parsed =
+                    CollectionId::new(raw).map_err(|error| CliError::usage(error.to_string()))?;
+                if collection_id.replace(parsed).is_some() {
+                    return Err(CliError::usage("--collection may only be supplied once"));
+                }
+            }
+            "--at" => {
+                let _ = required_value(&mut values, "--at")?;
+                return Err(CliError::usage(
+                    "historical export selection with --at is not implemented; omit --at to export current captured heads",
+                ));
+            }
+            _ => return Err(CliError::usage(format!("unknown export option {value:?}"))),
+        }
+    }
+    let format =
+        format.ok_or_else(|| CliError::usage("export requires --format <markdown|text>"))?;
+    Ok(Command::Export {
+        format,
+        collection_id,
+    })
 }
 
 fn parse_doctor(values: Vec<String>) -> Result<Command, CliError> {
@@ -1177,6 +1255,12 @@ impl From<doctor::DoctorError> for CliError {
     }
 }
 
+impl From<export::ExportError> for CliError {
+    fn from(error: export::ExportError) -> Self {
+        Self::message(error.to_string())
+    }
+}
+
 impl From<wikisync_mediawiki::ConfigError> for CliError {
     fn from(error: wikisync_mediawiki::ConfigError) -> Self {
         Self::message(error.to_string())
@@ -1355,6 +1439,40 @@ mod tests {
                 command: Command::Compact,
             }
         );
+    }
+
+    #[test]
+    fn parses_current_export_and_rejects_unimplemented_historical_selection() {
+        assert_eq!(
+            parse([
+                "--library",
+                "/tmp/wiki",
+                "export",
+                "--format",
+                "markdown",
+                "--collection",
+                "7",
+            ])
+            .expect("export parse"),
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::Export {
+                    format: ExportFormat::Markdown,
+                    collection_id: Some(CollectionId::new(7).expect("collection")),
+                },
+            }
+        );
+        let error = parse([
+            "--library",
+            "/tmp/wiki",
+            "export",
+            "--format",
+            "text",
+            "--at",
+            "41",
+        ])
+        .expect_err("historical export remains explicit");
+        assert!(error.to_string().contains("--at is not implemented"));
     }
 
     #[test]

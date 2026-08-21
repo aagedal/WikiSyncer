@@ -3664,6 +3664,8 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "wikisync-core",
  "zstd",

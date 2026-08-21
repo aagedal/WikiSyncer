@@ -226,6 +226,7 @@ async fn maxlag_errors_preserve_retry_guidance() {
         status: 200,
         body: MAXLAG,
         retry_after: Some(7),
+        ..FixtureResponse::json(MAXLAG)
     }]);
     let client = fixture_client_with_policy(&server, fast_retry_policy(1));
     let error = client
@@ -249,6 +250,7 @@ async fn retryable_status_then_success_repeats_the_same_bounded_request() {
             status: 503,
             body: "{}",
             retry_after: None,
+            ..FixtureResponse::json("{}")
         },
         FixtureResponse::json(TITLE_RESOLUTION),
     ]);
@@ -274,8 +276,9 @@ async fn retryable_failures_stop_at_the_configured_attempt_ceiling() {
         status: 503,
         body: "{}",
         retry_after: None,
+        ..FixtureResponse::json("{}")
     };
-    let server = FixtureServer::start(vec![throttled, throttled, throttled]);
+    let server = FixtureServer::start(vec![throttled.clone(), throttled.clone(), throttled]);
     let client = fixture_client_with_policy(&server, fast_retry_policy(3));
     let error = client
         .resolve_titles(&[PageTitle::new("Rust").expect("title")])
@@ -296,6 +299,7 @@ async fn retry_after_is_honored_up_to_the_configured_safety_ceiling() {
             status: 429,
             body: "{}",
             retry_after: Some(1),
+            ..FixtureResponse::json("{}")
         },
         FixtureResponse::json(TITLE_RESOLUTION),
     ]);
@@ -320,6 +324,7 @@ async fn nonretryable_status_is_attempted_only_once() {
         status: 400,
         body: "{}",
         retry_after: None,
+        ..FixtureResponse::json("{}")
     }]);
     let client = fixture_client_with_policy(&server, fast_retry_policy(4));
     let error = client
@@ -340,6 +345,7 @@ async fn cloned_clients_share_an_open_circuit_without_an_extra_request() {
         status: 503,
         body: "{}",
         retry_after: None,
+        ..FixtureResponse::json("{}")
     }]);
     let policy = fast_retry_policy(1)
         .with_circuit_breaker(1, Duration::from_secs(1))
@@ -375,4 +381,104 @@ async fn declared_oversized_responses_are_rejected_before_parsing() {
         .expect_err("fixture exceeds limit");
     assert!(matches!(error, ClientError::ResponseTooLarge { limit: 32 }));
     server.finish();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_origin_redirect_is_rejected_without_contacting_the_destination() {
+    let server = FixtureServer::start(vec![FixtureResponse::redirect(
+        "http://localhost:9/w/api.php".to_owned(),
+    )]);
+    let client = fixture_client(&server);
+
+    let error = client
+        .resolve_titles(&[PageTitle::new("Rust").expect("valid title")])
+        .await
+        .expect_err("cross-origin redirect must fail closed");
+
+    assert!(matches!(
+        error,
+        ClientError::Transport(ref transport) if transport.is_redirect()
+    ));
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_origin_redirect_remains_within_the_source_allowlist() {
+    let server = FixtureServer::start(vec![
+        FixtureResponse::redirect("/w/redirected-api.php".to_owned()),
+        FixtureResponse::json(TITLE_RESOLUTION),
+    ]);
+    let client = fixture_client(&server);
+
+    let resolved = client
+        .resolve_titles(&[PageTitle::new("Rust").expect("valid title")])
+        .await
+        .expect("same-origin redirect is allowed");
+
+    assert!(matches!(resolved.first(), Some(TitleResolution::Found(_))));
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].starts_with("GET /w/redirected-api.php "));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cloned_clients_share_one_aggregate_download_budget() {
+    let server = FixtureServer::start(vec![
+        FixtureResponse::json(TITLE_RESOLUTION),
+        FixtureResponse::json(TITLE_RESOLUTION),
+    ]);
+    let config = ClientConfig::new(server.endpoint(), "WikiSyncer/0.1 budget-tests")
+        .expect("valid config")
+        .with_max_downloaded_response_bytes_per_run(TITLE_RESOLUTION.len())
+        .expect("positive aggregate limit");
+    let client = MediaWikiClient::new(config).expect("fixture client");
+    let clone = client.clone();
+
+    client
+        .resolve_titles(&[PageTitle::new("Rust").expect("valid title")])
+        .await
+        .expect("first response fits the run budget");
+    let error = clone
+        .resolve_titles(&[PageTitle::new("Ferris").expect("valid title")])
+        .await
+        .expect_err("clone must not receive a fresh byte budget");
+
+    assert!(matches!(
+        error,
+        ClientError::DownloadBudgetExceeded {
+            limit,
+            downloaded,
+            ..
+        } if limit == TITLE_RESOLUTION.len() && downloaded == TITLE_RESOLUTION.len()
+    ));
+    assert_eq!(server.finish().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cloned_clients_enforce_the_shared_concurrent_request_limit() {
+    let responses = (0..4)
+        .map(|_| FixtureResponse::delayed_json(EMPTY_PAGES, Duration::from_millis(75)))
+        .collect();
+    let server = FixtureServer::start(responses);
+    let config = ClientConfig::new(server.endpoint(), "WikiSyncer/0.1 concurrency-tests")
+        .expect("valid config")
+        .with_max_concurrent_requests(2)
+        .expect("positive concurrency limit");
+    let client = MediaWikiClient::new(config).expect("fixture client");
+    let mut tasks = Vec::new();
+    for index in 0..4 {
+        let clone = client.clone();
+        tasks.push(tokio::spawn(async move {
+            let title = PageTitle::new(format!("Fixture {index}")).expect("valid title");
+            clone.resolve_titles(&[title]).await
+        }));
+    }
+    for task in tasks {
+        task.await
+            .expect("request task did not panic")
+            .expect("fixture request succeeds");
+    }
+
+    assert_eq!(server.maximum_concurrent_requests(), 2);
+    assert_eq!(server.finish().len(), 4);
 }

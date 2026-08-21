@@ -4,10 +4,14 @@
 //! identities recorded when they were captured. It does not establish that an
 //! upstream statement is true, unbiased, complete, or still publicly available.
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
+use std::fs;
 
-use wikisync_store::{Library, ObjectId, ObjectVerificationState, StoreError};
+use wikisync_store::{
+    Library, ManifestId, ObjectId, ObjectVerificationState, StoreError, SyncRunState,
+};
 
 /// Default number of logical-object records loaded in one bounded store query.
 pub const DEFAULT_PAGE_SIZE: u32 = 256;
@@ -82,6 +86,22 @@ pub enum VerificationFindingKind {
     LengthMismatch,
     /// The logical object catalog changed while it was being checked.
     LibraryChangedDuringVerification,
+    /// The manifest directory contained an unreadable or invalid entry.
+    ManifestInventoryInvalid,
+    /// An expected append sequence was absent from the manifest directory.
+    ManifestMissing,
+    /// A manifest failed canonical JSON, filename, bound, or body-identity validation.
+    ManifestUnreadable,
+    /// The first/predecessor identity did not form the required append chain.
+    ManifestPredecessorMismatch,
+    /// More than one manifest claimed the same durable synchronization run.
+    DuplicateManifestRun,
+    /// A manifest referred to a run that was absent or had not succeeded.
+    ManifestRunNotSucceeded,
+    /// A successful durable sync run had no installed manifest.
+    SuccessfulRunMissingManifest,
+    /// Manifest directory membership changed during the scan.
+    ManifestsChangedDuringVerification,
 }
 
 /// One structured integrity finding.
@@ -91,6 +111,8 @@ pub struct VerificationFinding {
     pub kind: VerificationFindingKind,
     /// Affected logical object, or `None` for a library-level finding.
     pub object_id: Option<ObjectId>,
+    /// Affected manifest sequence, or `None` when no valid sequence is available.
+    pub manifest_sequence: Option<u64>,
     /// Human-readable local diagnostic detail.
     pub message: String,
 }
@@ -112,6 +134,14 @@ pub struct VerificationReport {
     pub objects_verified: u64,
     /// Canonical uncompressed bytes successfully verified.
     pub canonical_bytes_verified: u64,
+    /// Canonically named manifest files observed when manifest verification began.
+    pub manifests_at_start: u64,
+    /// Canonically named manifest files observed when manifest verification ended.
+    pub manifests_at_end: u64,
+    /// Manifest files whose bounded canonical representation was examined.
+    pub manifests_examined: u64,
+    /// Manifest files whose embedded identity reproduced their canonical body.
+    pub manifests_identity_verified: u64,
     /// Total findings, including details omitted by the report bound.
     pub finding_count: u64,
     /// First bounded set of structured findings.
@@ -168,6 +198,10 @@ pub fn verify_library_with_options(
         objects_examined: 0,
         objects_verified: 0,
         canonical_bytes_verified: 0,
+        manifests_at_start: 0,
+        manifests_at_end: 0,
+        manifests_examined: 0,
+        manifests_identity_verified: 0,
         finding_count: 0,
         findings: Vec::new(),
         omitted_findings: 0,
@@ -202,6 +236,7 @@ pub fn verify_library_with_options(
                     VerificationFinding {
                         kind: VerificationFindingKind::MetadataNotVerified,
                         object_id: Some(object_id),
+                        manifest_sequence: None,
                         message: format!(
                             "logical object metadata state is {:?}, not verified",
                             logical.verification_state
@@ -220,6 +255,7 @@ pub fn verify_library_with_options(
                             VerificationFinding {
                                 kind: VerificationFindingKind::LengthMismatch,
                                 object_id: Some(object_id),
+                                manifest_sequence: None,
                                 message: format!(
                                     "verified read returned {actual_length} bytes; metadata records {}",
                                     logical.object.uncompressed_length
@@ -242,6 +278,7 @@ pub fn verify_library_with_options(
                     VerificationFinding {
                         kind: VerificationFindingKind::ObjectUnreadable,
                         object_id: Some(object_id),
+                        manifest_sequence: None,
                         message: error.to_string(),
                     },
                 ),
@@ -262,6 +299,7 @@ pub fn verify_library_with_options(
             VerificationFinding {
                 kind: VerificationFindingKind::LibraryChangedDuringVerification,
                 object_id: None,
+                manifest_sequence: None,
                 message,
             },
         );
@@ -269,8 +307,255 @@ pub fn verify_library_with_options(
     if report.objects_examined != target {
         report.coverage = VerificationCoverage::Partial;
     }
+    if options.scope == VerificationScope::Full {
+        verify_manifest_history(library, options.max_retained_findings, &mut report)?;
+    }
 
     Ok(report)
+}
+
+fn verify_manifest_history(
+    library: &Library,
+    maximum_findings: usize,
+    report: &mut VerificationReport,
+) -> Result<(), VerificationError> {
+    let start_names = match manifest_inventory_names(library) {
+        Ok(names) => names,
+        Err(error) => {
+            report.coverage = VerificationCoverage::Partial;
+            push_finding(
+                report,
+                maximum_findings,
+                VerificationFinding {
+                    kind: VerificationFindingKind::ManifestInventoryInvalid,
+                    object_id: None,
+                    manifest_sequence: None,
+                    message: error.to_string(),
+                },
+            );
+            return Ok(());
+        }
+    };
+    let mut sequences = Vec::new();
+    for name in &start_names {
+        let Some(name) = name.to_str() else {
+            push_finding(
+                report,
+                maximum_findings,
+                VerificationFinding {
+                    kind: VerificationFindingKind::ManifestInventoryInvalid,
+                    object_id: None,
+                    manifest_sequence: None,
+                    message: "manifest filename is not UTF-8".to_owned(),
+                },
+            );
+            continue;
+        };
+        match parse_manifest_sequence(name) {
+            Some(sequence) => sequences.push(sequence),
+            None => push_finding(
+                report,
+                maximum_findings,
+                VerificationFinding {
+                    kind: VerificationFindingKind::ManifestInventoryInvalid,
+                    object_id: None,
+                    manifest_sequence: None,
+                    message: format!("unexpected manifest directory entry {name:?}"),
+                },
+            ),
+        }
+    }
+    sequences.sort_unstable();
+    report.manifests_at_start = sequences.len() as u64;
+
+    let mut expected_sequence = 1_u64;
+    let mut previous: Option<(u64, ManifestId)> = None;
+    let mut represented_runs = HashSet::new();
+    for sequence in sequences {
+        if sequence != expected_sequence {
+            let message = if sequence > expected_sequence {
+                format!(
+                    "manifest sequence {expected_sequence} through {} is missing before {sequence}",
+                    sequence - 1
+                )
+            } else {
+                format!("manifest sequence {sequence} is duplicated or reordered")
+            };
+            push_finding(
+                report,
+                maximum_findings,
+                VerificationFinding {
+                    kind: VerificationFindingKind::ManifestMissing,
+                    object_id: None,
+                    manifest_sequence: Some(expected_sequence),
+                    message,
+                },
+            );
+        }
+        expected_sequence = sequence.saturating_add(1);
+        report.manifests_examined = report.manifests_examined.saturating_add(1);
+        let stored = match library.read_manifest(sequence) {
+            Ok(stored) => stored,
+            Err(error) => {
+                push_finding(
+                    report,
+                    maximum_findings,
+                    VerificationFinding {
+                        kind: VerificationFindingKind::ManifestUnreadable,
+                        object_id: None,
+                        manifest_sequence: Some(sequence),
+                        message: error.to_string(),
+                    },
+                );
+                previous = None;
+                continue;
+            }
+        };
+        report.manifests_identity_verified = report.manifests_identity_verified.saturating_add(1);
+
+        let expected_predecessor = if sequence == 1 {
+            None
+        } else {
+            previous
+                .filter(|(previous_sequence, _)| *previous_sequence + 1 == sequence)
+                .map(|(_, id)| id)
+        };
+        let chain_matches = if sequence == 1 {
+            stored.manifest.predecessor.is_none()
+        } else {
+            expected_predecessor.is_some() && stored.manifest.predecessor == expected_predecessor
+        };
+        if !chain_matches {
+            push_finding(
+                report,
+                maximum_findings,
+                VerificationFinding {
+                    kind: VerificationFindingKind::ManifestPredecessorMismatch,
+                    object_id: None,
+                    manifest_sequence: Some(sequence),
+                    message: format!(
+                        "manifest predecessor {:?} does not match prior verified identity {:?}",
+                        stored.manifest.predecessor, expected_predecessor
+                    ),
+                },
+            );
+        }
+        previous = Some((sequence, stored.id));
+
+        if !represented_runs.insert(stored.manifest.run_id) {
+            push_finding(
+                report,
+                maximum_findings,
+                VerificationFinding {
+                    kind: VerificationFindingKind::DuplicateManifestRun,
+                    object_id: None,
+                    manifest_sequence: Some(sequence),
+                    message: format!(
+                        "sync run {} is represented by more than one manifest",
+                        stored.manifest.run_id
+                    ),
+                },
+            );
+        }
+        let status = library.sync_run_status(stored.manifest.run_id)?;
+        if status.is_none_or(|status| status.state != SyncRunState::Succeeded) {
+            push_finding(
+                report,
+                maximum_findings,
+                VerificationFinding {
+                    kind: VerificationFindingKind::ManifestRunNotSucceeded,
+                    object_id: None,
+                    manifest_sequence: Some(sequence),
+                    message: format!(
+                        "manifest refers to absent or unsuccessful sync run {}",
+                        stored.manifest.run_id
+                    ),
+                },
+            );
+        }
+    }
+
+    let mut run_cursor = None;
+    loop {
+        let run_ids = library.succeeded_sync_run_ids_after(run_cursor, 1_000)?;
+        if run_ids.is_empty() {
+            break;
+        }
+        for run_id in &run_ids {
+            if !represented_runs.contains(run_id) {
+                push_finding(
+                    report,
+                    maximum_findings,
+                    VerificationFinding {
+                        kind: VerificationFindingKind::SuccessfulRunMissingManifest,
+                        object_id: None,
+                        manifest_sequence: None,
+                        message: format!("successful sync run {run_id} has no manifest"),
+                    },
+                );
+            }
+        }
+        run_cursor = run_ids.last().copied();
+        if run_ids.len() < 1_000 {
+            break;
+        }
+    }
+
+    match manifest_inventory_names(library) {
+        Ok(end_names) => {
+            report.manifests_at_end = end_names
+                .iter()
+                .filter(|name| name.to_str().and_then(parse_manifest_sequence).is_some())
+                .count() as u64;
+            if end_names != start_names {
+                report.coverage = VerificationCoverage::Partial;
+                push_finding(
+                    report,
+                    maximum_findings,
+                    VerificationFinding {
+                        kind: VerificationFindingKind::ManifestsChangedDuringVerification,
+                        object_id: None,
+                        manifest_sequence: None,
+                        message: "manifest directory changed during verification".to_owned(),
+                    },
+                );
+            }
+        }
+        Err(error) => {
+            report.coverage = VerificationCoverage::Partial;
+            push_finding(
+                report,
+                maximum_findings,
+                VerificationFinding {
+                    kind: VerificationFindingKind::ManifestsChangedDuringVerification,
+                    object_id: None,
+                    manifest_sequence: None,
+                    message: error.to_string(),
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn manifest_inventory_names(library: &Library) -> Result<Vec<std::ffi::OsString>, std::io::Error> {
+    let mut names = fs::read_dir(library.root().join("manifests"))?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    names.sort();
+    Ok(names)
+}
+
+fn parse_manifest_sequence(name: &str) -> Option<u64> {
+    if name.len() != 17 || !name.ends_with(".json") {
+        return None;
+    }
+    let digits = &name[..12];
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let sequence = digits.parse().ok()?;
+    (sequence > 0).then_some(sequence)
 }
 
 fn validate_options(options: VerificationOptions) -> Result<(), VerificationError> {
@@ -362,7 +647,7 @@ mod tests {
     use std::fs;
 
     use tempfile::TempDir;
-    use wikisync_store::{Library, ObjectKind};
+    use wikisync_store::{Library, ObjectKind, SyncRunKind};
 
     use super::*;
 
@@ -378,6 +663,36 @@ mod tests {
                 .expect("store object");
         }
         (directory, library, bytes)
+    }
+
+    fn manifested_library(count: usize) -> (TempDir, Library) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut library = Library::open(directory.path()).expect("library");
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("wiki");
+        for index in 0..count {
+            let candidate = 100 + index as u64;
+            let run_id = library
+                .start_or_resume_sync_run(
+                    wiki_id,
+                    None,
+                    if index == 0 {
+                        SyncRunKind::Bootstrap
+                    } else {
+                        SyncRunKind::Update
+                    },
+                    candidate,
+                )
+                .expect("start run")
+                .status
+                .run_id;
+            library
+                .complete_sync_run(run_id, None)
+                .expect("complete run");
+            library.append_sync_manifest(run_id).expect("manifest run");
+        }
+        (directory, library)
     }
 
     #[test]
@@ -490,6 +805,111 @@ mod tests {
         assert_eq!(report.finding_count, 3);
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.omitted_findings, 2);
+    }
+
+    #[test]
+    fn full_verification_checks_manifest_identity_chain_and_successful_runs() {
+        let (_directory, library) = manifested_library(3);
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert_eq!(report.coverage, VerificationCoverage::Complete);
+        assert_eq!(report.manifests_at_start, 3);
+        assert_eq!(report.manifests_at_end, 3);
+        assert_eq!(report.manifests_examined, 3);
+        assert_eq!(report.manifests_identity_verified, 3);
+        assert_eq!(report.finding_count, 0);
+        assert!(report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn tampered_manifest_identity_is_a_structured_finding() {
+        let (directory, library) = manifested_library(1);
+        let path = directory.path().join("manifests/000000000001.json");
+        let original = fs::read_to_string(&path).expect("manifest");
+        let tampered = original.replace(
+            "\"capture_completed_at\":100",
+            "\"capture_completed_at\":101",
+        );
+        assert_ne!(tampered, original);
+        fs::write(path, tampered).expect("tamper manifest");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestUnreadable
+                && finding.manifest_sequence == Some(1)
+        }));
+        assert!(!report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn missing_manifest_history_and_successful_run_gap_are_structured_findings() {
+        let (directory, library) = manifested_library(3);
+        fs::remove_file(directory.path().join("manifests/000000000002.json"))
+            .expect("remove middle manifest");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestMissing
+                && finding.manifest_sequence == Some(2)
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestPredecessorMismatch
+                && finding.manifest_sequence == Some(3)
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::SuccessfulRunMissingManifest
+        }));
+    }
+
+    #[test]
+    fn swapped_manifest_files_are_detected_as_reordered_history() {
+        let (directory, library) = manifested_library(2);
+        let first_path = directory.path().join("manifests/000000000001.json");
+        let second_path = directory.path().join("manifests/000000000002.json");
+        let first = fs::read(&first_path).expect("first");
+        let second = fs::read(&second_path).expect("second");
+        fs::write(&first_path, second).expect("swap first");
+        fs::write(&second_path, first).expect("swap second");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        let unreadable = report
+            .findings
+            .iter()
+            .filter(|finding| finding.kind == VerificationFindingKind::ManifestUnreadable)
+            .count();
+        assert_eq!(unreadable, 2);
+        assert_eq!(report.manifests_identity_verified, 0);
+    }
+
+    #[test]
+    fn completed_run_without_manifest_is_detected_and_locally_repairable() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut library = Library::open(directory.path()).expect("library");
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("wiki");
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Bootstrap, 100)
+            .expect("start")
+            .status
+            .run_id;
+        library.complete_sync_run(run_id, None).expect("complete");
+
+        let before = verify_library(&library, VerificationScope::Full).expect("before repair");
+        assert!(before.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::SuccessfulRunMissingManifest
+        }));
+
+        library
+            .append_missing_sync_manifests(1)
+            .expect("repair manifest");
+        let after = verify_library(&library, VerificationScope::Full).expect("after repair");
+        assert_eq!(after.finding_count, 0);
+        assert_eq!(after.manifests_identity_verified, 1);
     }
 
     #[test]

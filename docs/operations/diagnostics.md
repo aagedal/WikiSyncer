@@ -95,10 +95,12 @@ sqlite3 -readonly /absolute/path/to/library/library.sqlite3 'PRAGMA quick_check;
 
 An `ok` result covers SQLite structure only. It does not read, reconstruct, or hash
 the canonical content objects. Use the GUI's **Verify full library** action for the
-implemented logical-object verification. It checks every catalogued object through
-the store's normal loose/pack reconstruction and identity validation. The current
-verifier does not yet validate every planned manifest, revision-chain, search-pointer,
-or cache invariant, so report its exact scope rather than saying the archive is
+implemented full verification. It checks every catalogued object through the store's
+normal loose/pack reconstruction and identity validation, then validates bounded
+canonical manifest JSON, embedded identities, strict append sequence, predecessor
+links, and coverage of manifest-eligible successful runs. It does not yet validate
+every planned revision-chain, search-pointer, cache, signature, or external trusted-
+head invariant, so report its exact scope rather than saying the archive is
 universally verified.
 
 If verification reports corruption, stop synchronization, keep the original library

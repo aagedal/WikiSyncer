@@ -146,12 +146,14 @@ impl ApplicationHandler {
             .map_err(|error| OperationError::failed(error.to_string()))?;
         let fully_verified = report.is_verified_since_capture();
         let payload = format!(
-            "scope={} coverage={:?} objects_examined={} objects_verified={} canonical_bytes_verified={} findings={} omitted_findings={} fully_verified={fully_verified}",
+            "scope={} coverage={:?} objects_examined={} objects_verified={} canonical_bytes_verified={} manifests_examined={} manifests_identity_verified={} findings={} omitted_findings={} fully_verified={fully_verified}",
             if full { "full" } else { "quick" },
             report.coverage,
             report.objects_examined,
             report.objects_verified,
             report.canonical_bytes_verified,
+            report.manifests_examined,
+            report.manifests_identity_verified,
             report.finding_count,
             report.omitted_findings,
         );

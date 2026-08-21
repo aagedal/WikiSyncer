@@ -172,15 +172,18 @@ approved host set.
   reconstruction are bounded/validated. Existing representations remain available
   until replacements verify; pruning and pack retirement require a verified alternate
   representation.
-- `wikisync-integrity` performs bounded quick or complete logical-object scans and
-  reports partial coverage honestly. A complete stable object scan with no findings
-  is labeled only as "verified since capture," not as truth.
+- `wikisync-integrity` performs bounded quick object scans or complete logical-object
+  and predecessor-manifest scans and reports partial coverage honestly. Full scans
+  validate canonical manifest identity, sequence/link continuity, and coverage of
+  manifest-eligible successful runs. A complete stable scan with no findings is
+  labeled only as "verified since capture," not as truth.
 - Tests exercise tampered loose objects, pack payloads, indexes, and database location
   pointers.
 
-Current verification is object-catalog verification. It does not yet authenticate or
-fully verify revision chains, manifests, cache transformer versions, search pointers,
-or a trusted library head.
+Current full verification covers the object catalog and unsigned predecessor-linked
+manifest history. It does not yet authenticate a signing identity or fully verify
+revision chains, cache transformer versions, search pointers, or an externally
+trusted library head.
 
 ### Derived content, HTML, and reader
 
@@ -347,13 +350,14 @@ older complete backup; or creates a new self-consistent object graph.
 
 **Present resistance.** Object and pack identities, verified reconstruction, database
 constraints, immutable metadata conflict checks, transactional checkpoints, durable
-jobs, and focused tamper tests catch many partial or accidental changes.
+jobs, canonical predecessor-linked manifests, completed-run coverage checks, and
+focused tamper tests catch many partial or accidental changes.
 
-**Residual risk and action.** Implement append-only predecessor-linked manifests over
-source/configuration, introduced revisions, and resulting heads. Verify manifest
-canonicalization, chain continuity, revision/page linkage, object reachability,
-checkpoints, transformer/search pointers, and absence of unexpected truncation.
-Optional Ed25519 signing must be domain separated and define key rotation/revocation.
+**Residual risk and action.** Extend full verification from implemented manifest
+canonicalization, chain continuity, and completed-run coverage to revision/page
+linkage, object reachability, checkpoints, transformer/search pointers, and absence
+of unexpected database truncation. Optional Ed25519 signing must be domain separated
+and define key rotation/revocation.
 Export the trusted public key and latest manifest identity to separate storage. Without
 that external anchor, a complete rollback can only be reported as internally
 self-consistent, not current. Backup/restore must preserve and compare anchors and
@@ -385,16 +389,16 @@ recoverability from packs/backups.
 | Requirement | State at review | Evidence / remaining work |
 | --- | --- | --- |
 | No telemetry or external reader assets | **Present for tested reader path** | Bundled CSS, restrictive CSP, and in-process outbound-resource crawl; add release-level outbound test and audit diagnostics/updater behavior |
-| Explicit source allowlist | **Pending** | HTTPS validation exists, but arbitrary HTTPS hosts and cross-host HTTPS redirects are accepted |
+| Explicit source allowlist | **Present for configured source origin** | Each client derives an explicit normalized host allowlist from its selected endpoint; redirects must remain on the exact scheme/host/effective-port origin and cross-origin destinations fail before contact. Private-address/DNS-rebinding policy remains to be reviewed |
 | HTTPS through Rustls | **Present** | `wikisync-mediawiki` disables reqwest defaults and enables `rustls-tls`; loopback HTTP is fixture-only by validation |
 | Application User-Agent and operator contact | **Partial** | Non-empty controlled User-Agent and `maxlag` exist; configuration/UI contract for operator contact remains |
-| Response, timeout, parser, redirect, and decompression bounds | **Partial** | Request/connect timeout, body and request limits, redirect count, object/pack and inline-depth limits exist; redirect target, decompression ratio, aggregate parser/allocation/output budgets and fuzzing remain |
+| Response, timeout, parser, redirect, and decompression bounds | **Partial** | Request/connect timeout, per-response and aggregate run-byte limits, clone-shared concurrency, redirect count/origin policy, object/pack and inline-depth limits exist; byte-rate shaping, decompression-ratio coverage, broader parser/allocation budgets, and fuzzing remain |
 | Sanitized HTML and restrictive CSP | **Present for text reader** | Raw HTML events become text, links/images are rewritten, headers are tested; continue adversarial corpus testing |
-| User-restricted data-directory permissions | **Present on Unix core paths** | Directories `0700`, SQLite/WAL/SHM `0600`; extend verification to manifests, IPC, logs, exports and backups |
+| User-restricted data-directory permissions | **Present on Unix core paths** | Directories including manifests/exports are `0700`; SQLite/WAL/SHM and created manifest/export files are `0600`; extend release auditing to logs, IPC, and backups |
 | BLAKE3 identities for canonical text/media | **Present for object abstraction** | Domain-separated text/media object kinds and verified reads exist; media ingestion is not implemented |
-| Predecessor-linked manifests | **Pending** | No manifest schema/storage/verification implementation is present |
+| Predecessor-linked manifests | **Present, unsigned** | Bounded canonical JSON, BLAKE3 body identity, immutable run configuration snapshots, strict predecessor/sequence checks, atomic durable append, bounded crash-gap repair, catalog-difference revisions, resulting heads, and tamper tests are implemented |
 | Optional Ed25519 signatures and external trust anchor | **Pending** | No signing/key lifecycle or trusted-head export is present |
-| Full verify contract | **Partial** | Loose/pack/delta/object catalog verification exists; revision chains, manifests, search/cache pointers, deletion/truncation and trusted-head comparison remain |
+| Full verify contract | **Partial** | Loose/pack/delta/object catalog plus unsigned manifest identity/chain/run coverage verification exists; revision/page/checkpoint reachability, search/cache pointers, database truncation, signatures, and trusted-head comparison remain |
 | Loopback-only read-only reader | **Present, confidentiality gap** | Non-loopback addresses are rejected and only GET routes exist; localhost is unauthenticated and not an OS-user boundary |
 | Daemon single-writer authorization | **Partial** | Versioned bounded Unix IPC, `0600` sockets inside the private library, cooperative writer leases, scheduling, signal cancellation, advisory-lock stale-socket recovery, GUI/CLI forwarding, and exclusion/recovery tests exist; peer-credential review and hostile same-UID analysis remain |
 | Locked/audited dependencies | **Partial** | Lockfile, cargo-deny policy, locked CI tests; formal audit response, immutable CI action pins, SBOM/provenance remain |

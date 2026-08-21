@@ -605,6 +605,11 @@ pub const DEFAULT_MAX_RECONCILIATION_BATCHES_PER_PAGE: usize = 10_000;
 /// Default maximum revisions traversed for one page reconciliation.
 pub const DEFAULT_MAX_RECONCILIATION_REVISIONS_PER_PAGE: usize = 1_000_000;
 
+/// Maximum predecessor-manifest gaps repaired before one sync invocation contacts
+/// its source. Larger backlogs are drained across retryable invocations so recovery
+/// work remains bounded.
+pub const MAX_MANIFEST_REPAIRS_PER_SYNC: u32 = 16;
+
 /// Explicit resource ceilings for one page in a long-gap reconciliation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReconciliationLimits {
@@ -1007,6 +1012,7 @@ pub async fn bootstrap_collection(
     library: &mut Library,
     collection_id: CollectionId,
 ) -> Result<BootstrapReport, CaptureError> {
+    repair_missing_sync_manifests(library)?;
     let configuration = library
         .collection_configuration(collection_id)?
         .ok_or(StoreError::CollectionNotConfigured(collection_id))?;
@@ -1118,6 +1124,7 @@ pub async fn bootstrap_collection(
         }
     }
     let status = library.complete_sync_run(run_id, None)?;
+    library.append_sync_manifest(status.run_id)?;
     Ok(BootstrapReport {
         status,
         current,
@@ -1248,6 +1255,7 @@ pub async fn reconcile_collection_heads_with_limits_and_cancellation(
         return Err(CaptureError::InvalidReconciliationLimits);
     }
     check_cancellation(cancellation)?;
+    repair_missing_sync_manifests(library)?;
     let started = library.start_or_resume_sync_run(
         wiki_id,
         Some(collection_id),
@@ -1333,7 +1341,23 @@ pub async fn reconcile_collection_heads_with_limits_and_cancellation(
 
     check_cancellation(cancellation)?;
     report.status = library.complete_sync_run(run_id, None)?;
+    library.append_sync_manifest(report.status.run_id)?;
     Ok(report)
+}
+
+fn repair_missing_sync_manifests(library: &mut Library) -> Result<(), CaptureError> {
+    let repaired = library.append_missing_sync_manifests(MAX_MANIFEST_REPAIRS_PER_SYNC)?;
+    if let Some(next_run_id) = library
+        .unmanifested_succeeded_run_ids(1)?
+        .into_iter()
+        .next()
+    {
+        return Err(CaptureError::ManifestRepairBacklog {
+            repaired: repaired.len(),
+            next_run_id,
+        });
+    }
+    Ok(())
 }
 
 async fn reconcile_page_head(
@@ -1694,6 +1718,13 @@ pub enum CaptureError {
     InvalidBootstrapJob,
     /// The caller supplied a zero reconciliation ceiling.
     InvalidReconciliationLimits,
+    /// More completed runs need predecessor manifests than one invocation repairs.
+    ManifestRepairBacklog {
+        /// Manifests repaired by this invocation before stopping.
+        repaired: usize,
+        /// Oldest successful run still missing its manifest.
+        next_run_id: u64,
+    },
     /// A selected page did not have a durable local head to reconcile from.
     MissingLocalPageHead(PageId),
     /// A per-page reconciliation safety ceiling was reached after durable progress.
@@ -1779,6 +1810,13 @@ impl fmt::Display for CaptureError {
             }
             Self::InvalidReconciliationLimits => formatter
                 .write_str("reconciliation batch and revision limits must be greater than zero"),
+            Self::ManifestRepairBacklog {
+                repaired,
+                next_run_id,
+            } => write!(
+                formatter,
+                "repaired {repaired} missing sync manifests; retry to continue from successful run {next_run_id} before contacting the source"
+            ),
             Self::MissingLocalPageHead(page_id) => {
                 write!(
                     formatter,
@@ -1863,6 +1901,7 @@ impl CaptureError {
             Self::InvalidReconciliationJob => "invalid-reconciliation-job",
             Self::InvalidBootstrapJob => "invalid-bootstrap-job",
             Self::InvalidReconciliationLimits => "invalid-reconciliation-limits",
+            Self::ManifestRepairBacklog { .. } => "manifest-repair-backlog",
             Self::MissingLocalPageHead(_) => "missing-local-page-head",
             Self::ReconciliationLimitExceeded { .. } => "reconciliation-limit",
             Self::MissingCurrentRevision(_) => "page-head-unavailable",
@@ -1883,7 +1922,7 @@ impl CaptureError {
         match self {
             Self::Cancelled => false,
             Self::Source(error) => error.is_retryable(),
-            Self::Store(_) | Self::Search(_) => true,
+            Self::Store(_) | Self::Search(_) | Self::ManifestRepairBacklog { .. } => true,
             _ => false,
         }
     }

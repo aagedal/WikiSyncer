@@ -19,6 +19,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
+use serde::{Deserialize, Serialize};
 use wikisync_core::{
     CollectionBudget, CollectionId, CollectionRemovalPolicy, CollectionRule, HistoryPolicy,
     InclusionReason, PageId, PageTitle, RevisionId, TitleSelection, UnixTimestamp, WikiId,
@@ -31,8 +32,16 @@ const MIGRATION_4: &str = include_str!("../migrations/0004_sync.sql");
 const MIGRATION_5: &str = include_str!("../migrations/0005_packs.sql");
 const MIGRATION_6: &str = include_str!("../migrations/0006_collections.sql");
 const MIGRATION_7: &str = include_str!("../migrations/0007_schedules.sql");
+const MIGRATION_8: &str = include_str!("../migrations/0008_manifest_configuration.sql");
 const OBJECT_DOMAIN: &[u8] = b"wikisync-object-v1\0";
 const DATABASE_NAME: &str = "library.sqlite3";
+const MANIFEST_DOMAIN: &[u8] = b"wikisync-manifest-v1\0";
+const MANIFEST_DIRECTORY: &str = "manifests";
+const MANIFEST_SCHEMA_VERSION: u32 = 1;
+const MANIFEST_FILENAME_DIGITS: usize = 12;
+const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_MANIFEST_ENTRIES: usize = 100_000;
+const MAX_MANIFEST_TEXT_BYTES: usize = 8 * 1024;
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const PACK_MAGIC: &[u8; 8] = b"WSPACK1\0";
 const INDEX_MAGIC: &[u8; 8] = b"WSINDEX1";
@@ -71,6 +80,9 @@ pub const MAX_SCHEDULE_JITTER_SECONDS: u32 = 24 * 60 * 60;
 
 /// Largest due-schedule page accepted by [`Library::due_schedules`].
 pub const MAX_DUE_SCHEDULES: u32 = 10_000;
+
+/// Maximum manifest records returned by one bounded enumeration call.
+pub const MAX_MANIFEST_PAGE_SIZE: u32 = 1_000;
 
 /// Configuration for a [`Library`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -244,6 +256,170 @@ impl fmt::Display for InvalidObjectId {
 }
 
 impl Error for InvalidObjectId {}
+
+/// Content identity of one canonical integrity-manifest body.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ManifestId([u8; 32]);
+
+impl ManifestId {
+    /// Returns the raw 32-byte BLAKE3 digest.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    fn for_body(body: &[u8]) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(MANIFEST_DOMAIN);
+        hasher.update(&(body.len() as u64).to_le_bytes());
+        hasher.update(body);
+        Self(*hasher.finalize().as_bytes())
+    }
+}
+
+impl fmt::Debug for ManifestId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for ManifestId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "b3:{}",
+            blake3::Hash::from_bytes(self.0).to_hex()
+        )
+    }
+}
+
+impl FromStr for ManifestId {
+    type Err = InvalidManifestId;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let digest = value.strip_prefix("b3:").ok_or(InvalidManifestId)?;
+        let hash = blake3::Hash::from_hex(digest).map_err(|_| InvalidManifestId)?;
+        Ok(Self(*hash.as_bytes()))
+    }
+}
+
+/// A manifest ID did not use the supported `b3:` form.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidManifestId;
+
+impl fmt::Display for InvalidManifestId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("manifest ID must be b3: followed by 64 hexadecimal characters")
+    }
+}
+
+impl Error for InvalidManifestId {}
+
+/// One durable revision newly represented by this manifest chain entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestRevision {
+    /// Stable page identity at the source.
+    pub page_id: PageId,
+    /// Stable source revision identity.
+    pub revision_id: RevisionId,
+    /// Immutable canonical content identity.
+    pub content_object_id: ObjectId,
+}
+
+/// One resulting captured page head in the synchronization scope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestPageHead {
+    /// Stable page identity at the source.
+    pub page_id: PageId,
+    /// Captured head, absent when the source page has no locally captured head.
+    pub revision_id: Option<RevisionId>,
+}
+
+/// Parsed, validated contents of one predecessor-linked synchronization manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncManifest {
+    /// Strictly increasing append sequence, also encoded in the filename.
+    pub sequence: u64,
+    /// Identity of the exact canonical predecessor body.
+    pub predecessor: Option<ManifestId>,
+    /// Durable synchronization run represented by this manifest.
+    pub run_id: u64,
+    /// Local source identity.
+    pub wiki_id: WikiId,
+    /// Optional collection scope.
+    pub collection_id: Option<CollectionId>,
+    /// Stable source operation label.
+    pub run_kind: SyncRunKind,
+    /// Configured MediaWiki API endpoint observed for the run.
+    pub source: String,
+    /// Inclusive source discovery-window start.
+    pub capture_started_at: u64,
+    /// Source boundary made durable by the successful run.
+    pub capture_completed_at: u64,
+    /// Content identity of the durable collection/source configuration.
+    pub configuration_hash: String,
+    /// Durable revisions in scope that no predecessor manifest represented.
+    pub introduced_revisions: Vec<ManifestRevision>,
+    /// Resulting page heads in stable page-ID order.
+    pub page_heads: Vec<ManifestPageHead>,
+}
+
+/// One durably installed and identity-verified manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredManifest {
+    /// Content identity recorded in and reproduced from the canonical file.
+    pub id: ManifestId,
+    /// Validated semantic contents.
+    pub manifest: SyncManifest,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ManifestEnvelope {
+    manifest_id: String,
+    #[serde(flatten)]
+    body: ManifestBody,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ManifestBody {
+    schema_version: u32,
+    sequence: u64,
+    predecessor: Option<String>,
+    run_id: u64,
+    wiki_id: u64,
+    collection_id: Option<u64>,
+    run_kind: String,
+    source: String,
+    capture_started_at: u64,
+    capture_completed_at: u64,
+    configuration_hash: String,
+    introduced_revisions: Vec<ManifestRevisionWire>,
+    page_heads: Vec<ManifestPageHeadWire>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ManifestRevisionWire {
+    page_id: u64,
+    revision_id: u64,
+    content_object_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ManifestPageHeadWire {
+    page_id: u64,
+    revision_id: Option<u64>,
+}
+
+type ManifestConfigurationRow = (
+    String,
+    Option<String>,
+    Option<i64>,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    String,
+);
 
 /// Metadata returned after an object is durably installed.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -756,6 +932,8 @@ pub struct SyncRunStatus {
     pub window_start: u64,
     /// Source timestamp committed only after every job succeeds.
     pub checkpoint_candidate: u64,
+    /// Immutable hash of the durable configuration at run start, absent for legacy runs.
+    pub configuration_hash: Option<String>,
     /// Number of queued jobs.
     pub queued_jobs: u64,
     /// Number of claimed jobs.
@@ -897,6 +1075,7 @@ fn prepare_library_directories(root: &Path) -> io::Result<()> {
         root.join("objects/loose"),
         root.join("objects/loose/b3"),
         root.join("objects/packs"),
+        root.join(MANIFEST_DIRECTORY),
         root.join("tmp"),
     ] {
         create_private_dir_all(&directory)?;
@@ -1925,6 +2104,8 @@ impl Library {
                 return Err(StoreError::CollectionWikiMismatch);
             }
         }
+        let configuration_hash =
+            manifest_configuration_hash_for(&transaction, wiki_id, collection_id)?;
 
         transaction.execute(
             "INSERT OR IGNORE INTO sync_checkpoints (
@@ -1937,61 +2118,69 @@ impl Library {
                 now
             ],
         )?;
-        let existing_run: Option<(i64, String)> = transaction
+        let existing_run: Option<(i64, String, Option<String>)> = transaction
             .query_row(
-                "SELECT run_id, run_kind FROM sync_runs
+                "SELECT run_id, run_kind, configuration_hash FROM sync_runs
                  WHERE wiki_id = ?1 AND collection_id IS ?2
                    AND state = 'running'",
                 params![raw_wiki_id, raw_collection_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
 
-        let (raw_run_id, resumed) = if let Some((run_id, existing_kind)) = existing_run {
-            if existing_kind != kind.as_str() {
-                return Err(StoreError::SyncScopeBusy {
-                    run_id: sql_u64(run_id, "invalid sync run ID")?,
-                    kind: existing_kind,
-                });
-            }
-            transaction.execute(
-                "UPDATE sync_jobs
+        let (raw_run_id, resumed) =
+            if let Some((run_id, existing_kind, existing_configuration_hash)) = existing_run {
+                if existing_kind != kind.as_str() {
+                    return Err(StoreError::SyncScopeBusy {
+                        run_id: sql_u64(run_id, "invalid sync run ID")?,
+                        kind: existing_kind,
+                    });
+                }
+                if existing_configuration_hash.is_none() {
+                    transaction.execute(
+                        "UPDATE sync_runs SET configuration_hash = ?2 WHERE run_id = ?1",
+                        params![run_id, configuration_hash],
+                    )?;
+                }
+                transaction.execute(
+                    "UPDATE sync_jobs
                  SET state = 'queued', started_at = NULL, finished_at = NULL
                  WHERE run_id = ?1
                    AND (state = 'running' OR (state = 'failed' AND retryable = 1))",
-                [run_id],
-            )?;
-            (run_id, true)
-        } else {
-            let (committed_through, overlap_seconds): (i64, i64) = transaction.query_row(
-                "SELECT committed_through, overlap_seconds FROM sync_checkpoints
+                    [run_id],
+                )?;
+                (run_id, true)
+            } else {
+                let (committed_through, overlap_seconds): (i64, i64) = transaction.query_row(
+                    "SELECT committed_through, overlap_seconds FROM sync_checkpoints
                  WHERE wiki_id = ?1 AND collection_id IS ?2",
-                params![raw_wiki_id, raw_collection_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            let window_start = committed_through.saturating_sub(overlap_seconds).max(0);
-            if raw_candidate < committed_through {
-                return Err(StoreError::InvalidCheckpointCandidate {
-                    committed_through: sql_u64(committed_through, "invalid sync checkpoint")?,
-                    candidate: checkpoint_candidate,
-                });
-            }
-            transaction.execute(
-                "INSERT INTO sync_runs (
+                    params![raw_wiki_id, raw_collection_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let window_start = committed_through.saturating_sub(overlap_seconds).max(0);
+                if raw_candidate < committed_through {
+                    return Err(StoreError::InvalidCheckpointCandidate {
+                        committed_through: sql_u64(committed_through, "invalid sync checkpoint")?,
+                        candidate: checkpoint_candidate,
+                    });
+                }
+                transaction.execute(
+                    "INSERT INTO sync_runs (
                     wiki_id, collection_id, run_kind, state, window_start,
-                    checkpoint_candidate, created_at, started_at
-                 ) VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6, ?6)",
-                params![
-                    raw_wiki_id,
-                    raw_collection_id,
-                    kind.as_str(),
-                    window_start,
-                    raw_candidate,
-                    now,
-                ],
-            )?;
-            (transaction.last_insert_rowid(), false)
-        };
+                    checkpoint_candidate, configuration_hash, created_at, started_at
+                 ) VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6, ?7, ?7)",
+                    params![
+                        raw_wiki_id,
+                        raw_collection_id,
+                        kind.as_str(),
+                        window_start,
+                        raw_candidate,
+                        configuration_hash,
+                        now,
+                    ],
+                )?;
+                (transaction.last_insert_rowid(), false)
+            };
         transaction.commit()?;
         let run_id = sql_u64(raw_run_id, "invalid sync run ID")?;
         let status = self
@@ -2359,6 +2548,421 @@ impl Library {
             .optional()?
             .map(stored_sync_run_status)
             .transpose()
+    }
+
+    /// Returns the number of canonical manifest files after validating their names.
+    pub fn manifest_count(&self) -> Result<u64, StoreError> {
+        u64::try_from(self.manifest_sequences()?.len())
+            .map_err(|_| StoreError::ManifestLimitExceeded)
+    }
+
+    /// Reads and identity-verifies one canonical manifest by append sequence.
+    pub fn read_manifest(&self, sequence: u64) -> Result<StoredManifest, StoreError> {
+        if sequence == 0 {
+            return Err(StoreError::InvalidManifest(
+                "manifest sequence must be positive",
+            ));
+        }
+        let path = self.manifest_path(sequence)?;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                StoreError::ManifestNotFound(sequence)
+            } else {
+                StoreError::Io(error)
+            }
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StoreError::CorruptManifest {
+                sequence,
+                message: "manifest path is not a regular file",
+            });
+        }
+        if metadata.len() > MAX_MANIFEST_BYTES {
+            return Err(StoreError::CorruptManifest {
+                sequence,
+                message: "manifest exceeds the file-size bound",
+            });
+        }
+        let file = File::open(path)?;
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(MAX_MANIFEST_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err(StoreError::CorruptManifest {
+                sequence,
+                message: "manifest exceeds the file-size bound",
+            });
+        }
+        decode_manifest(sequence, &bytes)
+    }
+
+    /// Returns a bounded page of manifests in increasing sequence order.
+    pub fn manifests_after(
+        &self,
+        after_sequence: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<StoredManifest>, StoreError> {
+        if !(1..=MAX_MANIFEST_PAGE_SIZE).contains(&limit) {
+            return Err(StoreError::InvalidConfig(
+                "manifest page size must be between 1 and 1,000",
+            ));
+        }
+        self.manifest_sequences()?
+            .into_iter()
+            .filter(|sequence| after_sequence.is_none_or(|after| *sequence > after))
+            .take(limit as usize)
+            .map(|sequence| self.read_manifest(sequence))
+            .collect()
+    }
+
+    /// Appends the canonical manifest for one successful durable sync run.
+    ///
+    /// All manifest fields are derived from durable SQLite state. Repeating the call
+    /// for an already represented run returns the existing manifest. Running,
+    /// cancelled, and unknown runs are rejected. The database commit and file append
+    /// are deliberately separate durability boundaries: after a crash between them,
+    /// [`Library::append_missing_sync_manifests`] repairs the detectable gap.
+    pub fn append_sync_manifest(&mut self, run_id: u64) -> Result<StoredManifest, StoreError> {
+        self.ensure_writable()?;
+        let existing = self
+            .validated_manifest_chain()?
+            .into_iter()
+            .find(|stored| stored.manifest.run_id == run_id);
+        if let Some(existing) = existing {
+            return Ok(existing);
+        }
+
+        let status = self
+            .sync_run_status(run_id)?
+            .ok_or(StoreError::SyncRunNotSucceeded(run_id))?;
+        if status.state != SyncRunState::Succeeded {
+            return Err(StoreError::SyncRunNotSucceeded(run_id));
+        }
+        let expected_run_id = self
+            .unmanifested_succeeded_run_ids(1)?
+            .into_iter()
+            .next()
+            .ok_or(StoreError::CorruptMetadata(
+                "successful unmanifested run was not found",
+            ))?;
+        if run_id != expected_run_id {
+            return Err(StoreError::ManifestRunOutOfOrder {
+                expected: expected_run_id,
+                requested: run_id,
+            });
+        }
+        status.finished_at.ok_or(StoreError::CorruptMetadata(
+            "successful sync run lacks finish time",
+        ))?;
+        let source = self
+            .wiki(status.wiki_id)?
+            .ok_or(StoreError::WikiNotFound(status.wiki_id))?
+            .api_endpoint;
+        validate_manifest_text(&source)?;
+        let configuration_hash = status
+            .configuration_hash
+            .clone()
+            .ok_or(StoreError::SyncRunConfigurationUnavailable(run_id))?;
+        let prior = self.validated_manifest_chain()?;
+        let mut introduced_revisions =
+            self.manifest_catalog_revisions(status.wiki_id, status.collection_id)?;
+        let mut candidate_revision_ids = introduced_revisions
+            .iter()
+            .map(|revision| revision.revision_id)
+            .collect::<HashSet<_>>();
+        for stored in &prior {
+            if stored.manifest.wiki_id == status.wiki_id {
+                for revision in &stored.manifest.introduced_revisions {
+                    candidate_revision_ids.remove(&revision.revision_id);
+                }
+            }
+        }
+        introduced_revisions
+            .retain(|revision| candidate_revision_ids.contains(&revision.revision_id));
+        let page_heads = self.manifest_page_heads(status.wiki_id, status.collection_id)?;
+        let sequence = prior.last().map_or(Ok(1_u64), |stored| {
+            stored
+                .manifest
+                .sequence
+                .checked_add(1)
+                .ok_or(StoreError::ManifestLimitExceeded)
+        })?;
+        let predecessor = prior.last().map(|stored| stored.id);
+        let manifest = SyncManifest {
+            sequence,
+            predecessor,
+            run_id,
+            wiki_id: status.wiki_id,
+            collection_id: status.collection_id,
+            run_kind: status.kind,
+            source,
+            capture_started_at: status.window_start,
+            capture_completed_at: status.checkpoint_candidate,
+            configuration_hash,
+            introduced_revisions,
+            page_heads,
+        };
+        let (id, bytes) = encode_manifest(&manifest)?;
+        let path = self.manifest_path(sequence)?;
+        if path.exists() {
+            return Err(StoreError::ManifestConflict(sequence));
+        }
+        let mut temporary = tempfile::Builder::new()
+            .prefix("manifest-")
+            .tempfile_in(self.root.join("tmp"))?;
+        temporary.write_all(&bytes)?;
+        temporary.as_file().sync_all()?;
+        #[cfg(unix)]
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o600))?;
+        temporary
+            .persist(&path)
+            .map_err(|error| StoreError::Io(error.error))?;
+        sync_directory(&self.root.join(MANIFEST_DIRECTORY))?;
+        let stored = self.read_manifest(sequence)?;
+        if stored.id != id {
+            return Err(StoreError::CorruptManifest {
+                sequence,
+                message: "installed manifest identity changed",
+            });
+        }
+        Ok(stored)
+    }
+
+    /// Appends manifests for a bounded oldest-first set of successful unrepresented runs.
+    pub fn append_missing_sync_manifests(
+        &mut self,
+        limit: u32,
+    ) -> Result<Vec<StoredManifest>, StoreError> {
+        let run_ids = self.unmanifested_succeeded_run_ids(limit)?;
+        run_ids
+            .into_iter()
+            .map(|run_id| self.append_sync_manifest(run_id))
+            .collect()
+    }
+
+    /// Finds a bounded oldest-first set of successful runs with no installed manifest.
+    pub fn unmanifested_succeeded_run_ids(&self, limit: u32) -> Result<Vec<u64>, StoreError> {
+        if !(1..=MAX_MANIFEST_PAGE_SIZE).contains(&limit) {
+            return Err(StoreError::InvalidConfig(
+                "missing manifest limit must be between 1 and 1,000",
+            ));
+        }
+        let represented = self
+            .validated_manifest_chain()?
+            .into_iter()
+            .map(|stored| stored.manifest.run_id)
+            .collect::<HashSet<_>>();
+        let mut statement = self.connection.prepare(
+            "SELECT run_id FROM sync_runs
+                 WHERE state = 'succeeded' AND configuration_hash IS NOT NULL
+                 ORDER BY run_id",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+        let mut missing = Vec::new();
+        for row in rows {
+            let run_id = sql_u64(row?, "invalid sync run ID")?;
+            if !represented.contains(&run_id) {
+                missing.push(run_id);
+                if missing.len() == limit as usize {
+                    break;
+                }
+            }
+        }
+        Ok(missing)
+    }
+
+    /// Returns a bounded increasing page of successful run IDs for integrity scans.
+    pub fn succeeded_sync_run_ids_after(
+        &self,
+        after_run_id: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<u64>, StoreError> {
+        if !(1..=MAX_MANIFEST_PAGE_SIZE).contains(&limit) {
+            return Err(StoreError::InvalidConfig(
+                "successful run page size must be between 1 and 1,000",
+            ));
+        }
+        let after = to_sql_integer(after_run_id.unwrap_or(0))?;
+        let mut statement = self.connection.prepare(
+            "SELECT run_id FROM sync_runs
+             WHERE state = 'succeeded' AND configuration_hash IS NOT NULL AND run_id > ?1
+             ORDER BY run_id LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![after, limit], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|value| sql_u64(value, "invalid sync run ID"))
+            .collect()
+    }
+
+    fn all_manifests(&self) -> Result<Vec<StoredManifest>, StoreError> {
+        self.manifest_sequences()?
+            .into_iter()
+            .map(|sequence| self.read_manifest(sequence))
+            .collect()
+    }
+
+    fn validated_manifest_chain(&self) -> Result<Vec<StoredManifest>, StoreError> {
+        let manifests = self.all_manifests()?;
+        let mut previous = None;
+        let mut run_ids = HashSet::new();
+        for (index, stored) in manifests.iter().enumerate() {
+            let expected_sequence = index as u64 + 1;
+            if stored.manifest.sequence != expected_sequence {
+                return Err(StoreError::CorruptManifest {
+                    sequence: expected_sequence,
+                    message: "manifest append sequence has a gap",
+                });
+            }
+            if stored.manifest.predecessor != previous {
+                return Err(StoreError::CorruptManifest {
+                    sequence: expected_sequence,
+                    message: "manifest predecessor chain is broken",
+                });
+            }
+            if !run_ids.insert(stored.manifest.run_id) {
+                return Err(StoreError::CorruptManifest {
+                    sequence: expected_sequence,
+                    message: "sync run occurs more than once in manifest chain",
+                });
+            }
+            previous = Some(stored.id);
+        }
+        Ok(manifests)
+    }
+
+    fn manifest_sequences(&self) -> Result<Vec<u64>, StoreError> {
+        let directory = self.root.join(MANIFEST_DIRECTORY);
+        let metadata = fs::symlink_metadata(&directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(StoreError::InvalidManifest(
+                "manifest directory is not a regular directory",
+            ));
+        }
+        let mut sequences = Vec::new();
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| StoreError::InvalidManifest("manifest filename is not UTF-8"))?;
+            let sequence = parse_manifest_filename(&name)?;
+            sequences.push(sequence);
+            if sequences.len() > MAX_MANIFEST_ENTRIES {
+                return Err(StoreError::ManifestLimitExceeded);
+            }
+        }
+        sequences.sort_unstable();
+        if sequences.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(StoreError::InvalidManifest("duplicate manifest sequence"));
+        }
+        Ok(sequences)
+    }
+
+    fn manifest_path(&self, sequence: u64) -> Result<PathBuf, StoreError> {
+        if sequence == 0 || sequence >= 10_u64.pow(MANIFEST_FILENAME_DIGITS as u32) {
+            return Err(StoreError::ManifestLimitExceeded);
+        }
+        Ok(self.root.join(MANIFEST_DIRECTORY).join(format!(
+            "{sequence:0width$}.json",
+            width = MANIFEST_FILENAME_DIGITS
+        )))
+    }
+
+    fn manifest_catalog_revisions(
+        &self,
+        wiki_id: WikiId,
+        collection_id: Option<CollectionId>,
+    ) -> Result<Vec<ManifestRevision>, StoreError> {
+        let sql = if collection_id.is_some() {
+            "SELECT revisions.page_id, revisions.revision_id,
+                    revisions.content_object_id
+             FROM revisions
+             JOIN collection_resolved_members members
+               ON members.wiki_id = revisions.wiki_id
+              AND members.page_id = revisions.page_id
+             WHERE revisions.wiki_id = ?1
+               AND members.collection_id = ?2
+             ORDER BY revisions.revision_id"
+        } else {
+            "SELECT page_id, revision_id, content_object_id FROM revisions
+             WHERE wiki_id = ?1 AND ?2 IS NULL
+             ORDER BY revision_id"
+        };
+        let mut statement = self.connection.prepare(sql)?;
+        let rows = statement.query_map(
+            params![
+                to_sql_integer(wiki_id.get())?,
+                collection_id
+                    .map(|id| to_sql_integer(id.get()))
+                    .transpose()?
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        let mut revisions = Vec::new();
+        for row in rows {
+            let (page_id, revision_id, object_id) = row?;
+            revisions.push(ManifestRevision {
+                page_id: sql_id(page_id, "invalid page ID in manifest input")?,
+                revision_id: sql_id(revision_id, "invalid revision ID in manifest input")?,
+                content_object_id: object_id.parse().map_err(|_| {
+                    StoreError::CorruptMetadata("invalid object ID in manifest input")
+                })?,
+            });
+            if revisions.len() > MAX_MANIFEST_ENTRIES {
+                return Err(StoreError::ManifestLimitExceeded);
+            }
+        }
+        Ok(revisions)
+    }
+
+    fn manifest_page_heads(
+        &self,
+        wiki_id: WikiId,
+        collection_id: Option<CollectionId>,
+    ) -> Result<Vec<ManifestPageHead>, StoreError> {
+        let (sql, collection_parameter) = if let Some(collection_id) = collection_id {
+            (
+                "SELECT pages.page_id, pages.current_revision_id
+                 FROM collection_resolved_members members
+                 JOIN pages ON pages.wiki_id = members.wiki_id
+                           AND pages.page_id = members.page_id
+                 WHERE members.collection_id = ?1
+                   AND members.membership_state = 'active'
+                 ORDER BY pages.page_id",
+                to_sql_integer(collection_id.get())?,
+            )
+        } else {
+            (
+                "SELECT page_id, current_revision_id FROM pages
+                 WHERE wiki_id = ?1 ORDER BY page_id",
+                to_sql_integer(wiki_id.get())?,
+            )
+        };
+        let mut statement = self.connection.prepare(sql)?;
+        let rows = statement.query_map([collection_parameter], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?;
+        let mut heads = Vec::new();
+        for row in rows {
+            let (page_id, revision_id) = row?;
+            heads.push(ManifestPageHead {
+                page_id: sql_id(page_id, "invalid page ID in manifest head")?,
+                revision_id: revision_id
+                    .map(|value| sql_id(value, "invalid revision ID in manifest head"))
+                    .transpose()?,
+            });
+            if heads.len() > MAX_MANIFEST_ENTRIES {
+                return Err(StoreError::ManifestLimitExceeded);
+            }
+        }
+        Ok(heads)
     }
 
     /// Makes canonical bytes durable, then atomically records their page and revision.
@@ -3908,6 +4512,7 @@ type SyncRunStatusRow = (
     String,
     i64,
     i64,
+    Option<String>,
     i64,
     i64,
     i64,
@@ -4056,6 +4661,7 @@ fn stored_sync_checkpoint(row: SyncCheckpointRow) -> Result<SyncCheckpoint, Stor
 fn sync_run_status_query() -> &'static str {
     "SELECT runs.run_id, runs.wiki_id, runs.collection_id, runs.run_kind,
             runs.state, runs.window_start, runs.checkpoint_candidate,
+            runs.configuration_hash,
             (SELECT COUNT(*) FROM sync_jobs WHERE run_id = runs.run_id AND state = 'queued'),
             (SELECT COUNT(*) FROM sync_jobs WHERE run_id = runs.run_id AND state = 'running'),
             (SELECT COUNT(*) FROM sync_jobs WHERE run_id = runs.run_id AND state = 'succeeded'),
@@ -4090,6 +4696,7 @@ fn sync_run_status_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncRunStatu
         row.get(14)?,
         row.get(15)?,
         row.get(16)?,
+        row.get(17)?,
     ))
 }
 
@@ -4105,16 +4712,17 @@ fn stored_sync_run_status(row: SyncRunStatusRow) -> Result<SyncRunStatus, StoreE
         state: SyncRunState::from_database(&row.4)?,
         window_start: sql_u64(row.5, "invalid sync window start")?,
         checkpoint_candidate: sql_u64(row.6, "invalid checkpoint candidate")?,
-        queued_jobs: sql_u64(row.7, "invalid queued job count")?,
-        running_jobs: sql_u64(row.8, "invalid running job count")?,
-        succeeded_jobs: sql_u64(row.9, "invalid succeeded job count")?,
-        failed_jobs: sql_u64(row.10, "invalid failed job count")?,
-        created_at: sql_u64(row.11, "invalid sync creation time")?,
+        configuration_hash: row.7,
+        queued_jobs: sql_u64(row.8, "invalid queued job count")?,
+        running_jobs: sql_u64(row.9, "invalid running job count")?,
+        succeeded_jobs: sql_u64(row.10, "invalid succeeded job count")?,
+        failed_jobs: sql_u64(row.11, "invalid failed job count")?,
+        created_at: sql_u64(row.12, "invalid sync creation time")?,
         finished_at: row
-            .12
+            .13
             .map(|value| sql_u64(value, "invalid sync finish time"))
             .transpose()?,
-        latest_error: match (row.13, row.14, row.15, row.16) {
+        latest_error: match (row.14, row.15, row.16, row.17) {
             (None, None, None, None) => None,
             (Some(code), Some(message), Some(retryable), Some(occurred_at)) => Some(SyncFailure {
                 code,
@@ -5026,7 +5634,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
          ) STRICT;",
     )?;
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > 7 {
+    if version > 8 {
         return Err(StoreError::UnsupportedSchemaVersion(version));
     }
     if version == 0 {
@@ -5112,6 +5720,18 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
         transaction.pragma_update(None, "user_version", 7)?;
         transaction.commit()?;
     }
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 7 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(MIGRATION_8)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (8, 'manifest-configuration', ?1)",
+            [unix_time()?],
+        )?;
+        transaction.pragma_update(None, "user_version", 8)?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -5137,6 +5757,345 @@ fn unix_time() -> Result<i64, StoreError> {
 
 fn to_sql_integer(value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::IntegerOutOfRange(value))
+}
+
+fn encode_manifest(manifest: &SyncManifest) -> Result<(ManifestId, Vec<u8>), StoreError> {
+    validate_manifest(manifest)?;
+    let body = ManifestBody {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        sequence: manifest.sequence,
+        predecessor: manifest.predecessor.map(|id| id.to_string()),
+        run_id: manifest.run_id,
+        wiki_id: manifest.wiki_id.get(),
+        collection_id: manifest.collection_id.map(CollectionId::get),
+        run_kind: manifest.run_kind.as_str().to_owned(),
+        source: manifest.source.clone(),
+        capture_started_at: manifest.capture_started_at,
+        capture_completed_at: manifest.capture_completed_at,
+        configuration_hash: manifest.configuration_hash.clone(),
+        introduced_revisions: manifest
+            .introduced_revisions
+            .iter()
+            .map(|revision| ManifestRevisionWire {
+                page_id: revision.page_id.get(),
+                revision_id: revision.revision_id.get(),
+                content_object_id: revision.content_object_id.to_string(),
+            })
+            .collect(),
+        page_heads: manifest
+            .page_heads
+            .iter()
+            .map(|head| ManifestPageHeadWire {
+                page_id: head.page_id.get(),
+                revision_id: head.revision_id.map(RevisionId::get),
+            })
+            .collect(),
+    };
+    let canonical_body = serde_json::to_vec(&body)
+        .map_err(|_| StoreError::InvalidManifest("manifest body could not be serialized"))?;
+    let id = ManifestId::for_body(&canonical_body);
+    let envelope = ManifestEnvelope {
+        manifest_id: id.to_string(),
+        body,
+    };
+    let bytes = serde_json::to_vec(&envelope)
+        .map_err(|_| StoreError::InvalidManifest("manifest could not be serialized"))?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(StoreError::ManifestLimitExceeded);
+    }
+    Ok((id, bytes))
+}
+
+fn decode_manifest(sequence: u64, bytes: &[u8]) -> Result<StoredManifest, StoreError> {
+    let envelope: ManifestEnvelope =
+        serde_json::from_slice(bytes).map_err(|_| StoreError::CorruptManifest {
+            sequence,
+            message: "manifest is not valid schema-v1 JSON",
+        })?;
+    if envelope.body.schema_version != MANIFEST_SCHEMA_VERSION {
+        return Err(StoreError::CorruptManifest {
+            sequence,
+            message: "unsupported manifest schema version",
+        });
+    }
+    if envelope.body.sequence != sequence {
+        return Err(StoreError::CorruptManifest {
+            sequence,
+            message: "filename and manifest sequence disagree",
+        });
+    }
+    let canonical_body =
+        serde_json::to_vec(&envelope.body).map_err(|_| StoreError::CorruptManifest {
+            sequence,
+            message: "manifest body cannot be canonicalized",
+        })?;
+    let actual_id = ManifestId::for_body(&canonical_body);
+    let recorded_id = envelope
+        .manifest_id
+        .parse()
+        .map_err(|_| StoreError::CorruptManifest {
+            sequence,
+            message: "manifest records an invalid identity",
+        })?;
+    if actual_id != recorded_id {
+        return Err(StoreError::CorruptManifest {
+            sequence,
+            message: "manifest body does not reproduce its recorded identity",
+        });
+    }
+    let canonical_envelope =
+        serde_json::to_vec(&envelope).map_err(|_| StoreError::CorruptManifest {
+            sequence,
+            message: "manifest cannot be canonicalized",
+        })?;
+    if canonical_envelope != bytes {
+        return Err(StoreError::CorruptManifest {
+            sequence,
+            message: "manifest file is not in canonical JSON form",
+        });
+    }
+    if envelope.body.introduced_revisions.len() > MAX_MANIFEST_ENTRIES
+        || envelope.body.page_heads.len() > MAX_MANIFEST_ENTRIES
+    {
+        return Err(StoreError::CorruptManifest {
+            sequence,
+            message: "manifest entry count exceeds bounds",
+        });
+    }
+    let predecessor = envelope
+        .body
+        .predecessor
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| StoreError::CorruptManifest {
+            sequence,
+            message: "manifest predecessor identity is invalid",
+        })?;
+    let mut introduced_revisions = Vec::with_capacity(envelope.body.introduced_revisions.len());
+    for revision in envelope.body.introduced_revisions {
+        introduced_revisions.push(ManifestRevision {
+            page_id: PageId::new(revision.page_id).map_err(|_| StoreError::CorruptManifest {
+                sequence,
+                message: "manifest page ID is invalid",
+            })?,
+            revision_id: RevisionId::new(revision.revision_id).map_err(|_| {
+                StoreError::CorruptManifest {
+                    sequence,
+                    message: "manifest revision ID is invalid",
+                }
+            })?,
+            content_object_id: revision.content_object_id.parse().map_err(|_| {
+                StoreError::CorruptManifest {
+                    sequence,
+                    message: "manifest object ID is invalid",
+                }
+            })?,
+        });
+    }
+    let mut page_heads = Vec::with_capacity(envelope.body.page_heads.len());
+    for head in envelope.body.page_heads {
+        page_heads.push(ManifestPageHead {
+            page_id: PageId::new(head.page_id).map_err(|_| StoreError::CorruptManifest {
+                sequence,
+                message: "manifest head page ID is invalid",
+            })?,
+            revision_id: head
+                .revision_id
+                .map(RevisionId::new)
+                .transpose()
+                .map_err(|_| StoreError::CorruptManifest {
+                    sequence,
+                    message: "manifest head revision ID is invalid",
+                })?,
+        });
+    }
+    let manifest = SyncManifest {
+        sequence,
+        predecessor,
+        run_id: envelope.body.run_id,
+        wiki_id: WikiId::new(envelope.body.wiki_id).map_err(|_| StoreError::CorruptManifest {
+            sequence,
+            message: "manifest wiki ID is invalid",
+        })?,
+        collection_id: envelope
+            .body
+            .collection_id
+            .map(CollectionId::new)
+            .transpose()
+            .map_err(|_| StoreError::CorruptManifest {
+                sequence,
+                message: "manifest collection ID is invalid",
+            })?,
+        run_kind: SyncRunKind::from_database(&envelope.body.run_kind).map_err(|_| {
+            StoreError::CorruptManifest {
+                sequence,
+                message: "manifest run kind is invalid",
+            }
+        })?,
+        source: envelope.body.source,
+        capture_started_at: envelope.body.capture_started_at,
+        capture_completed_at: envelope.body.capture_completed_at,
+        configuration_hash: envelope.body.configuration_hash,
+        introduced_revisions,
+        page_heads,
+    };
+    validate_manifest(&manifest).map_err(|_| StoreError::CorruptManifest {
+        sequence,
+        message: "manifest contents violate schema invariants",
+    })?;
+    Ok(StoredManifest {
+        id: actual_id,
+        manifest,
+    })
+}
+
+fn validate_manifest(manifest: &SyncManifest) -> Result<(), StoreError> {
+    if manifest.sequence == 0 || manifest.run_id == 0 {
+        return Err(StoreError::InvalidManifest(
+            "manifest sequence and run ID must be positive",
+        ));
+    }
+    if manifest.capture_completed_at < manifest.capture_started_at {
+        return Err(StoreError::InvalidManifest(
+            "manifest capture interval is reversed",
+        ));
+    }
+    validate_manifest_text(&manifest.source)?;
+    manifest
+        .configuration_hash
+        .parse::<ManifestId>()
+        .map_err(|_| StoreError::InvalidManifest("configuration hash is invalid"))?;
+    if manifest.introduced_revisions.len() > MAX_MANIFEST_ENTRIES
+        || manifest.page_heads.len() > MAX_MANIFEST_ENTRIES
+    {
+        return Err(StoreError::ManifestLimitExceeded);
+    }
+    if manifest
+        .introduced_revisions
+        .windows(2)
+        .any(|pair| pair[0].revision_id >= pair[1].revision_id)
+    {
+        return Err(StoreError::InvalidManifest(
+            "introduced revisions are not strictly ordered",
+        ));
+    }
+    if manifest
+        .page_heads
+        .windows(2)
+        .any(|pair| pair[0].page_id >= pair[1].page_id)
+    {
+        return Err(StoreError::InvalidManifest(
+            "page heads are not strictly ordered",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_manifest_text(value: &str) -> Result<(), StoreError> {
+    if value.trim().is_empty()
+        || value.len() > MAX_MANIFEST_TEXT_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(StoreError::InvalidManifest(
+            "manifest text is empty, too long, or contains controls",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_manifest_filename(name: &str) -> Result<u64, StoreError> {
+    let expected_length = MANIFEST_FILENAME_DIGITS + ".json".len();
+    if name.len() != expected_length || !name.ends_with(".json") {
+        return Err(StoreError::InvalidManifest("invalid manifest filename"));
+    }
+    let digits = &name[..MANIFEST_FILENAME_DIGITS];
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(StoreError::InvalidManifest("invalid manifest filename"));
+    }
+    let sequence = digits
+        .parse::<u64>()
+        .map_err(|_| StoreError::InvalidManifest("invalid manifest filename"))?;
+    if sequence == 0 {
+        return Err(StoreError::InvalidManifest(
+            "manifest sequence must be positive",
+        ));
+    }
+    Ok(sequence)
+}
+
+fn manifest_configuration_hash_for(
+    connection: &Connection,
+    wiki_id: WikiId,
+    collection_id: Option<CollectionId>,
+) -> Result<String, StoreError> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"wikisync-manifest-configuration-v1\0");
+    hash_manifest_field(&mut hasher, &wiki_id.get().to_string());
+    if let Some(collection_id) = collection_id {
+        hash_manifest_field(&mut hasher, &collection_id.get().to_string());
+        let configuration: ManifestConfigurationRow = connection.query_row(
+            "SELECT rule_kind, category_title, category_recursion_depth,
+                    history_kind, history_value, maximum_pages, maximum_bytes,
+                    removal_policy
+             FROM collection_configuration WHERE collection_id = ?1",
+            [to_sql_integer(collection_id.get())?],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )?;
+        for field in [
+            Some(configuration.0),
+            configuration.1,
+            configuration.2.map(|value| value.to_string()),
+            Some(configuration.3),
+            configuration.4.map(|value| value.to_string()),
+            configuration.5.map(|value| value.to_string()),
+            configuration.6.map(|value| value.to_string()),
+            Some(configuration.7),
+        ] {
+            hash_manifest_optional_field(&mut hasher, field.as_deref());
+        }
+        let mut statement = connection.prepare(
+            "SELECT title FROM collection_rule_titles
+             WHERE collection_id = ?1 ORDER BY title",
+        )?;
+        let titles = statement.query_map([to_sql_integer(collection_id.get())?], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for title in titles {
+            hash_manifest_field(&mut hasher, &title?);
+        }
+    } else {
+        hash_manifest_field(&mut hasher, "source-wide");
+    }
+    Ok(format!("b3:{}", hasher.finalize().to_hex()))
+}
+
+fn hash_manifest_field(hasher: &mut blake3::Hasher, value: &str) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn hash_manifest_optional_field(hasher: &mut blake3::Hasher, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update(&[1]);
+            hash_manifest_field(hasher, value);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
 }
 
 fn sync_directory(path: &Path) -> Result<(), StoreError> {
@@ -5247,6 +6206,32 @@ pub enum StoreError {
         /// Jobs not yet successful.
         incomplete_jobs: u64,
     },
+    /// A manifest was requested for an absent, running, or cancelled run.
+    SyncRunNotSucceeded(u64),
+    /// A legacy run lacks the immutable configuration snapshot needed for a manifest.
+    SyncRunConfigurationUnavailable(u64),
+    /// A later successful run cannot precede an older unrepresented run in the chain.
+    ManifestRunOutOfOrder {
+        /// Oldest successful run that must be represented next.
+        expected: u64,
+        /// Later run requested by the caller.
+        requested: u64,
+    },
+    /// A manifest filename, field, or append request violated a stable invariant.
+    InvalidManifest(&'static str),
+    /// No manifest exists at the requested sequence.
+    ManifestNotFound(u64),
+    /// A canonical manifest file failed bounded parsing or identity validation.
+    CorruptManifest {
+        /// Sequence encoded by the expected filename.
+        sequence: u64,
+        /// Stable local diagnostic.
+        message: &'static str,
+    },
+    /// A different file already occupies a new manifest sequence.
+    ManifestConflict(u64),
+    /// Manifest sequence, count, or encoded size exceeded a supported bound.
+    ManifestLimitExceeded,
     /// A bounded synchronization key or status string was invalid.
     InvalidSyncText(&'static str),
     /// The database was created by a newer application schema.
@@ -5362,6 +6347,31 @@ impl fmt::Display for StoreError {
                 formatter,
                 "sync run {run_id} has {incomplete_jobs} incomplete jobs"
             ),
+            Self::SyncRunNotSucceeded(run_id) => {
+                write!(formatter, "sync run {run_id} has not succeeded")
+            }
+            Self::SyncRunConfigurationUnavailable(run_id) => write!(
+                formatter,
+                "sync run {run_id} predates durable manifest configuration snapshots"
+            ),
+            Self::ManifestRunOutOfOrder {
+                expected,
+                requested,
+            } => write!(
+                formatter,
+                "sync run {requested} cannot be manifested before older successful run {expected}"
+            ),
+            Self::InvalidManifest(message) => write!(formatter, "invalid manifest: {message}"),
+            Self::ManifestNotFound(sequence) => {
+                write!(formatter, "manifest sequence {sequence} was not found")
+            }
+            Self::CorruptManifest { sequence, message } => {
+                write!(formatter, "corrupt manifest {sequence}: {message}")
+            }
+            Self::ManifestConflict(sequence) => {
+                write!(formatter, "manifest sequence {sequence} already exists")
+            }
+            Self::ManifestLimitExceeded => formatter.write_str("manifest exceeds supported bounds"),
             Self::InvalidSyncText(label) => write!(
                 formatter,
                 "{label} must be non-empty, bounded, and contain no control characters"
@@ -5537,7 +6547,7 @@ mod tests {
         let before = filesystem_snapshot(directory.path());
 
         let mut library = Library::open_read_only(directory.path()).expect("read-only library");
-        assert_eq!(library.schema_version().expect("schema version"), 7);
+        assert_eq!(library.schema_version().expect("schema version"), 8);
         assert_eq!(library.wikis().expect("wikis")[0].wiki_id, wiki_id);
         assert_eq!(library.logical_object_count().expect("object count"), 1);
         assert_eq!(
@@ -5601,6 +6611,7 @@ mod tests {
             "objects/loose",
             "objects/loose/b3",
             "objects/packs",
+            "manifests",
             "tmp",
         ] {
             assert_eq!(
@@ -5638,13 +6649,13 @@ mod tests {
     #[test]
     fn migration_is_applied_once_and_keeps_locations_separate() {
         let (directory, library) = test_library();
-        assert_eq!(library.schema_version().expect("schema version"), 7);
-        assert_eq!(migration_count(&library), 7);
+        assert_eq!(library.schema_version().expect("schema version"), 8);
+        assert_eq!(migration_count(&library), 8);
 
         drop(library);
         let reopened = Library::open(directory.path()).expect("reopen library");
-        assert_eq!(reopened.schema_version().expect("schema version"), 7);
-        assert_eq!(migration_count(&reopened), 7);
+        assert_eq!(reopened.schema_version().expect("schema version"), 8);
+        assert_eq!(migration_count(&reopened), 8);
 
         let logical_columns: Vec<String> = reopened
             .connection()
@@ -5704,8 +6715,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 7);
-        assert_eq!(migration_count(&upgraded), 7);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 8);
+        assert_eq!(migration_count(&upgraded), 8);
         assert_eq!(table_count(&upgraded, "revisions"), 0);
     }
 
@@ -5741,8 +6752,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 7);
-        assert_eq!(migration_count(&upgraded), 7);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 8);
+        assert_eq!(migration_count(&upgraded), 8);
         assert_eq!(table_count(&upgraded, "search_documents"), 0);
         let fts_definition: String = upgraded
             .connection()
@@ -6901,6 +7912,244 @@ mod tests {
         assert_eq!(checkpoints[0].committed_through, 1_000);
         assert_eq!(checkpoints[1].collection_id, Some(second_collection));
         assert_eq!(checkpoints[1].committed_through, 0);
+    }
+
+    #[test]
+    fn successful_sync_manifests_are_idempotent_canonical_and_predecessor_linked() {
+        let (directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let first_run = library
+            .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Bootstrap, 100)
+            .expect("start first")
+            .status
+            .run_id;
+        library
+            .complete_sync_run(first_run, None)
+            .expect("complete first");
+
+        let first = library
+            .append_sync_manifest(first_run)
+            .expect("append first");
+        let repeated = library
+            .append_sync_manifest(first_run)
+            .expect("repeat first");
+        assert_eq!(first, repeated);
+        assert_eq!(first.manifest.sequence, 1);
+        assert_eq!(first.manifest.predecessor, None);
+        assert_eq!(library.manifest_count().expect("count"), 1);
+
+        let second_run = library
+            .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Update, 200)
+            .expect("start second")
+            .status
+            .run_id;
+        library
+            .complete_sync_run(second_run, Some("fixture-cursor"))
+            .expect("complete second");
+        let second = library
+            .append_sync_manifest(second_run)
+            .expect("append second");
+        assert_eq!(second.manifest.sequence, 2);
+        assert_eq!(second.manifest.predecessor, Some(first.id));
+        assert_eq!(
+            library.manifests_after(Some(1), 1).expect("page"),
+            vec![second]
+        );
+
+        let filename = directory.path().join("manifests/000000000001.json");
+        let bytes = fs::read(&filename).expect("manifest bytes");
+        assert!(!bytes.ends_with(b"\n"));
+        assert_eq!(
+            serde_json::to_vec(&serde_json::from_slice::<ManifestEnvelope>(&bytes).unwrap())
+                .unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn manifests_reject_unfinished_runs_and_repair_bounded_success_gaps() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let running = library
+            .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Bootstrap, 100)
+            .expect("start running")
+            .status
+            .run_id;
+        assert!(matches!(
+            library.append_sync_manifest(running),
+            Err(StoreError::SyncRunNotSucceeded(id)) if id == running
+        ));
+        library
+            .complete_sync_run(running, None)
+            .expect("complete first");
+        let second = library
+            .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Update, 200)
+            .expect("start second")
+            .status
+            .run_id;
+        library
+            .complete_sync_run(second, None)
+            .expect("complete second");
+
+        assert!(matches!(
+            library.append_sync_manifest(second),
+            Err(StoreError::ManifestRunOutOfOrder {
+                expected,
+                requested
+            }) if expected == running && requested == second
+        ));
+
+        assert_eq!(
+            library.unmanifested_succeeded_run_ids(10).expect("missing"),
+            vec![running, second]
+        );
+        let repaired = library
+            .append_missing_sync_manifests(1)
+            .expect("repair one");
+        assert_eq!(repaired.len(), 1);
+        assert_eq!(repaired[0].manifest.run_id, running);
+        assert_eq!(
+            library
+                .unmanifested_succeeded_run_ids(10)
+                .expect("remaining"),
+            vec![second]
+        );
+    }
+
+    #[test]
+    fn catalog_difference_introduces_preexisting_revisions_exactly_once() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Fixture")
+            .expect("collection");
+        let title = PageTitle::new("Fixture page").expect("title");
+        library
+            .capture_current_revision(
+                wiki_id,
+                collection_id,
+                &CurrentRevisionCapture {
+                    page_id: PageId::new(10).expect("page"),
+                    namespace: 0,
+                    title: &title,
+                    revision_id: RevisionId::new(20).expect("revision"),
+                    parent_id: None,
+                    timestamp: "2026-08-21T00:00:00Z",
+                    author: None,
+                    author_id: None,
+                    comment: None,
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: b"fixture",
+                },
+            )
+            .expect("capture");
+        let first_run = library
+            .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Bootstrap, 100)
+            .expect("start first")
+            .status
+            .run_id;
+        library
+            .complete_sync_run(first_run, None)
+            .expect("complete first");
+        let first = library
+            .append_sync_manifest(first_run)
+            .expect("manifest first");
+        assert_eq!(first.manifest.introduced_revisions.len(), 1);
+
+        let second_run = library
+            .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Update, 200)
+            .expect("start second")
+            .status
+            .run_id;
+        library
+            .complete_sync_run(second_run, None)
+            .expect("complete second");
+        let second = library
+            .append_sync_manifest(second_run)
+            .expect("manifest second");
+        assert!(second.manifest.introduced_revisions.is_empty());
+    }
+
+    #[test]
+    fn manifest_repair_uses_configuration_hash_persisted_at_run_start() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Configuration fixture")
+            .expect("collection");
+        let started = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 100)
+            .expect("start");
+        let original_hash = started
+            .status
+            .configuration_hash
+            .clone()
+            .expect("snapshotted configuration");
+        library
+            .complete_sync_run(started.status.run_id, None)
+            .expect("complete");
+
+        library
+            .connection
+            .execute(
+                "UPDATE collection_configuration
+                 SET history_kind = 'complete', history_value = NULL
+                 WHERE collection_id = ?1",
+                [to_sql_integer(collection_id.get()).unwrap()],
+            )
+            .expect("mutate configuration after crash boundary");
+        let changed_hash =
+            manifest_configuration_hash_for(&library.connection, wiki_id, Some(collection_id))
+                .expect("changed hash");
+        assert_ne!(changed_hash, original_hash);
+
+        let repaired = library
+            .append_missing_sync_manifests(1)
+            .expect("repair manifest");
+        assert_eq!(repaired[0].manifest.configuration_hash, original_hash);
+    }
+
+    #[test]
+    fn manifest_reads_detect_body_and_canonical_file_tampering() {
+        let (directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Bootstrap, 100)
+            .expect("start")
+            .status
+            .run_id;
+        library.complete_sync_run(run_id, None).expect("complete");
+        library.append_sync_manifest(run_id).expect("append");
+        let path = directory.path().join("manifests/000000000001.json");
+        let original = fs::read_to_string(&path).expect("manifest");
+        let tampered = original.replace(
+            "\"capture_completed_at\":100",
+            "\"capture_completed_at\":101",
+        );
+        assert_ne!(tampered, original);
+        fs::write(&path, tampered).expect("tamper body");
+        assert!(matches!(
+            library.read_manifest(1),
+            Err(StoreError::CorruptManifest { sequence: 1, .. })
+        ));
+
+        fs::write(&path, format!("{original}\n")).expect("tamper representation");
+        assert!(matches!(
+            library.read_manifest(1),
+            Err(StoreError::CorruptManifest { sequence: 1, .. })
+        ));
     }
 
     fn migration_count(library: &Library) -> u32 {
