@@ -4,10 +4,11 @@
 //! are compressed into a temporary file, made durable, and atomically installed
 //! before the SQLite transaction records their location.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,12 +20,32 @@ const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
 const MIGRATION_2: &str = include_str!("../migrations/0002_capture.sql");
 const MIGRATION_3: &str = include_str!("../migrations/0003_search.sql");
 const MIGRATION_4: &str = include_str!("../migrations/0004_sync.sql");
+const MIGRATION_5: &str = include_str!("../migrations/0005_packs.sql");
 const OBJECT_DOMAIN: &[u8] = b"wikisync-object-v1\0";
 const DATABASE_NAME: &str = "library.sqlite3";
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
+const PACK_MAGIC: &[u8; 8] = b"WSPACK1\0";
+const INDEX_MAGIC: &[u8; 8] = b"WSINDEX1";
+const PACK_HEADER_LENGTH: u64 = 8 + 8;
+const PACK_ENTRY_HEADER_LENGTH: u64 = 1 + 1 + 2 + 32 + 32 + 8 + 8;
+const INDEX_HEADER_LENGTH: u64 = 8 + 32 + 8;
+const INDEX_ENTRY_LENGTH: u64 = 32 + 8 + 8;
+const PACK_ENCODING_FULL: u8 = 1;
+const PACK_ENCODING_DELTA: u8 = 2;
+const DELTA_HEADER_LENGTH: usize = 16;
+const MAX_DELTA_DEPTH: u16 = 8;
+const DELTA_CANDIDATE_WINDOW: usize = 16;
+const MIN_DELTA_SAVINGS: usize = 16;
+const MAX_SUPPORTED_PACK_OBJECTS: u32 = 1_000_000;
 
 /// Default upper bound for one uncompressed canonical object (64 MiB).
 pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Default maximum number of objects considered for one pack.
+pub const DEFAULT_MAX_PACK_OBJECTS: u32 = 256;
+
+/// Default maximum canonical input represented by one pack (512 MiB).
+pub const DEFAULT_MAX_PACK_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Default amount of already-committed source time revisited by an update (5 minutes).
 pub const DEFAULT_SYNC_OVERLAP_SECONDS: u64 = 5 * 60;
@@ -34,6 +55,8 @@ pub const DEFAULT_SYNC_OVERLAP_SECONDS: u64 = 5 * 60;
 pub struct StoreConfig {
     max_object_bytes: u64,
     compression_level: i32,
+    max_pack_objects: u32,
+    max_pack_input_bytes: u64,
 }
 
 impl Default for StoreConfig {
@@ -41,6 +64,8 @@ impl Default for StoreConfig {
         Self {
             max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
             compression_level: 3,
+            max_pack_objects: DEFAULT_MAX_PACK_OBJECTS,
+            max_pack_input_bytes: DEFAULT_MAX_PACK_INPUT_BYTES,
         }
     }
 }
@@ -67,6 +92,28 @@ impl StoreConfig {
         self.compression_level = level;
         Ok(self)
     }
+
+    /// Sets the maximum object count in one newly built pack.
+    pub fn with_max_pack_objects(mut self, count: u32) -> Result<Self, StoreError> {
+        if count == 0 || count > MAX_SUPPORTED_PACK_OBJECTS {
+            return Err(StoreError::InvalidConfig(
+                "maximum pack object count must be between 1 and 1,000,000",
+            ));
+        }
+        self.max_pack_objects = count;
+        Ok(self)
+    }
+
+    /// Sets the maximum sum of canonical object bytes considered for one pack.
+    pub fn with_max_pack_input_bytes(mut self, bytes: u64) -> Result<Self, StoreError> {
+        if bytes == 0 {
+            return Err(StoreError::InvalidConfig(
+                "maximum pack input size must be greater than zero",
+            ));
+        }
+        self.max_pack_input_bytes = bytes;
+        Ok(self)
+    }
 }
 
 /// Canonical object categories. The category participates in logical identity.
@@ -83,6 +130,14 @@ impl ObjectKind {
         match self {
             Self::Wikitext => 1,
             Self::Media => 2,
+        }
+    }
+
+    fn from_identity_tag(tag: u8) -> Result<Self, StoreError> {
+        match tag {
+            1 => Ok(Self::Wikitext),
+            2 => Ok(Self::Media),
+            _ => Err(StoreError::CorruptPack("unknown object kind")),
         }
     }
 
@@ -177,6 +232,25 @@ pub struct StoredObject {
     pub kind: ObjectKind,
     /// Length of the canonical, uncompressed bytes.
     pub uncompressed_length: u64,
+}
+
+/// Result of durably building, verifying, and activating one immutable pack.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackSummary {
+    /// Content-derived identity of the exact pack bytes.
+    pub pack_id: String,
+    /// Monotonically increasing physical representation generation.
+    pub generation: u64,
+    /// Number of logical objects represented by the pack.
+    pub object_count: u64,
+    /// Entries stored as independently compressed complete objects.
+    pub full_entries: u64,
+    /// Entries stored as bounded deltas from preceding entries.
+    pub delta_entries: u64,
+    /// On-disk pack length.
+    pub pack_bytes: u64,
+    /// On-disk index length.
+    pub index_bytes: u64,
 }
 
 /// Metadata and canonical bytes committed for a page's observed current revision.
@@ -501,6 +575,93 @@ pub struct StartedSyncRun {
     pub status: SyncRunStatus,
     /// Whether an existing interrupted run was resumed.
     pub resumed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackEncoding {
+    Full,
+    Delta,
+}
+
+impl PackEncoding {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Full => PACK_ENCODING_FULL,
+            Self::Delta => PACK_ENCODING_DELTA,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Result<Self, StoreError> {
+        match tag {
+            PACK_ENCODING_FULL => Ok(Self::Full),
+            PACK_ENCODING_DELTA => Ok(Self::Delta),
+            _ => Err(StoreError::CorruptPack("unknown pack entry encoding")),
+        }
+    }
+
+    const fn database_value(self) -> &'static str {
+        match self {
+            Self::Full => "pack-full",
+            Self::Delta => "pack-delta",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PreparedPackEntry {
+    id: ObjectId,
+    kind: ObjectKind,
+    uncompressed_length: u64,
+    encoding: PackEncoding,
+    base_id: Option<ObjectId>,
+    delta_depth: u16,
+    payload: Vec<u8>,
+    offset: u64,
+    record_length: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PackIndexEntry {
+    id: ObjectId,
+    offset: u64,
+    record_length: u64,
+}
+
+#[derive(Debug)]
+struct DecodedPackEntry {
+    id: ObjectId,
+    kind: ObjectKind,
+    uncompressed_length: u64,
+    encoding: PackEncoding,
+    base_id: Option<ObjectId>,
+    delta_depth: u16,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct PackLocation {
+    storage_kind: String,
+    encoding: String,
+    relative_path: String,
+    compressed_length: i64,
+    base_object_id: Option<String>,
+    pack_id: Option<String>,
+    pack_offset: Option<i64>,
+    delta_depth: Option<i64>,
+    pack_path: Option<String>,
+    index_path: Option<String>,
+    pack_checksum: Option<String>,
+    index_checksum: Option<String>,
+}
+
+#[derive(Debug)]
+struct RecordedPack {
+    pack_path: PathBuf,
+    index_path: PathBuf,
+    pack_checksum: [u8; 32],
+    index_checksum: [u8; 32],
+    generation: u64,
+    object_count: u64,
 }
 
 /// One WikiSyncer library and its writer connection.
@@ -1658,6 +1819,389 @@ impl Library {
         })
     }
 
+    /// Builds and activates one bounded immutable pack from verified loose objects.
+    ///
+    /// The pack and its separate index are made durable and every entry is
+    /// reconstructed and hash-verified before one SQLite transaction exposes any
+    /// packed location. Existing loose representations remain available until an
+    /// explicit pruning pass marks them obsolete.
+    pub fn pack_loose_objects(&mut self) -> Result<Option<PackSummary>, StoreError> {
+        let candidate_ids = {
+            let mut statement = self.connection.prepare(
+                "SELECT loose.object_id
+                 FROM object_locations AS loose
+                 WHERE loose.storage_kind = 'loose'
+                   AND loose.encoding = 'zstd'
+                   AND loose.verification_state = 'verified'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM object_locations AS packed
+                       JOIN packs ON packs.pack_id = packed.pack_id
+                       WHERE packed.object_id = loose.object_id
+                         AND packed.storage_kind = 'pack'
+                         AND packed.verification_state = 'verified'
+                         AND packs.state = 'verified'
+                   )
+                 GROUP BY loose.object_id
+                 ORDER BY MIN(loose.location_id)
+                 LIMIT ?1",
+            )?;
+            statement
+                .query_map([i64::from(self.config.max_pack_objects)], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut sources = Vec::with_capacity(candidate_ids.len());
+        let mut total_input = 0_u64;
+        for raw_id in candidate_ids {
+            let id = raw_id
+                .parse::<ObjectId>()
+                .map_err(|_| StoreError::CorruptMetadata("invalid stored object ID"))?;
+            let (kind, expected_length, bytes) = self.read_loose_object(id)?;
+            let next_total = total_input
+                .checked_add(expected_length)
+                .ok_or(StoreError::PackLimitExceeded)?;
+            if next_total > self.config.max_pack_input_bytes {
+                if sources.is_empty() {
+                    return Err(StoreError::PackLimitExceeded);
+                }
+                break;
+            }
+            total_input = next_total;
+            sources.push((id, kind, bytes));
+        }
+        if sources.is_empty() {
+            return Ok(None);
+        }
+
+        self.activate_pack_sources(&sources).map(Some)
+    }
+
+    /// Rewrites one verified pack's objects into a fresh generation.
+    /// The previous representation remains active until [`Self::retire_pack`] is
+    /// called, so interruption cannot strand an object between generations.
+    pub fn repack_pack(&mut self, pack_id: &str) -> Result<PackSummary, StoreError> {
+        let recorded = self.verify_recorded_pack(pack_id)?;
+        if recorded.object_count > u64::from(self.config.max_pack_objects) {
+            return Err(StoreError::PackLimitExceeded);
+        }
+        let candidate_ids = {
+            let mut statement = self.connection.prepare(
+                "SELECT object_id FROM object_locations
+                 WHERE pack_id = ?1 AND verification_state = 'verified'
+                 ORDER BY pack_offset",
+            )?;
+            statement
+                .query_map([pack_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut sources = Vec::with_capacity(candidate_ids.len());
+        let mut total_input = 0_u64;
+        for raw_id in candidate_ids {
+            let id = raw_id
+                .parse::<ObjectId>()
+                .map_err(|_| StoreError::CorruptMetadata("invalid stored object ID"))?;
+            let (kind, expected_length, _) = self.object_locations(id)?;
+            let next_total = total_input
+                .checked_add(expected_length)
+                .ok_or(StoreError::PackLimitExceeded)?;
+            if next_total > self.config.max_pack_input_bytes {
+                if sources.is_empty() {
+                    return Err(StoreError::PackLimitExceeded);
+                }
+                break;
+            }
+            let bytes = self.read_object(id)?;
+            total_input = next_total;
+            sources.push((id, kind, bytes));
+        }
+        if sources.len() as u64 != recorded.object_count {
+            return Err(StoreError::CorruptMetadata(
+                "pack object count disagrees with locations",
+            ));
+        }
+        self.activate_pack_sources(&sources)
+    }
+
+    fn activate_pack_sources(
+        &mut self,
+        sources: &[(ObjectId, ObjectKind, Vec<u8>)],
+    ) -> Result<PackSummary, StoreError> {
+        let raw_generation: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(generation), 0) + 1 FROM packs",
+            [],
+            |row| row.get(0),
+        )?;
+        let generation = sql_u64(raw_generation, "invalid pack generation")?;
+        let mut entries = prepare_pack_entries(sources, self.config.compression_level)?;
+
+        let mut pack_temp = tempfile::Builder::new()
+            .prefix("pack-")
+            .suffix(".tmp")
+            .tempfile_in(self.root.join("tmp"))?;
+        write_pack(pack_temp.as_file_mut(), generation, &mut entries)?;
+        pack_temp.as_file().sync_all()?;
+        let pack_checksum = checksum_file(pack_temp.as_file_mut())?;
+        let pack_bytes = pack_temp.as_file().metadata()?.len();
+
+        let mut index_temp = tempfile::Builder::new()
+            .prefix("index-")
+            .suffix(".tmp")
+            .tempfile_in(self.root.join("tmp"))?;
+        write_pack_index(index_temp.as_file_mut(), pack_checksum, &entries)?;
+        index_temp.as_file().sync_all()?;
+        let index_checksum = checksum_file(index_temp.as_file_mut())?;
+        let index_bytes = index_temp.as_file().metadata()?.len();
+
+        let pack_digest = blake3::Hash::from_bytes(pack_checksum).to_hex().to_string();
+        let index_digest = blake3::Hash::from_bytes(index_checksum)
+            .to_hex()
+            .to_string();
+        let pack_id = format!("b3:{pack_digest}");
+        let pack_relative = PathBuf::from("objects/packs").join(format!("pack-{pack_digest}.pack"));
+        let index_relative = PathBuf::from("objects/packs").join(format!("pack-{pack_digest}.idx"));
+        let pack_absolute = self.root.join(&pack_relative);
+        let index_absolute = self.root.join(&index_relative);
+        pack_temp
+            .persist(&pack_absolute)
+            .map_err(|error| StoreError::Io(error.error))?;
+        index_temp
+            .persist(&index_absolute)
+            .map_err(|error| StoreError::Io(error.error))?;
+        sync_directory(&self.root.join("objects/packs"))?;
+
+        verify_pack_files(
+            &pack_absolute,
+            &index_absolute,
+            pack_checksum,
+            index_checksum,
+            generation,
+            self.config.max_object_bytes,
+            entries.len() as u64,
+        )?;
+
+        let now = unix_time()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO packs (
+                pack_id, generation, pack_path, index_path, pack_checksum,
+                index_checksum, object_count, state, created_at, verified_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'verified', ?8, ?8)",
+            params![
+                pack_id,
+                to_sql_integer(generation)?,
+                path_to_database(&pack_relative)?,
+                path_to_database(&index_relative)?,
+                format!("b3:{pack_digest}"),
+                format!("b3:{index_digest}"),
+                to_sql_integer(entries.len() as u64)?,
+                now,
+            ],
+        )?;
+        for entry in &entries {
+            transaction.execute(
+                "INSERT INTO object_locations (
+                    object_id, storage_kind, encoding, relative_path,
+                    compressed_length, base_object_id, pack_generation,
+                    verification_state, created_at, pack_id, pack_offset, delta_depth
+                 ) VALUES (?1, 'pack', ?2, ?3, ?4, ?5, ?6, 'verified', ?7, ?8, ?9, ?10)",
+                params![
+                    entry.id.to_string(),
+                    entry.encoding.database_value(),
+                    path_to_database(&pack_relative)?,
+                    to_sql_integer(entry.record_length)?,
+                    entry.base_id.map(|id| id.to_string()),
+                    to_sql_integer(generation)?,
+                    now,
+                    pack_id,
+                    to_sql_integer(entry.offset)?,
+                    i64::from(entry.delta_depth),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+
+        let full_entries = entries
+            .iter()
+            .filter(|entry| entry.encoding == PackEncoding::Full)
+            .count() as u64;
+        let delta_entries = entries.len() as u64 - full_entries;
+        Ok(PackSummary {
+            pack_id,
+            generation,
+            object_count: entries.len() as u64,
+            full_entries,
+            delta_entries,
+            pack_bytes,
+            index_bytes,
+        })
+    }
+
+    fn recorded_pack(&self, pack_id: &str) -> Result<RecordedPack, StoreError> {
+        let metadata: Option<(String, String, String, String, i64, i64)> = self
+            .connection
+            .query_row(
+                "SELECT pack_path, index_path, pack_checksum, index_checksum,
+                        generation, object_count
+                 FROM packs WHERE pack_id = ?1 AND state = 'verified'",
+                [pack_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (pack_path, index_path, pack_checksum, index_checksum, generation, object_count) =
+            metadata.ok_or_else(|| StoreError::PackNotFound(pack_id.to_owned()))?;
+        Ok(RecordedPack {
+            pack_path: pack_database_path(&pack_path, ".pack")?,
+            index_path: pack_database_path(&index_path, ".idx")?,
+            pack_checksum: parse_checksum(&pack_checksum)?,
+            index_checksum: parse_checksum(&index_checksum)?,
+            generation: sql_u64(generation, "invalid pack generation")?,
+            object_count: sql_u64(object_count, "invalid pack object count")?,
+        })
+    }
+
+    fn verify_recorded_pack(&self, pack_id: &str) -> Result<RecordedPack, StoreError> {
+        let pack = self.recorded_pack(pack_id)?;
+        verify_pack_files(
+            &self.root.join(&pack.pack_path),
+            &self.root.join(&pack.index_path),
+            pack.pack_checksum,
+            pack.index_checksum,
+            pack.generation,
+            self.config.max_object_bytes,
+            pack.object_count,
+        )?;
+        Ok(pack)
+    }
+
+    /// Marks loose copies represented by a verified pack obsolete, then removes them.
+    ///
+    /// The metadata transition commits first, so interruption can leave only harmless
+    /// orphaned loose files and never remove the active packed representation.
+    pub fn prune_packed_loose_objects(&mut self, pack_id: &str) -> Result<u64, StoreError> {
+        self.verify_recorded_pack(pack_id)?;
+        let paths = {
+            let mut statement = self.connection.prepare(
+                "SELECT DISTINCT loose.relative_path
+                 FROM object_locations AS loose
+                 JOIN object_locations AS packed ON packed.object_id = loose.object_id
+                 WHERE packed.pack_id = ?1
+                   AND packed.verification_state = 'verified'
+                   AND loose.storage_kind = 'loose'
+                   AND loose.verification_state = 'verified'",
+            )?;
+            statement
+                .query_map([pack_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE object_locations AS loose
+             SET verification_state = 'obsolete'
+             WHERE loose.storage_kind = 'loose'
+               AND loose.verification_state = 'verified'
+               AND EXISTS (
+                   SELECT 1 FROM object_locations AS packed
+                   WHERE packed.pack_id = ?1
+                     AND packed.object_id = loose.object_id
+                     AND packed.verification_state = 'verified'
+               )",
+            [pack_id],
+        )?;
+        transaction.commit()?;
+        for raw_path in paths {
+            let path = loose_database_path(&raw_path)?;
+            match fs::remove_file(self.root.join(path)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(StoreError::Io(error)),
+            }
+        }
+        Ok(changed as u64)
+    }
+
+    /// Retires and removes one pack after verifying another representation of every
+    /// object. This is the final, separately crash-safe phase of repacking.
+    pub fn retire_pack(&mut self, pack_id: &str) -> Result<u64, StoreError> {
+        let retiring = self.recorded_pack(pack_id)?;
+        let object_ids = {
+            let mut statement = self.connection.prepare(
+                "SELECT object_id FROM object_locations
+                 WHERE pack_id = ?1 AND verification_state = 'verified'
+                 ORDER BY object_id",
+            )?;
+            statement
+                .query_map([pack_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if object_ids.len() as u64 != retiring.object_count {
+            return Err(StoreError::CorruptMetadata(
+                "pack object count disagrees with locations",
+            ));
+        }
+        for raw_id in &object_ids {
+            let id = raw_id
+                .parse::<ObjectId>()
+                .map_err(|_| StoreError::CorruptMetadata("invalid stored object ID"))?;
+            let (kind, expected_length, locations) = self.object_locations(id)?;
+            let mut verified_alternative = false;
+            for location in locations {
+                if location.pack_id.as_deref() == Some(pack_id) {
+                    continue;
+                }
+                let result = if location.storage_kind == "loose" {
+                    self.read_loose_location(id, kind, expected_length, &location.relative_path)
+                } else {
+                    self.read_pack_location(id, kind, expected_length, &location)
+                };
+                if result.is_ok() {
+                    verified_alternative = true;
+                    break;
+                }
+            }
+            if !verified_alternative {
+                return Err(StoreError::PackStillRequired(pack_id.to_owned()));
+            }
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE object_locations SET verification_state = 'obsolete'
+             WHERE pack_id = ?1 AND verification_state = 'verified'",
+            [pack_id],
+        )?;
+        transaction.execute(
+            "UPDATE packs SET state = 'obsolete' WHERE pack_id = ?1 AND state = 'verified'",
+            [pack_id],
+        )?;
+        transaction.commit()?;
+        for relative in [&retiring.pack_path, &retiring.index_path] {
+            match fs::remove_file(self.root.join(relative)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(StoreError::Io(error)),
+            }
+        }
+        sync_directory(&self.root.join("objects/packs"))?;
+        Ok(changed as u64)
+    }
+
     /// Returns whether verified metadata and a physical location are recorded.
     pub fn contains(&self, id: ObjectId) -> Result<bool, StoreError> {
         let exists = self.connection.query_row(
@@ -1667,6 +2211,14 @@ impl Library {
                 WHERE objects.object_id = ?1
                   AND objects.verification_state = 'verified'
                   AND locations.verification_state = 'verified'
+                  AND (
+                      locations.storage_kind = 'loose'
+                      OR EXISTS (
+                          SELECT 1 FROM packs
+                          WHERE packs.pack_id = locations.pack_id
+                            AND packs.state = 'verified'
+                      )
+                  )
              )",
             [id.to_string()],
             |row| row.get(0),
@@ -1676,7 +2228,88 @@ impl Library {
 
     /// Reads, bounds, decompresses, and verifies a canonical object.
     pub fn read_object(&self, id: ObjectId) -> Result<Vec<u8>, StoreError> {
-        let metadata = self
+        let (kind, expected_length, locations) = self.object_locations(id)?;
+        let mut first_error = None;
+        for location in locations {
+            let result = if location.storage_kind == "loose" {
+                self.read_loose_location(id, kind, expected_length, &location.relative_path)
+            } else {
+                self.read_pack_location(id, kind, expected_length, &location)
+            };
+            match result {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        Err(first_error.unwrap_or(StoreError::ObjectNotFound(id)))
+    }
+
+    fn object_locations(
+        &self,
+        id: ObjectId,
+    ) -> Result<(ObjectKind, u64, Vec<PackLocation>), StoreError> {
+        let logical: Option<(String, i64)> = self
+            .connection
+            .query_row(
+                "SELECT object_kind, uncompressed_length
+                 FROM content_objects
+                 WHERE object_id = ?1 AND verification_state = 'verified'",
+                [id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (raw_kind, raw_length) = logical.ok_or(StoreError::ObjectNotFound(id))?;
+        let kind = ObjectKind::from_database(&raw_kind)?;
+        let expected_length = u64::try_from(raw_length)
+            .map_err(|_| StoreError::CorruptMetadata("negative object length"))?;
+        if expected_length > self.config.max_object_bytes {
+            return Err(StoreError::ObjectTooLarge {
+                limit: self.config.max_object_bytes,
+                actual: expected_length,
+            });
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT locations.storage_kind, locations.encoding,
+                    locations.relative_path, locations.compressed_length,
+                    locations.base_object_id, locations.pack_id,
+                    locations.pack_offset, locations.delta_depth,
+                    packs.pack_path, packs.index_path, packs.pack_checksum,
+                    packs.index_checksum
+             FROM object_locations AS locations
+             LEFT JOIN packs ON packs.pack_id = locations.pack_id
+             WHERE locations.object_id = ?1
+               AND locations.verification_state = 'verified'
+               AND (locations.storage_kind = 'loose' OR packs.state = 'verified')
+             ORDER BY (locations.storage_kind = 'pack') DESC,
+                      locations.pack_generation DESC, locations.location_id DESC",
+        )?;
+        let locations = statement
+            .query_map([id.to_string()], |row| {
+                Ok(PackLocation {
+                    storage_kind: row.get(0)?,
+                    encoding: row.get(1)?,
+                    relative_path: row.get(2)?,
+                    compressed_length: row.get(3)?,
+                    base_object_id: row.get(4)?,
+                    pack_id: row.get(5)?,
+                    pack_offset: row.get(6)?,
+                    delta_depth: row.get(7)?,
+                    pack_path: row.get(8)?,
+                    index_path: row.get(9)?,
+                    pack_checksum: row.get(10)?,
+                    index_checksum: row.get(11)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((kind, expected_length, locations))
+    }
+
+    fn read_loose_object(&self, id: ObjectId) -> Result<(ObjectKind, u64, Vec<u8>), StoreError> {
+        let metadata: Option<(String, i64, String)> = self
             .connection
             .query_row(
                 "SELECT objects.object_kind, objects.uncompressed_length,
@@ -1690,47 +2323,152 @@ impl Library {
                    AND locations.verification_state = 'verified'
                  ORDER BY locations.location_id DESC LIMIT 1",
                 [id.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .optional()?
-            .ok_or(StoreError::ObjectNotFound(id))?;
-
-        let kind = ObjectKind::from_database(&metadata.0)?;
-        let expected_length = u64::try_from(metadata.1)
+            .optional()?;
+        let (raw_kind, raw_length, relative_path) =
+            metadata.ok_or(StoreError::ObjectNotFound(id))?;
+        let kind = ObjectKind::from_database(&raw_kind)?;
+        let expected_length = u64::try_from(raw_length)
             .map_err(|_| StoreError::CorruptMetadata("negative object length"))?;
+        let bytes = self.read_loose_location(id, kind, expected_length, &relative_path)?;
+        Ok((kind, expected_length, bytes))
+    }
+
+    fn read_loose_location(
+        &self,
+        id: ObjectId,
+        kind: ObjectKind,
+        expected_length: u64,
+        raw_path: &str,
+    ) -> Result<Vec<u8>, StoreError> {
         if expected_length > self.config.max_object_bytes {
             return Err(StoreError::ObjectTooLarge {
                 limit: self.config.max_object_bytes,
                 actual: expected_length,
             });
         }
-        let relative_path = database_path(&metadata.2)?;
+        let relative_path = loose_database_path(raw_path)?;
         let file = File::open(self.root.join(relative_path))?;
         let decoder = zstd::stream::read::Decoder::new(file)?;
-        let read_limit = expected_length
-            .checked_add(1)
-            .ok_or(StoreError::CorruptMetadata("object length overflow"))?;
-        let mut bytes = Vec::with_capacity(
-            usize::try_from(expected_length)
-                .map_err(|_| StoreError::CorruptMetadata("object is too large for this host"))?,
-        );
-        decoder.take(read_limit).read_to_end(&mut bytes)?;
-        let actual_length = bytes.len() as u64;
-        if actual_length != expected_length {
-            return Err(StoreError::LengthMismatch {
-                expected: expected_length,
-                actual: actual_length,
-            });
+        let bytes = read_bounded(decoder, expected_length)?;
+        verify_object_bytes(id, kind, expected_length, &bytes)?;
+        Ok(bytes)
+    }
+
+    fn read_pack_location(
+        &self,
+        id: ObjectId,
+        kind: ObjectKind,
+        expected_length: u64,
+        location: &PackLocation,
+    ) -> Result<Vec<u8>, StoreError> {
+        let pack_id = location
+            .pack_id
+            .as_deref()
+            .ok_or(StoreError::CorruptMetadata("pack location lacks pack ID"))?;
+        let pack_path = pack_database_path(
+            location
+                .pack_path
+                .as_deref()
+                .ok_or(StoreError::CorruptMetadata("pack location lacks pack path"))?,
+            ".pack",
+        )?;
+        if location.relative_path != pack_path.to_string_lossy() {
+            return Err(StoreError::CorruptMetadata(
+                "pack location path disagrees with pack",
+            ));
         }
-        if ObjectId::for_bytes(kind, &bytes) != id {
-            return Err(StoreError::HashMismatch(id));
+        let index_path = pack_database_path(
+            location
+                .index_path
+                .as_deref()
+                .ok_or(StoreError::CorruptMetadata(
+                    "pack location lacks index path",
+                ))?,
+            ".idx",
+        )?;
+        let pack_checksum = parse_checksum(
+            location
+                .pack_checksum
+                .as_deref()
+                .ok_or(StoreError::CorruptMetadata("pack lacks checksum"))?,
+        )?;
+        if format!("b3:{}", blake3::Hash::from_bytes(pack_checksum).to_hex()) != pack_id {
+            return Err(StoreError::CorruptMetadata(
+                "pack identity disagrees with checksum",
+            ));
         }
+        let index_checksum = parse_checksum(
+            location
+                .index_checksum
+                .as_deref()
+                .ok_or(StoreError::CorruptMetadata("pack index lacks checksum"))?,
+        )?;
+        let index = read_pack_index(
+            &self.root.join(index_path),
+            pack_checksum,
+            index_checksum,
+            u64::from(MAX_SUPPORTED_PACK_OBJECTS),
+        )?;
+        let indexed = index
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or(StoreError::CorruptPack("object is absent from pack index"))?;
+        if Some(to_sql_integer(indexed.offset)?) != location.pack_offset {
+            return Err(StoreError::CorruptMetadata(
+                "pack offset disagrees with index",
+            ));
+        }
+        if to_sql_integer(indexed.record_length)? != location.compressed_length {
+            return Err(StoreError::CorruptMetadata(
+                "pack record length disagrees with index",
+            ));
+        }
+        let pack_absolute = self.root.join(&pack_path);
+        let decoded = read_pack_entry(&mut File::open(&pack_absolute)?, *indexed)?;
+        if decoded.id != id
+            || decoded.kind != kind
+            || decoded.uncompressed_length != expected_length
+            || decoded.encoding.database_value() != location.encoding
+            || decoded.base_id.map(|base| base.to_string()) != location.base_object_id
+            || Some(i64::from(decoded.delta_depth)) != location.delta_depth
+        {
+            return Err(StoreError::CorruptMetadata(
+                "pack location disagrees with indexed entry",
+            ));
+        }
+        let mut cache = HashMap::new();
+        let mut depths = HashMap::new();
+        let bytes = reconstruct_pack_object(
+            &pack_absolute,
+            &index,
+            id,
+            self.config.max_object_bytes,
+            0,
+            &mut cache,
+            &mut depths,
+        )?;
+        let entry_depth = depths
+            .get(&id)
+            .copied()
+            .ok_or(StoreError::CorruptPack("reconstructed object lacks depth"))?;
+        if Some(i64::from(entry_depth)) != location.delta_depth {
+            return Err(StoreError::CorruptMetadata(
+                "delta depth disagrees with pack",
+            ));
+        }
+        let expected_encoding = if entry_depth == 0 {
+            "pack-full"
+        } else {
+            "pack-delta"
+        };
+        if location.encoding != expected_encoding {
+            return Err(StoreError::CorruptMetadata(
+                "pack encoding disagrees with entry",
+            ));
+        }
+        verify_object_bytes(id, kind, expected_length, &bytes)?;
         Ok(bytes)
     }
 
@@ -2070,6 +2808,528 @@ fn object_hasher(kind: ObjectKind, length: u64) -> blake3::Hasher {
     hasher
 }
 
+fn prepare_pack_entries(
+    sources: &[(ObjectId, ObjectKind, Vec<u8>)],
+    compression_level: i32,
+) -> Result<Vec<PreparedPackEntry>, StoreError> {
+    let mut entries: Vec<PreparedPackEntry> = Vec::with_capacity(sources.len());
+    for (index, (id, kind, bytes)) in sources.iter().enumerate() {
+        let full_payload = zstd::stream::encode_all(bytes.as_slice(), compression_level)?;
+        let mut selected = (PackEncoding::Full, None, 0_u16, full_payload);
+        let candidate_start = index.saturating_sub(DELTA_CANDIDATE_WINDOW);
+        for candidate_index in candidate_start..index {
+            let (base_id, base_kind, base_bytes) = &sources[candidate_index];
+            let base_entry = &entries[candidate_index];
+            if base_kind != kind || base_entry.delta_depth >= MAX_DELTA_DEPTH {
+                continue;
+            }
+            let delta = create_delta(base_bytes, bytes);
+            let payload = zstd::stream::encode_all(delta.as_slice(), compression_level)?;
+            if payload
+                .len()
+                .checked_add(MIN_DELTA_SAVINGS)
+                .is_some_and(|length| length < selected.3.len())
+            {
+                selected = (
+                    PackEncoding::Delta,
+                    Some(*base_id),
+                    base_entry.delta_depth + 1,
+                    payload,
+                );
+            }
+        }
+        entries.push(PreparedPackEntry {
+            id: *id,
+            kind: *kind,
+            uncompressed_length: bytes.len() as u64,
+            encoding: selected.0,
+            base_id: selected.1,
+            delta_depth: selected.2,
+            payload: selected.3,
+            offset: 0,
+            record_length: 0,
+        });
+    }
+    Ok(entries)
+}
+
+fn create_delta(base: &[u8], target: &[u8]) -> Vec<u8> {
+    let prefix = base
+        .iter()
+        .zip(target)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let remaining_base = base.len().saturating_sub(prefix);
+    let remaining_target = target.len().saturating_sub(prefix);
+    let suffix = base
+        .iter()
+        .rev()
+        .zip(target.iter().rev())
+        .take(remaining_base.min(remaining_target))
+        .take_while(|(left, right)| left == right)
+        .count();
+    let middle_end = target.len() - suffix;
+    let mut delta = Vec::with_capacity(DELTA_HEADER_LENGTH + middle_end - prefix);
+    delta.extend_from_slice(&(prefix as u64).to_be_bytes());
+    delta.extend_from_slice(&(suffix as u64).to_be_bytes());
+    delta.extend_from_slice(&target[prefix..middle_end]);
+    delta
+}
+
+fn apply_delta(base: &[u8], delta: &[u8], expected_length: u64) -> Result<Vec<u8>, StoreError> {
+    if delta.len() < DELTA_HEADER_LENGTH {
+        return Err(StoreError::CorruptPack("delta header is truncated"));
+    }
+    let prefix = usize::try_from(u64::from_be_bytes(
+        delta[0..8]
+            .try_into()
+            .map_err(|_| StoreError::CorruptPack("invalid delta prefix"))?,
+    ))
+    .map_err(|_| StoreError::CorruptPack("delta prefix exceeds host limits"))?;
+    let suffix = usize::try_from(u64::from_be_bytes(
+        delta[8..16]
+            .try_into()
+            .map_err(|_| StoreError::CorruptPack("invalid delta suffix"))?,
+    ))
+    .map_err(|_| StoreError::CorruptPack("delta suffix exceeds host limits"))?;
+    if prefix > base.len() || suffix > base.len().saturating_sub(prefix) {
+        return Err(StoreError::CorruptPack("delta exceeds its base object"));
+    }
+    let middle = &delta[DELTA_HEADER_LENGTH..];
+    let actual_length = prefix
+        .checked_add(middle.len())
+        .and_then(|length| length.checked_add(suffix))
+        .ok_or(StoreError::CorruptPack("delta output length overflow"))?;
+    if actual_length as u64 != expected_length {
+        return Err(StoreError::LengthMismatch {
+            expected: expected_length,
+            actual: actual_length as u64,
+        });
+    }
+    let mut output = Vec::with_capacity(actual_length);
+    output.extend_from_slice(&base[..prefix]);
+    output.extend_from_slice(middle);
+    output.extend_from_slice(&base[base.len() - suffix..]);
+    Ok(output)
+}
+
+fn write_pack(
+    file: &mut File,
+    generation: u64,
+    entries: &mut [PreparedPackEntry],
+) -> Result<(), StoreError> {
+    file.write_all(PACK_MAGIC)?;
+    file.write_all(&generation.to_be_bytes())?;
+    let mut offset = PACK_HEADER_LENGTH;
+    for entry in entries {
+        let payload_length = entry.payload.len() as u64;
+        let record_length = PACK_ENTRY_HEADER_LENGTH
+            .checked_add(payload_length)
+            .ok_or(StoreError::PackLimitExceeded)?;
+        entry.offset = offset;
+        entry.record_length = record_length;
+        file.write_all(&[entry.encoding.tag(), entry.kind.identity_tag()])?;
+        file.write_all(&entry.delta_depth.to_be_bytes())?;
+        file.write_all(entry.id.as_bytes())?;
+        let base_bytes = entry.base_id.map_or([0_u8; 32], |id| *id.as_bytes());
+        file.write_all(&base_bytes)?;
+        file.write_all(&entry.uncompressed_length.to_be_bytes())?;
+        file.write_all(&payload_length.to_be_bytes())?;
+        file.write_all(&entry.payload)?;
+        offset = offset
+            .checked_add(record_length)
+            .ok_or(StoreError::PackLimitExceeded)?;
+    }
+    Ok(())
+}
+
+fn write_pack_index(
+    file: &mut File,
+    pack_checksum: [u8; 32],
+    entries: &[PreparedPackEntry],
+) -> Result<(), StoreError> {
+    file.write_all(INDEX_MAGIC)?;
+    file.write_all(&pack_checksum)?;
+    file.write_all(&(entries.len() as u64).to_be_bytes())?;
+    let mut index: Vec<_> = entries
+        .iter()
+        .map(|entry| PackIndexEntry {
+            id: entry.id,
+            offset: entry.offset,
+            record_length: entry.record_length,
+        })
+        .collect();
+    index.sort_unstable_by_key(|entry| entry.id);
+    for entry in index {
+        file.write_all(entry.id.as_bytes())?;
+        file.write_all(&entry.offset.to_be_bytes())?;
+        file.write_all(&entry.record_length.to_be_bytes())?;
+    }
+    Ok(())
+}
+
+fn checksum_file(file: &mut File) -> Result<[u8; 32], StoreError> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; COPY_BUFFER_SIZE];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn checksum_path(path: &Path) -> Result<[u8; 32], StoreError> {
+    checksum_file(&mut File::open(path)?)
+}
+
+fn read_pack_index(
+    path: &Path,
+    expected_pack_checksum: [u8; 32],
+    expected_index_checksum: [u8; 32],
+    max_objects: u64,
+) -> Result<Vec<PackIndexEntry>, StoreError> {
+    if checksum_path(path)? != expected_index_checksum {
+        return Err(StoreError::CorruptPack("pack index checksum mismatch"));
+    }
+    let mut file = File::open(path)?;
+    let mut header = [0_u8; INDEX_HEADER_LENGTH as usize];
+    file.read_exact(&mut header)?;
+    if &header[0..8] != INDEX_MAGIC {
+        return Err(StoreError::CorruptPack("invalid pack index magic"));
+    }
+    if header[8..40] != expected_pack_checksum {
+        return Err(StoreError::CorruptPack("index refers to a different pack"));
+    }
+    let count = u64::from_be_bytes(
+        header[40..48]
+            .try_into()
+            .map_err(|_| StoreError::CorruptPack("invalid pack index count"))?,
+    );
+    if count == 0 || count > max_objects {
+        return Err(StoreError::CorruptPack("pack index count exceeds bounds"));
+    }
+    let expected_length = INDEX_HEADER_LENGTH
+        .checked_add(
+            INDEX_ENTRY_LENGTH
+                .checked_mul(count)
+                .ok_or(StoreError::CorruptPack("pack index length overflow"))?,
+        )
+        .ok_or(StoreError::CorruptPack("pack index length overflow"))?;
+    if file.metadata()?.len() != expected_length {
+        return Err(StoreError::CorruptPack("pack index length mismatch"));
+    }
+    let mut entries = Vec::with_capacity(
+        usize::try_from(count)
+            .map_err(|_| StoreError::CorruptPack("pack index exceeds host limits"))?,
+    );
+    for _ in 0..count {
+        let mut raw = [0_u8; INDEX_ENTRY_LENGTH as usize];
+        file.read_exact(&mut raw)?;
+        let mut id = [0_u8; 32];
+        id.copy_from_slice(&raw[0..32]);
+        let offset = u64::from_be_bytes(
+            raw[32..40]
+                .try_into()
+                .map_err(|_| StoreError::CorruptPack("invalid pack index offset"))?,
+        );
+        let record_length = u64::from_be_bytes(
+            raw[40..48]
+                .try_into()
+                .map_err(|_| StoreError::CorruptPack("invalid pack record length"))?,
+        );
+        entries.push(PackIndexEntry {
+            id: ObjectId(id),
+            offset,
+            record_length,
+        });
+    }
+    if entries.windows(2).any(|pair| pair[0].id >= pair[1].id) {
+        return Err(StoreError::CorruptPack("pack index is not strictly sorted"));
+    }
+    Ok(entries)
+}
+
+fn read_pack_entry(
+    file: &mut File,
+    indexed: PackIndexEntry,
+) -> Result<DecodedPackEntry, StoreError> {
+    if indexed.offset < PACK_HEADER_LENGTH || indexed.record_length < PACK_ENTRY_HEADER_LENGTH {
+        return Err(StoreError::CorruptPack("invalid pack entry bounds"));
+    }
+    file.seek(SeekFrom::Start(indexed.offset))?;
+    let mut header = [0_u8; PACK_ENTRY_HEADER_LENGTH as usize];
+    file.read_exact(&mut header)?;
+    let encoding = PackEncoding::from_tag(header[0])?;
+    let kind = ObjectKind::from_identity_tag(header[1])?;
+    let delta_depth = u16::from_be_bytes(
+        header[2..4]
+            .try_into()
+            .map_err(|_| StoreError::CorruptPack("invalid delta depth"))?,
+    );
+    let mut id = [0_u8; 32];
+    id.copy_from_slice(&header[4..36]);
+    let mut raw_base = [0_u8; 32];
+    raw_base.copy_from_slice(&header[36..68]);
+    let uncompressed_length = u64::from_be_bytes(
+        header[68..76]
+            .try_into()
+            .map_err(|_| StoreError::CorruptPack("invalid object length"))?,
+    );
+    let payload_length = u64::from_be_bytes(
+        header[76..84]
+            .try_into()
+            .map_err(|_| StoreError::CorruptPack("invalid pack payload length"))?,
+    );
+    if PACK_ENTRY_HEADER_LENGTH.checked_add(payload_length) != Some(indexed.record_length) {
+        return Err(StoreError::CorruptPack(
+            "pack record length disagrees with index",
+        ));
+    }
+    let base_id = (raw_base != [0_u8; 32]).then_some(ObjectId(raw_base));
+    match encoding {
+        PackEncoding::Full if delta_depth != 0 || base_id.is_some() => {
+            return Err(StoreError::CorruptPack("invalid complete entry metadata"));
+        }
+        PackEncoding::Delta
+            if delta_depth == 0 || delta_depth > MAX_DELTA_DEPTH || base_id.is_none() =>
+        {
+            return Err(StoreError::CorruptPack("invalid delta entry metadata"));
+        }
+        _ => {}
+    }
+    let mut payload = vec![
+        0_u8;
+        usize::try_from(payload_length).map_err(|_| StoreError::CorruptPack(
+            "pack payload exceeds host limits"
+        ))?
+    ];
+    file.read_exact(&mut payload)?;
+    Ok(DecodedPackEntry {
+        id: ObjectId(id),
+        kind,
+        uncompressed_length,
+        encoding,
+        base_id,
+        delta_depth,
+        payload,
+    })
+}
+
+fn reconstruct_pack_object(
+    pack_path: &Path,
+    index: &[PackIndexEntry],
+    id: ObjectId,
+    max_object_bytes: u64,
+    recursion_depth: u16,
+    cache: &mut HashMap<ObjectId, Vec<u8>>,
+    depths: &mut HashMap<ObjectId, u16>,
+) -> Result<Vec<u8>, StoreError> {
+    if let Some(bytes) = cache.get(&id) {
+        return Ok(bytes.clone());
+    }
+    if recursion_depth > MAX_DELTA_DEPTH {
+        return Err(StoreError::CorruptPack(
+            "delta reconstruction depth exceeded",
+        ));
+    }
+    let position = index
+        .binary_search_by_key(&id, |entry| entry.id)
+        .map_err(|_| StoreError::CorruptPack("delta base is absent from pack index"))?;
+    let indexed = index[position];
+    let mut file = File::open(pack_path)?;
+    let entry = read_pack_entry(&mut file, indexed)?;
+    if entry.id != id {
+        return Err(StoreError::CorruptPack(
+            "pack entry disagrees with index identity",
+        ));
+    }
+    if entry.uncompressed_length > max_object_bytes {
+        return Err(StoreError::ObjectTooLarge {
+            limit: max_object_bytes,
+            actual: entry.uncompressed_length,
+        });
+    }
+    let bytes = match entry.encoding {
+        PackEncoding::Full => {
+            let decoder = zstd::stream::read::Decoder::new(entry.payload.as_slice())?;
+            read_bounded(decoder, entry.uncompressed_length)?
+        }
+        PackEncoding::Delta => {
+            let base_id = entry
+                .base_id
+                .ok_or(StoreError::CorruptPack("delta lacks a base"))?;
+            let base_position = index
+                .binary_search_by_key(&base_id, |candidate| candidate.id)
+                .map_err(|_| StoreError::CorruptPack("delta base is absent from index"))?;
+            if index[base_position].offset >= indexed.offset {
+                return Err(StoreError::CorruptPack(
+                    "delta base does not precede dependent",
+                ));
+            }
+            let base = reconstruct_pack_object(
+                pack_path,
+                index,
+                base_id,
+                max_object_bytes,
+                recursion_depth + 1,
+                cache,
+                depths,
+            )?;
+            let base_depth = depths
+                .get(&base_id)
+                .copied()
+                .ok_or(StoreError::CorruptPack("delta base lacks verified depth"))?;
+            if entry.delta_depth != base_depth + 1 || entry.delta_depth > MAX_DELTA_DEPTH {
+                return Err(StoreError::CorruptPack("delta depth is inconsistent"));
+            }
+            let delta_limit = entry
+                .uncompressed_length
+                .checked_add(DELTA_HEADER_LENGTH as u64)
+                .ok_or(StoreError::CorruptPack("delta bound overflow"))?;
+            let decoder = zstd::stream::read::Decoder::new(entry.payload.as_slice())?;
+            let delta = read_at_most(decoder, delta_limit)?;
+            apply_delta(&base, &delta, entry.uncompressed_length)?
+        }
+    };
+    verify_object_bytes(id, entry.kind, entry.uncompressed_length, &bytes)?;
+    depths.insert(id, entry.delta_depth);
+    cache.insert(id, bytes.clone());
+    Ok(bytes)
+}
+
+fn verify_pack_files(
+    pack_path: &Path,
+    index_path: &Path,
+    pack_checksum: [u8; 32],
+    index_checksum: [u8; 32],
+    generation: u64,
+    max_object_bytes: u64,
+    expected_object_count: u64,
+) -> Result<(), StoreError> {
+    if expected_object_count == 0 || expected_object_count > u64::from(MAX_SUPPORTED_PACK_OBJECTS) {
+        return Err(StoreError::CorruptPack("pack object count exceeds bounds"));
+    }
+    if checksum_path(pack_path)? != pack_checksum {
+        return Err(StoreError::CorruptPack("pack checksum mismatch"));
+    }
+    let mut pack = File::open(pack_path)?;
+    let mut header = [0_u8; PACK_HEADER_LENGTH as usize];
+    pack.read_exact(&mut header)?;
+    if &header[0..8] != PACK_MAGIC {
+        return Err(StoreError::CorruptPack("invalid pack magic"));
+    }
+    let stored_generation = u64::from_be_bytes(
+        header[8..16]
+            .try_into()
+            .map_err(|_| StoreError::CorruptPack("invalid pack generation"))?,
+    );
+    if stored_generation != generation {
+        return Err(StoreError::CorruptPack("pack generation mismatch"));
+    }
+    let index = read_pack_index(
+        index_path,
+        pack_checksum,
+        index_checksum,
+        u64::from(MAX_SUPPORTED_PACK_OBJECTS),
+    )?;
+    if index.len() as u64 != expected_object_count {
+        return Err(StoreError::CorruptPack(
+            "pack object count disagrees with index",
+        ));
+    }
+    let mut physical = index.clone();
+    physical.sort_unstable_by_key(|entry| entry.offset);
+    let mut expected_offset = PACK_HEADER_LENGTH;
+    for entry in &physical {
+        if entry.offset != expected_offset {
+            return Err(StoreError::CorruptPack("pack entries are not contiguous"));
+        }
+        expected_offset = expected_offset
+            .checked_add(entry.record_length)
+            .ok_or(StoreError::CorruptPack("pack length overflow"))?;
+    }
+    if expected_offset != pack.metadata()?.len() {
+        return Err(StoreError::CorruptPack("pack has unindexed trailing bytes"));
+    }
+    let mut cache = HashMap::new();
+    let mut depths = HashMap::new();
+    for entry in &physical {
+        reconstruct_pack_object(
+            pack_path,
+            &index,
+            entry.id,
+            max_object_bytes,
+            0,
+            &mut cache,
+            &mut depths,
+        )?;
+    }
+    Ok(())
+}
+
+fn read_bounded(reader: impl Read, expected_length: u64) -> Result<Vec<u8>, StoreError> {
+    let read_limit = expected_length
+        .checked_add(1)
+        .ok_or(StoreError::CorruptMetadata("object length overflow"))?;
+    let capacity = usize::try_from(expected_length.min(1024 * 1024))
+        .map_err(|_| StoreError::CorruptMetadata("object length exceeds host limits"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    reader.take(read_limit).read_to_end(&mut bytes)?;
+    let actual_length = bytes.len() as u64;
+    if actual_length != expected_length {
+        return Err(StoreError::LengthMismatch {
+            expected: expected_length,
+            actual: actual_length,
+        });
+    }
+    Ok(bytes)
+}
+
+fn read_at_most(reader: impl Read, limit: u64) -> Result<Vec<u8>, StoreError> {
+    let capacity = usize::try_from(limit.min(1024 * 1024))
+        .map_err(|_| StoreError::CorruptMetadata("read bound exceeds host limits"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    let read_limit = limit
+        .checked_add(1)
+        .ok_or(StoreError::CorruptPack("bounded read length overflow"))?;
+    reader.take(read_limit).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(StoreError::CorruptPack(
+            "decoded pack payload exceeds bound",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn verify_object_bytes(
+    id: ObjectId,
+    kind: ObjectKind,
+    expected_length: u64,
+    bytes: &[u8],
+) -> Result<(), StoreError> {
+    if bytes.len() as u64 != expected_length {
+        return Err(StoreError::LengthMismatch {
+            expected: expected_length,
+            actual: bytes.len() as u64,
+        });
+    }
+    if ObjectId::for_bytes(kind, bytes) != id {
+        return Err(StoreError::HashMismatch(id));
+    }
+    Ok(())
+}
+
+fn parse_checksum(value: &str) -> Result<[u8; 32], StoreError> {
+    let id = value
+        .parse::<ObjectId>()
+        .map_err(|_| StoreError::CorruptMetadata("invalid BLAKE3 checksum"))?;
+    Ok(*id.as_bytes())
+}
+
 fn loose_relative_path(id: ObjectId) -> PathBuf {
     let digest = id.digest_hex();
     PathBuf::from("objects")
@@ -2089,10 +3349,21 @@ fn path_to_database(path: &Path) -> Result<String, StoreError> {
         .ok_or(StoreError::CorruptMetadata("object path is not UTF-8"))
 }
 
-fn database_path(value: &str) -> Result<PathBuf, StoreError> {
+fn loose_database_path(value: &str) -> Result<PathBuf, StoreError> {
     let path = PathBuf::from(value);
     if !is_safe_relative_path(&path) || !path.starts_with("objects/loose/b3") {
         return Err(StoreError::CorruptMetadata("unsafe object location"));
+    }
+    Ok(path)
+}
+
+fn pack_database_path(value: &str, extension: &str) -> Result<PathBuf, StoreError> {
+    let path = PathBuf::from(value);
+    if !is_safe_relative_path(&path)
+        || !path.starts_with("objects/packs")
+        || path.extension().and_then(|value| value.to_str()) != extension.strip_prefix('.')
+    {
+        return Err(StoreError::CorruptMetadata("unsafe pack location"));
     }
     Ok(path)
 }
@@ -2113,7 +3384,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
          ) STRICT;",
     )?;
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > 4 {
+    if version > 5 {
         return Err(StoreError::UnsupportedSchemaVersion(version));
     }
     if version == 0 {
@@ -2161,6 +3432,18 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
             [unix_time()?],
         )?;
         transaction.pragma_update(None, "user_version", 4)?;
+        transaction.commit()?;
+    }
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 4 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(MIGRATION_5)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (5, 'packs', ?1)",
+            [unix_time()?],
+        )?;
+        transaction.pragma_update(None, "user_version", 5)?;
         transaction.commit()?;
     }
     Ok(())
@@ -2222,6 +3505,14 @@ pub enum StoreError {
     ObjectNotFound(ObjectId),
     /// Canonical bytes did not reproduce their logical identity.
     HashMismatch(ObjectId),
+    /// A pack or its index violated the immutable on-disk format.
+    CorruptPack(&'static str),
+    /// A bounded pack size or offset calculation overflowed.
+    PackLimitExceeded,
+    /// The requested verified pack does not exist.
+    PackNotFound(String),
+    /// A pack cannot be retired because it contains the only verified copy.
+    PackStillRequired(String),
     /// Stored metadata violated a library invariant.
     CorruptMetadata(&'static str),
     /// A collection was used with a different wiki than the one it belongs to.
@@ -2294,6 +3585,12 @@ impl fmt::Display for StoreError {
             }
             Self::ObjectNotFound(id) => write!(formatter, "object {id} was not found"),
             Self::HashMismatch(id) => write!(formatter, "object {id} failed hash verification"),
+            Self::CorruptPack(message) => write!(formatter, "corrupt pack: {message}"),
+            Self::PackLimitExceeded => formatter.write_str("pack exceeds configured bounds"),
+            Self::PackNotFound(pack_id) => write!(formatter, "pack {pack_id} was not found"),
+            Self::PackStillRequired(pack_id) => {
+                write!(formatter, "pack {pack_id} still contains a required object")
+            }
             Self::CorruptMetadata(message) => write!(formatter, "corrupt metadata: {message}"),
             Self::CollectionWikiMismatch => {
                 formatter.write_str("collection does not belong to the requested wiki")
@@ -2392,13 +3689,13 @@ mod tests {
     #[test]
     fn migration_is_applied_once_and_keeps_locations_separate() {
         let (directory, library) = test_library();
-        assert_eq!(library.schema_version().expect("schema version"), 4);
-        assert_eq!(migration_count(&library), 4);
+        assert_eq!(library.schema_version().expect("schema version"), 5);
+        assert_eq!(migration_count(&library), 5);
 
         drop(library);
         let reopened = Library::open(directory.path()).expect("reopen library");
-        assert_eq!(reopened.schema_version().expect("schema version"), 4);
-        assert_eq!(migration_count(&reopened), 4);
+        assert_eq!(reopened.schema_version().expect("schema version"), 5);
+        assert_eq!(migration_count(&reopened), 5);
 
         let logical_columns: Vec<String> = reopened
             .connection()
@@ -2458,8 +3755,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 4);
-        assert_eq!(migration_count(&upgraded), 4);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 5);
+        assert_eq!(migration_count(&upgraded), 5);
         assert_eq!(table_count(&upgraded, "revisions"), 0);
     }
 
@@ -2495,8 +3792,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 4);
-        assert_eq!(migration_count(&upgraded), 4);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 5);
+        assert_eq!(migration_count(&upgraded), 5);
         assert_eq!(table_count(&upgraded, "search_documents"), 0);
         let fts_definition: String = upgraded
             .connection()
@@ -2575,6 +3872,289 @@ mod tests {
             library.read_object(stored.id),
             Err(StoreError::Io(_))
         ));
+    }
+
+    fn evolving_objects(library: &mut Library, count: usize) -> Vec<(ObjectId, Vec<u8>)> {
+        let mut bytes = Vec::with_capacity(32 * 1024);
+        let mut state = 0x9e37_79b9_u32;
+        for _ in 0..32 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            bytes.push(state as u8);
+        }
+        let mut stored = Vec::with_capacity(count);
+        for version in 0..count {
+            let offset = 512 + version * 997;
+            for (index, byte) in bytes[offset..offset + 32].iter_mut().enumerate() {
+                *byte = (version as u8).wrapping_mul(31).wrapping_add(index as u8);
+            }
+            let object = library
+                .put_bytes(ObjectKind::Wikitext, &bytes)
+                .expect("store evolving object");
+            stored.push((object.id, bytes.clone()));
+        }
+        stored
+    }
+
+    #[test]
+    fn verified_pack_round_trips_full_and_bounded_delta_entries_after_pruning() {
+        let (directory, mut library) = test_library();
+        let objects = evolving_objects(&mut library, 20);
+
+        let summary = library
+            .pack_loose_objects()
+            .expect("build pack")
+            .expect("nonempty pack");
+        assert_eq!(summary.object_count, objects.len() as u64);
+        assert!(summary.full_entries >= 1);
+        assert!(summary.delta_entries >= 1);
+        let maximum_depth: i64 = library
+            .connection()
+            .query_row(
+                "SELECT MAX(delta_depth) FROM object_locations WHERE pack_id = ?1",
+                [&summary.pack_id],
+                |row| row.get(0),
+            )
+            .expect("maximum delta depth");
+        assert!(maximum_depth <= i64::from(MAX_DELTA_DEPTH));
+
+        assert_eq!(
+            library
+                .prune_packed_loose_objects(&summary.pack_id)
+                .expect("prune loose copies"),
+            objects.len() as u64
+        );
+        for (id, expected) in &objects {
+            assert_eq!(
+                library.read_object(*id).expect("read packed object"),
+                *expected
+            );
+        }
+        assert!(
+            library
+                .pack_loose_objects()
+                .expect("repeat pack scan")
+                .is_none()
+        );
+
+        drop(library);
+        let reopened = Library::open(directory.path()).expect("reopen packed library");
+        for (id, expected) in objects {
+            assert_eq!(
+                reopened.read_object(id).expect("read after reopen"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_pack_index_falls_back_to_loose_then_fails_after_pruning() {
+        let (_directory, mut library) = test_library();
+        let object = library
+            .put_bytes(ObjectKind::Wikitext, b"pack index fallback")
+            .expect("store object");
+        let summary = library
+            .pack_loose_objects()
+            .expect("build pack")
+            .expect("nonempty pack");
+        let index_path: String = library
+            .connection()
+            .query_row(
+                "SELECT index_path FROM packs WHERE pack_id = ?1",
+                [&summary.pack_id],
+                |row| row.get(0),
+            )
+            .expect("index path");
+        let index_path = library.root().join(index_path);
+        let original_index = fs::read(&index_path).expect("read original index");
+        fs::write(&index_path, b"tampered index").expect("tamper index");
+
+        assert_eq!(
+            library.read_object(object.id).expect("loose fallback"),
+            b"pack index fallback"
+        );
+        assert!(matches!(
+            library.prune_packed_loose_objects(&summary.pack_id),
+            Err(StoreError::CorruptPack("pack index checksum mismatch"))
+        ));
+        fs::write(&index_path, &original_index).expect("restore index");
+        library
+            .prune_packed_loose_objects(&summary.pack_id)
+            .expect("prune loose copy");
+        fs::write(&index_path, b"tampered index").expect("tamper packed-only index");
+        assert!(matches!(
+            library.read_object(object.id),
+            Err(StoreError::CorruptPack("pack index checksum mismatch"))
+        ));
+    }
+
+    #[test]
+    fn repacking_preserves_ids_and_bytes_before_the_old_pack_is_retired() {
+        let (_directory, mut library) = test_library();
+        let objects = evolving_objects(&mut library, 12);
+        let first = library
+            .pack_loose_objects()
+            .expect("first pack")
+            .expect("nonempty first pack");
+        library
+            .prune_packed_loose_objects(&first.pack_id)
+            .expect("prune first loose copies");
+
+        let second = library.repack_pack(&first.pack_id).expect("repack");
+        assert_ne!(second.pack_id, first.pack_id);
+        assert_eq!(second.object_count, first.object_count);
+        assert_eq!(
+            library
+                .retire_pack(&first.pack_id)
+                .expect("retire first pack"),
+            objects.len() as u64
+        );
+        for (id, expected) in objects {
+            assert_eq!(
+                library.read_object(id).expect("read repacked object"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn tampered_pack_payload_is_rejected_without_a_loose_copy() {
+        use std::fs::OpenOptions;
+
+        let (_directory, mut library) = test_library();
+        let object = library
+            .put_bytes(ObjectKind::Wikitext, b"tamper the immutable pack payload")
+            .expect("store object");
+        let summary = library
+            .pack_loose_objects()
+            .expect("build pack")
+            .expect("nonempty pack");
+        library
+            .prune_packed_loose_objects(&summary.pack_id)
+            .expect("prune loose copy");
+        let (pack_path, offset, length): (String, i64, i64) = library
+            .connection()
+            .query_row(
+                "SELECT packs.pack_path, locations.pack_offset,
+                        locations.compressed_length
+                 FROM object_locations AS locations
+                 JOIN packs USING (pack_id)
+                 WHERE locations.pack_id = ?1 AND locations.object_id = ?2",
+                params![summary.pack_id, object.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("pack entry location");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(library.root().join(pack_path))
+            .expect("open pack for tamper");
+        file.seek(SeekFrom::Start((offset + length - 1) as u64))
+            .expect("seek payload byte");
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).expect("read payload byte");
+        file.seek(SeekFrom::Current(-1))
+            .expect("rewind payload byte");
+        byte[0] ^= 0xff;
+        file.write_all(&byte).expect("tamper payload byte");
+
+        assert!(library.read_object(object.id).is_err());
+    }
+
+    #[test]
+    fn pack_database_pointer_is_checked_against_the_index() {
+        let (_directory, mut library) = test_library();
+        let object = library
+            .put_bytes(ObjectKind::Wikitext, b"pointer integrity")
+            .expect("store object");
+        let summary = library
+            .pack_loose_objects()
+            .expect("build pack")
+            .expect("nonempty pack");
+        library
+            .prune_packed_loose_objects(&summary.pack_id)
+            .expect("prune loose copy");
+        library
+            .connection()
+            .execute(
+                "UPDATE object_locations SET pack_offset = pack_offset + 1
+                 WHERE pack_id = ?1 AND object_id = ?2",
+                params![summary.pack_id, object.id.to_string()],
+            )
+            .expect("tamper database pointer");
+
+        assert!(matches!(
+            library.read_object(object.id),
+            Err(StoreError::CorruptMetadata(
+                "pack offset disagrees with index"
+            ))
+        ));
+    }
+
+    #[test]
+    fn pack_activation_can_restart_after_durable_files_lose_metadata() {
+        let (_directory, mut library) = test_library();
+        let objects = evolving_objects(&mut library, 3);
+        let first = library
+            .pack_loose_objects()
+            .expect("first pack")
+            .expect("nonempty pack");
+        library
+            .connection()
+            .execute(
+                "DELETE FROM object_locations WHERE pack_id = ?1",
+                [&first.pack_id],
+            )
+            .expect("remove interrupted locations");
+        library
+            .connection()
+            .execute("DELETE FROM packs WHERE pack_id = ?1", [&first.pack_id])
+            .expect("remove interrupted activation");
+
+        let restarted = library
+            .pack_loose_objects()
+            .expect("restart pack")
+            .expect("recreated pack");
+        assert_eq!(restarted.pack_id, first.pack_id);
+        assert_eq!(restarted.generation, first.generation);
+        library
+            .prune_packed_loose_objects(&restarted.pack_id)
+            .expect("prune loose copies");
+        for (id, expected) in objects {
+            assert_eq!(
+                library.read_object(id).expect("read restarted pack"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn pack_creation_respects_configured_object_count_bound() {
+        let directory = tempfile::tempdir().expect("temporary library");
+        let config = StoreConfig::default()
+            .with_max_pack_objects(3)
+            .expect("valid pack bound");
+        let mut library =
+            Library::open_with_config(directory.path(), config).expect("open library");
+        evolving_objects(&mut library, 7);
+
+        let first = library
+            .pack_loose_objects()
+            .expect("first pack")
+            .expect("nonempty first pack");
+        let second = library
+            .pack_loose_objects()
+            .expect("second pack")
+            .expect("nonempty second pack");
+        let third = library
+            .pack_loose_objects()
+            .expect("third pack")
+            .expect("nonempty third pack");
+        assert_eq!(
+            (first.object_count, second.object_count, third.object_count),
+            (3, 3, 1)
+        );
     }
 
     #[test]

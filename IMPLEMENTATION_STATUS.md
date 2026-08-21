@@ -46,10 +46,17 @@ Updated: 2026-08-21
     longer reachable, and then exercises the real CLI search, current and historical
     show, history, and reading-diff commands plus the local reader from only the
     durable library.
+12. Verified, restartable immutable packfiles with separate checksummed indexes;
+    bounded full and prefix/suffix-delta entries; maximum reconstruction depth and
+    pack-input limits; hash verification before atomic SQLite activation; transparent
+    packed reads with loose-copy fallback; safe loose pruning; tamper detection for
+    pack payloads, indexes, and database pointers; and repacking that retains the old
+    generation until every replacement object is verified.
 
 ## Next backlog item
 
-12. Implement verified, restartable packfiles and bounded delta reconstruction.
+13. Begin category recursion, long-gap recovery, and the Iced GUI, starting with
+    category selection resolution and preview.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening
