@@ -18,8 +18,8 @@ use wikisync_mediawiki::{
 };
 use wikisync_search::{SearchDocument, SearchError, SearchIndex, SqliteSearchIndex};
 use wikisync_store::{
-    CurrentRevisionCapture, Library, MembershipCommit, ObjectId, ResolvedCollectionMember,
-    RevisionCapture, StoreError, StoredPage, SyncRunKind, SyncRunStatus,
+    CollectionPreviewCommit, CurrentRevisionCapture, Library, MembershipCommit, ObjectId,
+    ResolvedCollectionMember, RevisionCapture, StoreError, StoredPage, SyncRunKind, SyncRunStatus,
 };
 
 /// Default maximum subcategory depth accepted by one category preview.
@@ -282,21 +282,24 @@ pub fn commit_collection_preview(
     budget: CollectionBudget,
     removal_policy: CollectionRemovalPolicy,
 ) -> Result<MembershipCommit, StoreError> {
-    let page_count = u64::try_from(preview.members.len())
-        .map_err(|_| StoreError::InvalidConfig("collection preview is too large"))?;
-    library.set_collection_configuration(
+    let expected_generation = library
+        .collection_configuration(collection_id)?
+        .ok_or(StoreError::CollectionNotConfigured(collection_id))?
+        .generation;
+    library.update_collection_from_preview(
         collection_id,
-        &preview.rule,
-        history_policy,
-        budget,
-        removal_policy,
-    )?;
-    library.record_collection_estimate(
-        collection_id,
-        page_count,
-        preview.predicted_canonical_bytes,
-    )?;
-    library.commit_resolved_membership(collection_id, &preview.members)
+        expected_generation,
+        None,
+        CollectionPreviewCommit {
+            rule: &preview.rule,
+            history_policy,
+            budget,
+            removal_policy,
+            members: &preview.members,
+            missing_titles: &preview.missing_titles,
+            predicted_canonical_bytes: preview.predicted_canonical_bytes,
+        },
+    )
 }
 
 /// Outcome of periodically re-resolving a collection's dynamic membership.

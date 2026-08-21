@@ -6,15 +6,26 @@
 //! when no daemon is present, and reports a busy library in every other case.
 
 mod application;
+mod collection;
 mod network;
 mod schedule;
+mod source;
 
 pub use application::ApplicationHandler;
+pub use collection::{
+    CollectionAdministration, CollectionAdministrationOutcome, CollectionDraft,
+    CollectionDraftEstimate, administer_collection_direct, decode_collection_draft,
+    encode_collection_draft,
+};
 pub use network::{
     MeteredNetworkProbeOutcome, MeteredNetworkState, MeteredNetworkStatus, detect_metered_network,
 };
 pub use schedule::{
     RecoveryDecision, jittered_occurrence, next_nominal_after, next_occurrence_after, recover,
+};
+pub use source::{
+    MAX_SOURCE_API_ENDPOINT_BYTES, MAX_SOURCE_LANGUAGE_CODE_BYTES, SourceAdministration,
+    SourceAdministrationOutcome, administer_source_direct,
 };
 
 use std::error::Error;
@@ -32,11 +43,17 @@ use std::time::{Duration, Instant};
 use fs2::FileExt;
 
 /// Current on-wire request and response contract version.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
+/// Oldest on-wire contract still accepted by the daemon.
+pub const MIN_PROTOCOL_VERSION: u16 = 1;
 /// Largest accepted request or response frame, excluding its four-byte length.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Largest opaque mutation payload accepted by the version-one contract.
 pub const MAX_MUTATION_PAYLOAD_BYTES: usize = 60 * 1024;
+/// Largest chunk used to stage one collection-administration draft.
+pub const MAX_COLLECTION_DRAFT_CHUNK_BYTES: usize = 4 * 1024;
+/// Largest complete staged collection draft after joining bounded chunks.
+pub const MAX_COLLECTION_DRAFT_BYTES: usize = 16 * 1024 * 1024;
 /// Library-local daemon request socket name.
 pub const DAEMON_SOCKET_NAME: &str = ".wikisyncd.sock";
 /// Library-local cooperative writer lease socket name.
@@ -128,6 +145,45 @@ pub enum RequestKind {
     Mutate(Mutation),
     /// Stop accepting work after the current request completes.
     Shutdown,
+    /// Stage or apply a bounded collection-administration operation.
+    ///
+    /// This request kind was added in protocol version 2. Callers should normally
+    /// use [`Client::administer_collection`] instead of managing staging tokens.
+    CollectionAdmin(CollectionAdminRequest),
+    /// Applies a bounded source-registration or safe source-removal operation.
+    ///
+    /// This request kind was added in protocol version 2.
+    SourceAdmin(SourceAdministration),
+}
+
+/// Low-level protocol operations for one bounded collection-administration draft.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CollectionAdminRequest {
+    /// Starts an in-memory draft upload and returns an opaque token.
+    Begin { total_bytes: u32 },
+    /// Appends the next ordered chunk to the active draft.
+    Append {
+        /// Opaque token returned by [`Self::Begin`].
+        token: u64,
+        /// Required byte offset; duplicate and out-of-order chunks are rejected.
+        offset: u32,
+        /// Bounded encoded draft bytes.
+        bytes: Vec<u8>,
+    },
+    /// Validates and estimates the complete staged draft without consuming it.
+    Estimate { token: u64 },
+    /// Atomically creates a collection from the complete staged draft.
+    Add { token: u64 },
+    /// Atomically replaces an active collection from the complete staged draft.
+    Edit {
+        token: u64,
+        collection_id: u64,
+        expected_generation: u64,
+    },
+    /// Tombstones one collection while preserving historical evidence.
+    Remove { collection_id: u64 },
+    /// Drops the active non-durable staging draft.
+    Abort { token: u64 },
 }
 
 /// Stable shapes for operations that must run under exclusive writer ownership.
@@ -167,8 +223,29 @@ pub enum ResponseKind {
     Mutated(MutationOutcome),
     /// Graceful shutdown was accepted.
     ShutdownAccepted,
+    /// Result of one protocol-v2 collection administration step.
+    CollectionAdmin(CollectionAdminProtocolOutcome),
+    /// Result of one protocol-v2 source-administration operation.
+    SourceAdmin(SourceAdministrationOutcome),
     /// Structured rejection. Unsupported operations use [`ErrorCode::Unsupported`].
     Error(ResponseError),
+}
+
+/// Low-level results for protocol-v2 collection draft staging and administration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CollectionAdminProtocolOutcome {
+    /// A new staging draft was allocated.
+    Begun { token: u64 },
+    /// One ordered chunk was accepted.
+    Appended {
+        token: u64,
+        received_bytes: u32,
+        total_bytes: u32,
+    },
+    /// The active draft was discarded.
+    Aborted { token: u64 },
+    /// A complete high-level administration operation finished.
+    Completed(CollectionAdministrationOutcome),
 }
 
 /// Read-only liveness data.
@@ -251,6 +328,28 @@ pub trait RequestHandler: fmt::Debug + Send + 'static {
         mutation: Mutation,
         control: OperationControl,
     ) -> Result<MutationOutcome, OperationError>;
+
+    /// Stages or applies one protocol-v2 collection administration operation.
+    fn administer_collection(
+        &mut self,
+        _request: CollectionAdminRequest,
+        _control: OperationControl,
+    ) -> Result<CollectionAdminProtocolOutcome, OperationError> {
+        Err(OperationError::unsupported(
+            "this handler does not implement collection administration",
+        ))
+    }
+
+    /// Applies one protocol-v2 source-administration operation.
+    fn administer_source(
+        &mut self,
+        _administration: SourceAdministration,
+        _control: OperationControl,
+    ) -> Result<SourceAdministrationOutcome, OperationError> {
+        Err(OperationError::unsupported(
+            "this handler does not implement source administration",
+        ))
+    }
 
     /// Polls for at most one durably claimed background operation between requests.
     fn poll_background(
@@ -535,7 +634,7 @@ impl Client {
 
     /// Requests read-only liveness information.
     pub fn health(&self) -> Result<Health, DaemonError> {
-        match self.call(RequestKind::Health)? {
+        match self.call_compatible(RequestKind::Health)? {
             ResponseKind::Health(health) => Ok(health),
             kind => Err(unexpected_response("health", kind)),
         }
@@ -543,7 +642,7 @@ impl Client {
 
     /// Requests read-only daemon and application status.
     pub fn status(&self) -> Result<DaemonStatus, DaemonError> {
-        match self.call(RequestKind::Status)? {
+        match self.call_compatible(RequestKind::Status)? {
             ResponseKind::Status(status) => Ok(status),
             kind => Err(unexpected_response("status", kind)),
         }
@@ -551,7 +650,7 @@ impl Client {
 
     /// Forwards a mutation to the process holding daemon writer ownership.
     pub fn forward_mutation(&self, mutation: Mutation) -> Result<MutationOutcome, DaemonError> {
-        match self.call(RequestKind::Mutate(mutation))? {
+        match self.call_compatible(RequestKind::Mutate(mutation))? {
             ResponseKind::Mutated(outcome) => Ok(outcome),
             ResponseKind::Error(error) => Err(DaemonError::Remote(error)),
             kind => Err(unexpected_response("mutation", kind)),
@@ -560,23 +659,162 @@ impl Client {
 
     /// Requests graceful shutdown after the daemon's current request completes.
     pub fn shutdown(&self) -> Result<(), DaemonError> {
-        match self.call(RequestKind::Shutdown)? {
+        match self.call_compatible(RequestKind::Shutdown)? {
             ResponseKind::ShutdownAccepted => Ok(()),
             ResponseKind::Error(error) => Err(DaemonError::Remote(error)),
             kind => Err(unexpected_response("shutdown", kind)),
         }
     }
 
+    /// Runs one bounded collection operation through the daemon writer.
+    ///
+    /// Complete previews are encoded once and uploaded in ordered chunks so even a
+    /// 10,000-page preview never weakens the 64 KiB frame ceiling. Failed uploads are
+    /// aborted on a best-effort basis; daemon-side expiry is the final cleanup bound.
+    pub fn administer_collection(
+        &self,
+        administration: CollectionAdministration,
+    ) -> Result<CollectionAdministrationOutcome, DaemonError> {
+        match administration {
+            CollectionAdministration::Remove { collection_id } => self
+                .collection_admin_call(CollectionAdminRequest::Remove {
+                    collection_id: collection_id.get(),
+                })
+                .and_then(completed_collection_outcome),
+            CollectionAdministration::Estimate(draft) => {
+                self.stage_collection_draft(draft, |token| {
+                    self.collection_admin_call(CollectionAdminRequest::Estimate { token })
+                        .and_then(completed_collection_outcome)
+                })
+            }
+            CollectionAdministration::Add(draft) => self.stage_collection_draft(draft, |token| {
+                self.collection_admin_call(CollectionAdminRequest::Add { token })
+                    .and_then(completed_collection_outcome)
+            }),
+            CollectionAdministration::Edit {
+                collection_id,
+                expected_generation,
+                draft,
+            } => self.stage_collection_draft(draft, |token| {
+                self.collection_admin_call(CollectionAdminRequest::Edit {
+                    token,
+                    collection_id: collection_id.get(),
+                    expected_generation,
+                })
+                .and_then(completed_collection_outcome)
+            }),
+        }
+    }
+
+    /// Runs one validated source operation through the daemon writer.
+    pub fn administer_source(
+        &self,
+        administration: SourceAdministration,
+    ) -> Result<SourceAdministrationOutcome, DaemonError> {
+        match self.call(RequestKind::SourceAdmin(administration))? {
+            ResponseKind::SourceAdmin(outcome) => Ok(outcome),
+            ResponseKind::Error(error) => Err(DaemonError::Remote(error)),
+            kind => Err(unexpected_response("source-admin", kind)),
+        }
+    }
+
+    fn stage_collection_draft(
+        &self,
+        draft: CollectionDraft,
+        finish: impl FnOnce(u64) -> Result<CollectionAdministrationOutcome, DaemonError>,
+    ) -> Result<CollectionAdministrationOutcome, DaemonError> {
+        let encoded = encode_collection_draft(&draft)
+            .map_err(|_| DaemonError::Protocol("collection draft failed local validation"))?;
+        let total_bytes = u32::try_from(encoded.len())
+            .map_err(|_| DaemonError::Protocol("collection draft is too large"))?;
+        let token =
+            match self.collection_admin_call(CollectionAdminRequest::Begin { total_bytes })? {
+                CollectionAdminProtocolOutcome::Begun { token } => token,
+                _ => {
+                    return Err(DaemonError::Protocol(
+                        "unexpected collection begin response",
+                    ));
+                }
+            };
+        let staged = (|| {
+            for (index, chunk) in encoded.chunks(MAX_COLLECTION_DRAFT_CHUNK_BYTES).enumerate() {
+                let offset = index
+                    .checked_mul(MAX_COLLECTION_DRAFT_CHUNK_BYTES)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or(DaemonError::Protocol("collection draft offset overflowed"))?;
+                match self.collection_admin_call(CollectionAdminRequest::Append {
+                    token,
+                    offset,
+                    bytes: chunk.to_vec(),
+                })? {
+                    CollectionAdminProtocolOutcome::Appended {
+                        token: response_token,
+                        received_bytes,
+                        total_bytes: response_total,
+                    } if response_token == token
+                        && response_total == total_bytes
+                        && received_bytes
+                            == offset + u32::try_from(chunk.len()).unwrap_or(u32::MAX) => {}
+                    _ => {
+                        return Err(DaemonError::Protocol(
+                            "unexpected collection append response",
+                        ));
+                    }
+                }
+            }
+            finish(token)
+        })();
+        if staged.is_err() || matches!(&staged, Ok(CollectionAdministrationOutcome::Estimated(_))) {
+            let _ = self.collection_admin_call(CollectionAdminRequest::Abort { token });
+        }
+        staged
+    }
+
+    fn collection_admin_call(
+        &self,
+        request: CollectionAdminRequest,
+    ) -> Result<CollectionAdminProtocolOutcome, DaemonError> {
+        match self.call(RequestKind::CollectionAdmin(request))? {
+            ResponseKind::CollectionAdmin(outcome) => Ok(outcome),
+            ResponseKind::Error(error) => Err(DaemonError::Remote(error)),
+            kind => Err(unexpected_response("collection-admin", kind)),
+        }
+    }
+
     /// Sends any public request kind using the current protocol version.
     pub fn call(&self, kind: RequestKind) -> Result<ResponseKind, DaemonError> {
-        let read_timeout = if matches!(kind, RequestKind::Mutate(_) | RequestKind::Shutdown) {
+        self.call_version(kind, PROTOCOL_VERSION)
+    }
+
+    fn call_compatible(&self, kind: RequestKind) -> Result<ResponseKind, DaemonError> {
+        match self.call_version(kind.clone(), PROTOCOL_VERSION) {
+            Err(DaemonError::Remote(ResponseError {
+                code: ErrorCode::UnsupportedVersion,
+                ..
+            })) => self.call_version(kind, MIN_PROTOCOL_VERSION),
+            result => result,
+        }
+    }
+
+    fn call_version(
+        &self,
+        kind: RequestKind,
+        protocol_version: u16,
+    ) -> Result<ResponseKind, DaemonError> {
+        let read_timeout = if matches!(
+            kind,
+            RequestKind::Mutate(_)
+                | RequestKind::Shutdown
+                | RequestKind::CollectionAdmin(_)
+                | RequestKind::SourceAdmin(_)
+        ) {
             LONG_OPERATION_TIMEOUT
         } else {
             CLIENT_IO_TIMEOUT
         };
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let request = Request {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version,
             request_id,
             kind,
         };
@@ -585,9 +823,6 @@ impl Client {
         stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT))?;
         write_frame(&mut stream, &encode_request(&request)?)?;
         let response = decode_response(&read_frame(&mut stream)?)?;
-        if response.protocol_version != PROTOCOL_VERSION {
-            return Err(DaemonError::Protocol("daemon response version changed"));
-        }
         if response.request_id != request_id {
             return Err(DaemonError::Protocol(
                 "daemon response ID did not match request",
@@ -597,6 +832,9 @@ impl Client {
             if error.code == ErrorCode::UnsupportedVersion {
                 return Err(DaemonError::Remote(error.clone()));
             }
+        }
+        if response.protocol_version != protocol_version {
+            return Err(DaemonError::Protocol("daemon response version changed"));
         }
         Ok(response.kind)
     }
@@ -706,7 +944,7 @@ impl<H: RequestHandler> Daemon<H> {
                     request_id,
                     ErrorCode::UnsupportedVersion,
                     &format!(
-                        "protocol version {version} is unsupported; expected {PROTOCOL_VERSION}"
+                        "protocol version {version} is unsupported; supported range is {MIN_PROTOCOL_VERSION} through {PROTOCOL_VERSION}"
                     ),
                 );
                 write_frame(stream, &encode_response(&response)?)?;
@@ -765,12 +1003,59 @@ impl<H: RequestHandler> Daemon<H> {
                 self.running.store(false, Ordering::Release);
                 ResponseKind::ShutdownAccepted
             }
+            RequestKind::CollectionAdmin(request) => {
+                let is_durable_mutation = matches!(
+                    request,
+                    CollectionAdminRequest::Add { .. }
+                        | CollectionAdminRequest::Edit { .. }
+                        | CollectionAdminRequest::Remove { .. }
+                );
+                let control = self.operation_control();
+                match self.handler.administer_collection(request, control) {
+                    Ok(outcome) => {
+                        if is_durable_mutation
+                            && matches!(outcome, CollectionAdminProtocolOutcome::Completed(_))
+                        {
+                            self.completed_mutations = self.completed_mutations.saturating_add(1);
+                        }
+                        ResponseKind::CollectionAdmin(outcome)
+                    }
+                    Err(error) => ResponseKind::Error(ResponseError {
+                        code: error.code,
+                        message: bounded_message(error.message),
+                    }),
+                }
+            }
+            RequestKind::SourceAdmin(administration) => {
+                let control = self.operation_control();
+                match self.handler.administer_source(administration, control) {
+                    Ok(outcome) => {
+                        self.completed_mutations = self.completed_mutations.saturating_add(1);
+                        ResponseKind::SourceAdmin(outcome)
+                    }
+                    Err(error) => ResponseKind::Error(ResponseError {
+                        code: error.code,
+                        message: bounded_message(error.message),
+                    }),
+                }
+            }
         };
         Response {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: request.protocol_version,
             request_id: request.request_id,
             kind,
         }
+    }
+}
+
+fn completed_collection_outcome(
+    outcome: CollectionAdminProtocolOutcome,
+) -> Result<CollectionAdministrationOutcome, DaemonError> {
+    match outcome {
+        CollectionAdminProtocolOutcome::Completed(outcome) => Ok(outcome),
+        _ => Err(DaemonError::Protocol(
+            "unexpected completed collection administration response",
+        )),
     }
 }
 
@@ -1186,8 +1471,109 @@ fn encode_request(request: &Request) -> Result<Vec<u8>, DaemonError> {
             encode_mutation(&mut bytes, mutation)?;
         }
         RequestKind::Shutdown => put_u8(&mut bytes, 4),
+        RequestKind::CollectionAdmin(admin_request) => {
+            if request.protocol_version < 2 {
+                return Err(DaemonError::Protocol(
+                    "collection administration requires protocol version 2",
+                ));
+            }
+            put_u8(&mut bytes, 5);
+            encode_collection_admin_request(&mut bytes, admin_request)?;
+        }
+        RequestKind::SourceAdmin(administration) => {
+            if request.protocol_version < 2 {
+                return Err(DaemonError::Protocol(
+                    "source administration requires protocol version 2",
+                ));
+            }
+            put_u8(&mut bytes, 6);
+            encode_source_administration(&mut bytes, administration)?;
+        }
     }
     ensure_frame_size(bytes)
+}
+
+fn encode_source_administration(
+    bytes: &mut Vec<u8>,
+    administration: &SourceAdministration,
+) -> Result<(), DaemonError> {
+    match administration {
+        SourceAdministration::Add {
+            api_endpoint,
+            language_code,
+        } => {
+            put_u8(bytes, 1);
+            put_bytes(
+                bytes,
+                api_endpoint.as_bytes(),
+                MAX_SOURCE_API_ENDPOINT_BYTES,
+            )?;
+            put_bytes(
+                bytes,
+                language_code.as_bytes(),
+                MAX_SOURCE_LANGUAGE_CODE_BYTES,
+            )?;
+        }
+        SourceAdministration::Remove { wiki_id } => {
+            put_u8(bytes, 2);
+            put_u64(bytes, wiki_id.get());
+        }
+    }
+    Ok(())
+}
+
+fn encode_collection_admin_request(
+    bytes: &mut Vec<u8>,
+    request: &CollectionAdminRequest,
+) -> Result<(), DaemonError> {
+    match request {
+        CollectionAdminRequest::Begin { total_bytes } => {
+            if *total_bytes == 0 || *total_bytes as usize > MAX_COLLECTION_DRAFT_BYTES {
+                return Err(DaemonError::FrameTooLarge {
+                    size: *total_bytes as usize,
+                });
+            }
+            put_u8(bytes, 1);
+            put_u32(bytes, *total_bytes);
+        }
+        CollectionAdminRequest::Append {
+            token,
+            offset,
+            bytes: chunk,
+        } => {
+            put_u8(bytes, 2);
+            put_u64(bytes, *token);
+            put_u32(bytes, *offset);
+            put_bytes(bytes, chunk, MAX_COLLECTION_DRAFT_CHUNK_BYTES)?;
+        }
+        CollectionAdminRequest::Estimate { token } => {
+            put_u8(bytes, 3);
+            put_u64(bytes, *token);
+        }
+        CollectionAdminRequest::Add { token } => {
+            put_u8(bytes, 4);
+            put_u64(bytes, *token);
+        }
+        CollectionAdminRequest::Edit {
+            token,
+            collection_id,
+            expected_generation,
+        } => {
+            put_u8(bytes, 5);
+            put_u64(bytes, *token);
+            put_u64(bytes, *collection_id);
+            put_u64(bytes, *expected_generation);
+        }
+        CollectionAdminRequest::Remove { collection_id } => {
+            put_u8(bytes, 6);
+            put_u64(bytes, *collection_id);
+        }
+        CollectionAdminRequest::Abort { token } => {
+            put_u8(bytes, 7);
+            put_u64(bytes, *token);
+        }
+    }
+    Ok(())
 }
 
 fn encode_mutation(bytes: &mut Vec<u8>, mutation: &Mutation) -> Result<(), DaemonError> {
@@ -1243,7 +1629,7 @@ fn decode_request(bytes: &[u8]) -> Result<Request, DecodeRequestError> {
             request_id: None,
             message,
         })?;
-    if version != PROTOCOL_VERSION {
+    if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) {
         return Err(DecodeRequestError::UnsupportedVersion {
             request_id,
             version,
@@ -1265,6 +1651,22 @@ fn decode_request(bytes: &[u8]) -> Result<Request, DecodeRequestError> {
             }
         })?),
         4 => RequestKind::Shutdown,
+        5 if version >= 2 => {
+            RequestKind::CollectionAdmin(decode_collection_admin_request(&mut decoder).map_err(
+                |message| DecodeRequestError::Invalid {
+                    request_id: Some(request_id),
+                    message,
+                },
+            )?)
+        }
+        6 if version >= 2 => {
+            RequestKind::SourceAdmin(decode_source_administration(&mut decoder).map_err(
+                |message| DecodeRequestError::Invalid {
+                    request_id: Some(request_id),
+                    message,
+                },
+            )?)
+        }
         _ => {
             return Err(DecodeRequestError::Invalid {
                 request_id: Some(request_id),
@@ -1283,6 +1685,60 @@ fn decode_request(bytes: &[u8]) -> Result<Request, DecodeRequestError> {
         request_id,
         kind,
     })
+}
+
+fn decode_source_administration(
+    decoder: &mut Decoder<'_>,
+) -> Result<SourceAdministration, &'static str> {
+    match decoder.u8()? {
+        1 => Ok(SourceAdministration::Add {
+            api_endpoint: decoder.string(MAX_SOURCE_API_ENDPOINT_BYTES)?,
+            language_code: decoder.string(MAX_SOURCE_LANGUAGE_CODE_BYTES)?,
+        }),
+        2 => Ok(SourceAdministration::Remove {
+            wiki_id: wikisync_core::WikiId::new(decoder.u64()?)
+                .map_err(|_| "invalid wiki ID in source administration request")?,
+        }),
+        _ => Err("unknown source administration operation"),
+    }
+}
+
+fn decode_collection_admin_request(
+    decoder: &mut Decoder<'_>,
+) -> Result<CollectionAdminRequest, &'static str> {
+    match decoder.u8()? {
+        1 => {
+            let total_bytes = decoder.u32()?;
+            if total_bytes == 0 || total_bytes as usize > MAX_COLLECTION_DRAFT_BYTES {
+                Err("collection draft size is outside its bound")
+            } else {
+                Ok(CollectionAdminRequest::Begin { total_bytes })
+            }
+        }
+        2 => Ok(CollectionAdminRequest::Append {
+            token: decoder.u64()?,
+            offset: decoder.u32()?,
+            bytes: decoder.bytes(MAX_COLLECTION_DRAFT_CHUNK_BYTES)?,
+        }),
+        3 => Ok(CollectionAdminRequest::Estimate {
+            token: decoder.u64()?,
+        }),
+        4 => Ok(CollectionAdminRequest::Add {
+            token: decoder.u64()?,
+        }),
+        5 => Ok(CollectionAdminRequest::Edit {
+            token: decoder.u64()?,
+            collection_id: decoder.u64()?,
+            expected_generation: decoder.u64()?,
+        }),
+        6 => Ok(CollectionAdminRequest::Remove {
+            collection_id: decoder.u64()?,
+        }),
+        7 => Ok(CollectionAdminRequest::Abort {
+            token: decoder.u64()?,
+        }),
+        _ => Err("unknown collection administration operation"),
+    }
 }
 
 fn decode_mutation(decoder: &mut Decoder<'_>) -> Result<Mutation, &'static str> {
@@ -1329,6 +1785,24 @@ fn encode_response(response: &Response) -> Result<Vec<u8>, DaemonError> {
             put_bytes(&mut bytes, &outcome.payload, MAX_MUTATION_PAYLOAD_BYTES)?;
         }
         ResponseKind::ShutdownAccepted => put_u8(&mut bytes, 4),
+        ResponseKind::CollectionAdmin(outcome) => {
+            if response.protocol_version < 2 {
+                return Err(DaemonError::Protocol(
+                    "collection administration response requires protocol version 2",
+                ));
+            }
+            put_u8(&mut bytes, 5);
+            encode_collection_admin_outcome(&mut bytes, outcome);
+        }
+        ResponseKind::SourceAdmin(outcome) => {
+            if response.protocol_version < 2 {
+                return Err(DaemonError::Protocol(
+                    "source administration response requires protocol version 2",
+                ));
+            }
+            put_u8(&mut bytes, 6);
+            encode_source_administration_outcome(&mut bytes, outcome)?;
+        }
         ResponseKind::Error(error) => {
             put_u8(&mut bytes, 255);
             put_u8(&mut bytes, error_code_tag(error.code));
@@ -1336,6 +1810,112 @@ fn encode_response(response: &Response) -> Result<Vec<u8>, DaemonError> {
         }
     }
     ensure_frame_size(bytes)
+}
+
+fn encode_source_administration_outcome(
+    bytes: &mut Vec<u8>,
+    outcome: &SourceAdministrationOutcome,
+) -> Result<(), DaemonError> {
+    match outcome {
+        SourceAdministrationOutcome::Added {
+            wiki_id,
+            api_endpoint,
+            language_code,
+            created,
+        } => {
+            put_u8(bytes, 1);
+            put_u64(bytes, wiki_id.get());
+            put_bytes(
+                bytes,
+                api_endpoint.as_bytes(),
+                MAX_SOURCE_API_ENDPOINT_BYTES,
+            )?;
+            put_bytes(
+                bytes,
+                language_code.as_bytes(),
+                MAX_SOURCE_LANGUAGE_CODE_BYTES,
+            )?;
+            put_u8(bytes, u8::from(*created));
+        }
+        SourceAdministrationOutcome::Removed { wiki_id } => {
+            put_u8(bytes, 2);
+            put_u64(bytes, wiki_id.get());
+        }
+    }
+    Ok(())
+}
+
+fn encode_collection_admin_outcome(bytes: &mut Vec<u8>, outcome: &CollectionAdminProtocolOutcome) {
+    match outcome {
+        CollectionAdminProtocolOutcome::Begun { token } => {
+            put_u8(bytes, 1);
+            put_u64(bytes, *token);
+        }
+        CollectionAdminProtocolOutcome::Appended {
+            token,
+            received_bytes,
+            total_bytes,
+        } => {
+            put_u8(bytes, 2);
+            put_u64(bytes, *token);
+            put_u32(bytes, *received_bytes);
+            put_u32(bytes, *total_bytes);
+        }
+        CollectionAdminProtocolOutcome::Aborted { token } => {
+            put_u8(bytes, 3);
+            put_u64(bytes, *token);
+        }
+        CollectionAdminProtocolOutcome::Completed(outcome) => {
+            put_u8(bytes, 4);
+            encode_collection_administration_outcome(bytes, outcome);
+        }
+    }
+}
+
+fn encode_collection_administration_outcome(
+    bytes: &mut Vec<u8>,
+    outcome: &CollectionAdministrationOutcome,
+) {
+    match outcome {
+        CollectionAdministrationOutcome::Estimated(estimate) => {
+            put_u8(bytes, 1);
+            encode_collection_estimate(bytes, *estimate);
+        }
+        CollectionAdministrationOutcome::Added {
+            collection_id,
+            estimate,
+        } => {
+            put_u8(bytes, 2);
+            put_u64(bytes, collection_id.get());
+            encode_collection_estimate(bytes, *estimate);
+        }
+        CollectionAdministrationOutcome::Edited {
+            collection_id,
+            estimate,
+        } => {
+            put_u8(bytes, 3);
+            put_u64(bytes, collection_id.get());
+            encode_collection_estimate(bytes, *estimate);
+        }
+        CollectionAdministrationOutcome::Removed { collection_id } => {
+            put_u8(bytes, 4);
+            put_u64(bytes, collection_id.get());
+        }
+    }
+}
+
+fn encode_collection_estimate(bytes: &mut Vec<u8>, estimate: CollectionDraftEstimate) {
+    put_u64(bytes, estimate.resolved_page_count);
+    put_u64(bytes, estimate.missing_title_count);
+    match estimate.predicted_canonical_bytes {
+        Some(value) => {
+            put_u8(bytes, 1);
+            put_u64(bytes, value);
+        }
+        None => put_u8(bytes, 0),
+    }
+    put_u64(bytes, estimate.category_batches);
+    put_u8(bytes, u8::from(estimate.fits_budget));
 }
 
 fn decode_response(bytes: &[u8]) -> Result<Response, DaemonError> {
@@ -1373,6 +1953,12 @@ fn decode_response(bytes: &[u8]) -> Result<Response, DaemonError> {
                 .map_err(DaemonError::Protocol)?,
         }),
         4 => ResponseKind::ShutdownAccepted,
+        5 if version >= 2 => {
+            ResponseKind::CollectionAdmin(decode_collection_admin_outcome(&mut decoder)?)
+        }
+        6 if version >= 2 => {
+            ResponseKind::SourceAdmin(decode_source_administration_outcome(&mut decoder)?)
+        }
         255 => ResponseKind::Error(ResponseError {
             code: decode_error_code(decoder.u8().map_err(DaemonError::Protocol)?)?,
             message: decoder
@@ -1386,6 +1972,124 @@ fn decode_response(bytes: &[u8]) -> Result<Response, DaemonError> {
         protocol_version: version,
         request_id,
         kind,
+    })
+}
+
+fn decode_source_administration_outcome(
+    decoder: &mut Decoder<'_>,
+) -> Result<SourceAdministrationOutcome, DaemonError> {
+    match decoder.u8().map_err(DaemonError::Protocol)? {
+        1 => {
+            let wiki_id = decode_wiki_id(decoder)?;
+            let api_endpoint = decoder
+                .string(MAX_SOURCE_API_ENDPOINT_BYTES)
+                .map_err(DaemonError::Protocol)?;
+            let language_code = decoder
+                .string(MAX_SOURCE_LANGUAGE_CODE_BYTES)
+                .map_err(DaemonError::Protocol)?;
+            let created = match decoder.u8().map_err(DaemonError::Protocol)? {
+                0 => false,
+                1 => true,
+                _ => return Err(DaemonError::Protocol("invalid source-created flag")),
+            };
+            Ok(SourceAdministrationOutcome::Added {
+                wiki_id,
+                api_endpoint,
+                language_code,
+                created,
+            })
+        }
+        2 => Ok(SourceAdministrationOutcome::Removed {
+            wiki_id: decode_wiki_id(decoder)?,
+        }),
+        _ => Err(DaemonError::Protocol(
+            "unknown source administration outcome",
+        )),
+    }
+}
+
+fn decode_wiki_id(decoder: &mut Decoder<'_>) -> Result<wikisync_core::WikiId, DaemonError> {
+    wikisync_core::WikiId::new(decoder.u64().map_err(DaemonError::Protocol)?)
+        .map_err(|_| DaemonError::Protocol("invalid wiki ID in response"))
+}
+
+fn decode_collection_admin_outcome(
+    decoder: &mut Decoder<'_>,
+) -> Result<CollectionAdminProtocolOutcome, DaemonError> {
+    match decoder.u8().map_err(DaemonError::Protocol)? {
+        1 => Ok(CollectionAdminProtocolOutcome::Begun {
+            token: decoder.u64().map_err(DaemonError::Protocol)?,
+        }),
+        2 => Ok(CollectionAdminProtocolOutcome::Appended {
+            token: decoder.u64().map_err(DaemonError::Protocol)?,
+            received_bytes: decoder.u32().map_err(DaemonError::Protocol)?,
+            total_bytes: decoder.u32().map_err(DaemonError::Protocol)?,
+        }),
+        3 => Ok(CollectionAdminProtocolOutcome::Aborted {
+            token: decoder.u64().map_err(DaemonError::Protocol)?,
+        }),
+        4 => Ok(CollectionAdminProtocolOutcome::Completed(
+            decode_collection_administration_outcome(decoder)?,
+        )),
+        _ => Err(DaemonError::Protocol(
+            "unknown collection administration response",
+        )),
+    }
+}
+
+fn decode_collection_administration_outcome(
+    decoder: &mut Decoder<'_>,
+) -> Result<CollectionAdministrationOutcome, DaemonError> {
+    match decoder.u8().map_err(DaemonError::Protocol)? {
+        1 => Ok(CollectionAdministrationOutcome::Estimated(
+            decode_collection_estimate(decoder)?,
+        )),
+        2 => Ok(CollectionAdministrationOutcome::Added {
+            collection_id: decode_collection_id(decoder)?,
+            estimate: decode_collection_estimate(decoder)?,
+        }),
+        3 => Ok(CollectionAdministrationOutcome::Edited {
+            collection_id: decode_collection_id(decoder)?,
+            estimate: decode_collection_estimate(decoder)?,
+        }),
+        4 => Ok(CollectionAdministrationOutcome::Removed {
+            collection_id: decode_collection_id(decoder)?,
+        }),
+        _ => Err(DaemonError::Protocol(
+            "unknown completed collection administration outcome",
+        )),
+    }
+}
+
+fn decode_collection_id(
+    decoder: &mut Decoder<'_>,
+) -> Result<wikisync_core::CollectionId, DaemonError> {
+    wikisync_core::CollectionId::new(decoder.u64().map_err(DaemonError::Protocol)?)
+        .map_err(|_| DaemonError::Protocol("invalid collection ID in response"))
+}
+
+fn decode_collection_estimate(
+    decoder: &mut Decoder<'_>,
+) -> Result<CollectionDraftEstimate, DaemonError> {
+    let resolved_page_count = decoder.u64().map_err(DaemonError::Protocol)?;
+    let missing_title_count = decoder.u64().map_err(DaemonError::Protocol)?;
+    let predicted_canonical_bytes = match decoder.u8().map_err(DaemonError::Protocol)? {
+        0 => None,
+        1 => Some(decoder.u64().map_err(DaemonError::Protocol)?),
+        _ => return Err(DaemonError::Protocol("invalid optional estimate encoding")),
+    };
+    let category_batches = decoder.u64().map_err(DaemonError::Protocol)?;
+    let fits_budget = match decoder.u8().map_err(DaemonError::Protocol)? {
+        0 => false,
+        1 => true,
+        _ => return Err(DaemonError::Protocol("invalid estimate budget flag")),
+    };
+    Ok(CollectionDraftEstimate {
+        resolved_page_count,
+        missing_title_count,
+        predicted_canonical_bytes,
+        category_batches,
+        fits_budget,
     })
 }
 
@@ -1633,9 +2337,78 @@ mod tests {
         (client, thread)
     }
 
+    fn collection_draft(wiki_id: wikisync_core::WikiId, name: &str) -> CollectionDraft {
+        use wikisync_core::{
+            CollectionBudget, CollectionRemovalPolicy, CollectionRule, HistoryPolicy,
+            InclusionReason, PageId, PageTitle, TitleSelection,
+        };
+        let title = PageTitle::new("Rust").expect("title");
+        CollectionDraft {
+            wiki_id,
+            name: name.to_owned(),
+            preview: wikisync_sync::CollectionSelectionPreview {
+                rule: CollectionRule::ExplicitTitles(
+                    TitleSelection::new([title.clone()]).expect("selection"),
+                ),
+                members: vec![wikisync_store::ResolvedCollectionMember {
+                    page_id: PageId::new(10).expect("page ID"),
+                    namespace: 0,
+                    title: title.clone(),
+                    inclusion_reason: InclusionReason::ExplicitTitle(title),
+                }],
+                missing_titles: Vec::new(),
+                predicted_canonical_bytes: Some(1_024),
+                category_batches: 0,
+            },
+            history_policy: HistoryPolicy::CurrentAndFuture,
+            budget: CollectionBudget::unlimited(),
+            removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+        }
+    }
+
+    fn multi_chunk_collection_draft(wiki_id: wikisync_core::WikiId) -> CollectionDraft {
+        use wikisync_core::{
+            CollectionBudget, CollectionRemovalPolicy, CollectionRule, HistoryPolicy,
+            InclusionReason, PageId, PageTitle,
+        };
+        let category = PageTitle::new("Category:Systems").expect("category");
+        let members = (1..=1_500_u64)
+            .map(|raw_id| {
+                let title =
+                    PageTitle::new(format!("System article {raw_id:04}")).expect("generated title");
+                wikisync_store::ResolvedCollectionMember {
+                    page_id: PageId::new(raw_id).expect("page ID"),
+                    namespace: 0,
+                    title,
+                    inclusion_reason: InclusionReason::Category {
+                        category: category.clone(),
+                        depth: 1,
+                    },
+                }
+            })
+            .collect();
+        CollectionDraft {
+            wiki_id,
+            name: "Large preview".to_owned(),
+            preview: wikisync_sync::CollectionSelectionPreview {
+                rule: CollectionRule::Category {
+                    title: category,
+                    recursion_depth: 1,
+                },
+                members,
+                missing_titles: Vec::new(),
+                predicted_canonical_bytes: None,
+                category_batches: 20,
+            },
+            history_policy: HistoryPolicy::CurrentAndFuture,
+            budget: CollectionBudget::unlimited(),
+            removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+        }
+    }
+
     #[test]
-    fn protocol_round_trips_all_version_one_request_shapes() {
-        let requests = [
+    fn protocol_round_trips_all_current_request_shapes() {
+        let requests = vec![
             RequestKind::Health,
             RequestKind::Status,
             RequestKind::Mutate(Mutation::SyncAll),
@@ -1647,6 +2420,28 @@ mod tests {
                 payload: b"bounded bytes".to_vec(),
             }),
             RequestKind::Shutdown,
+            RequestKind::CollectionAdmin(CollectionAdminRequest::Begin { total_bytes: 99 }),
+            RequestKind::CollectionAdmin(CollectionAdminRequest::Append {
+                token: 7,
+                offset: 48,
+                bytes: b"chunk".to_vec(),
+            }),
+            RequestKind::CollectionAdmin(CollectionAdminRequest::Estimate { token: 7 }),
+            RequestKind::CollectionAdmin(CollectionAdminRequest::Add { token: 7 }),
+            RequestKind::CollectionAdmin(CollectionAdminRequest::Edit {
+                token: 7,
+                collection_id: 42,
+                expected_generation: 9,
+            }),
+            RequestKind::CollectionAdmin(CollectionAdminRequest::Remove { collection_id: 42 }),
+            RequestKind::CollectionAdmin(CollectionAdminRequest::Abort { token: 7 }),
+            RequestKind::SourceAdmin(SourceAdministration::Add {
+                api_endpoint: "https://en.wikipedia.org/w/api.php".to_owned(),
+                language_code: "en".to_owned(),
+            }),
+            RequestKind::SourceAdmin(SourceAdministration::Remove {
+                wiki_id: wikisync_core::WikiId::new(3).unwrap(),
+            }),
         ];
         for (index, kind) in requests.into_iter().enumerate() {
             let request = Request {
@@ -1657,6 +2452,176 @@ mod tests {
             let encoded = encode_request(&request).expect("encode request");
             assert_eq!(decode_request(&encoded).expect("decode request"), request);
         }
+    }
+
+    #[test]
+    fn protocol_one_requests_remain_compatible_but_cannot_use_v2_administration() {
+        for kind in [
+            RequestKind::Health,
+            RequestKind::Status,
+            RequestKind::Mutate(Mutation::SyncCollection(42)),
+            RequestKind::Shutdown,
+        ] {
+            let request = Request {
+                protocol_version: 1,
+                request_id: 9,
+                kind,
+            };
+            assert_eq!(
+                decode_request(&encode_request(&request).expect("encode v1")).expect("decode v1"),
+                request
+            );
+        }
+        let v1_admin = Request {
+            protocol_version: 1,
+            request_id: 10,
+            kind: RequestKind::CollectionAdmin(CollectionAdminRequest::Remove {
+                collection_id: 42,
+            }),
+        };
+        assert!(matches!(
+            encode_request(&v1_admin),
+            Err(DaemonError::Protocol(_))
+        ));
+        let v1_source_admin = Request {
+            protocol_version: 1,
+            request_id: 11,
+            kind: RequestKind::SourceAdmin(SourceAdministration::Add {
+                api_endpoint: "https://en.wikipedia.org/w/api.php".to_owned(),
+                language_code: "en".to_owned(),
+            }),
+        };
+        assert!(matches!(
+            encode_request(&v1_source_admin),
+            Err(DaemonError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn protocol_round_trips_collection_administration_responses() {
+        let estimate = CollectionDraftEstimate {
+            resolved_page_count: 10_000,
+            missing_title_count: 3,
+            predicted_canonical_bytes: Some(5_000_000),
+            category_batches: 20,
+            fits_budget: true,
+        };
+        let outcomes = vec![
+            CollectionAdminProtocolOutcome::Begun { token: 1 },
+            CollectionAdminProtocolOutcome::Appended {
+                token: 1,
+                received_bytes: 48,
+                total_bytes: 96,
+            },
+            CollectionAdminProtocolOutcome::Aborted { token: 1 },
+            CollectionAdminProtocolOutcome::Completed(CollectionAdministrationOutcome::Estimated(
+                estimate,
+            )),
+            CollectionAdminProtocolOutcome::Completed(CollectionAdministrationOutcome::Added {
+                collection_id: wikisync_core::CollectionId::new(2).unwrap(),
+                estimate,
+            }),
+            CollectionAdminProtocolOutcome::Completed(CollectionAdministrationOutcome::Edited {
+                collection_id: wikisync_core::CollectionId::new(2).unwrap(),
+                estimate,
+            }),
+            CollectionAdminProtocolOutcome::Completed(CollectionAdministrationOutcome::Removed {
+                collection_id: wikisync_core::CollectionId::new(2).unwrap(),
+            }),
+        ];
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            let response = Response {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: index as u64 + 1,
+                kind: ResponseKind::CollectionAdmin(outcome),
+            };
+            assert_eq!(
+                decode_response(&encode_response(&response).expect("encode response"))
+                    .expect("decode response"),
+                response
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_round_trips_source_administration_responses() {
+        let wiki_id = wikisync_core::WikiId::new(7).unwrap();
+        for (index, outcome) in [
+            SourceAdministrationOutcome::Added {
+                wiki_id,
+                api_endpoint: "https://en.wikipedia.org/w/api.php".to_owned(),
+                language_code: "en".to_owned(),
+                created: true,
+            },
+            SourceAdministrationOutcome::Added {
+                wiki_id,
+                api_endpoint: "https://en.wikipedia.org/w/api.php".to_owned(),
+                language_code: "en".to_owned(),
+                created: false,
+            },
+            SourceAdministrationOutcome::Removed { wiki_id },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = Response {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: index as u64 + 1,
+                kind: ResponseKind::SourceAdmin(outcome),
+            };
+            assert_eq!(
+                decode_response(&encode_response(&response).expect("encode response"))
+                    .expect("decode response"),
+                response
+            );
+        }
+    }
+
+    #[test]
+    fn source_administration_codec_enforces_field_bounds() {
+        let oversized_endpoint = Request {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: 1,
+            kind: RequestKind::SourceAdmin(SourceAdministration::Add {
+                api_endpoint: "x".repeat(MAX_SOURCE_API_ENDPOINT_BYTES + 1),
+                language_code: "en".to_owned(),
+            }),
+        };
+        assert!(matches!(
+            encode_request(&oversized_endpoint),
+            Err(DaemonError::FrameTooLarge { .. })
+        ));
+
+        let oversized_language = Request {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: 2,
+            kind: RequestKind::SourceAdmin(SourceAdministration::Add {
+                api_endpoint: "https://en.wikipedia.org/w/api.php".to_owned(),
+                language_code: "x".repeat(MAX_SOURCE_LANGUAGE_CODE_BYTES + 1),
+            }),
+        };
+        assert!(matches!(
+            encode_request(&oversized_language),
+            Err(DaemonError::FrameTooLarge { .. })
+        ));
+
+        let mut declared_oversized = Vec::new();
+        declared_oversized.extend_from_slice(REQUEST_MAGIC);
+        put_u16(&mut declared_oversized, PROTOCOL_VERSION);
+        put_u64(&mut declared_oversized, 3);
+        put_u8(&mut declared_oversized, 6);
+        put_u8(&mut declared_oversized, 1);
+        put_u32(
+            &mut declared_oversized,
+            u32::try_from(MAX_SOURCE_API_ENDPOINT_BYTES + 1).unwrap(),
+        );
+        assert!(matches!(
+            decode_request(&declared_oversized),
+            Err(DecodeRequestError::Invalid {
+                request_id: Some(3),
+                message: "bounded field is too large",
+            })
+        ));
     }
 
     #[test]
@@ -1774,6 +2739,202 @@ mod tests {
         daemon.join().expect("join daemon").expect("daemon result");
         assert!(!daemon_socket_path(library.path()).exists());
         WriterLease::acquire(library.path()).expect("writer released after shutdown");
+    }
+
+    #[test]
+    fn running_v2_daemon_answers_a_legacy_v1_health_frame_in_v1() {
+        let library = TempLibrary::new();
+        let (client, daemon) = running_daemon(&library, RecordingHandler::default());
+        let request = Request {
+            protocol_version: 1,
+            request_id: 91,
+            kind: RequestKind::Health,
+        };
+        let mut stream = UnixStream::connect(daemon_socket_path(library.path())).expect("connect");
+        write_frame(&mut stream, &encode_request(&request).expect("encode v1")).expect("send v1");
+        let response = decode_response(&read_frame(&mut stream).expect("read v1")).expect("v1");
+        assert_eq!(response.protocol_version, 1);
+        assert_eq!(response.request_id, 91);
+        assert!(matches!(response.kind, ResponseKind::Health(_)));
+
+        client.shutdown().expect("shutdown");
+        daemon.join().expect("join").expect("daemon result");
+    }
+
+    #[test]
+    fn collection_administration_forwards_the_same_typed_lifecycle_over_real_ipc() {
+        let library = TempLibrary::new();
+        let mut stored = wikisync_store::Library::open(library.path()).expect("library");
+        let wiki_id = stored
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("source");
+        drop(stored);
+        let handler = ApplicationHandler::new(library.path()).expect("handler");
+        let (client, daemon) = running_daemon(&library, handler);
+
+        let large = multi_chunk_collection_draft(wiki_id);
+        assert!(
+            encode_collection_draft(&large)
+                .expect("encode large preview")
+                .len()
+                > MAX_COLLECTION_DRAFT_CHUNK_BYTES
+        );
+        assert!(matches!(
+            client
+                .administer_collection(CollectionAdministration::Estimate(large))
+                .expect("multi-chunk estimate"),
+            CollectionAdministrationOutcome::Estimated(CollectionDraftEstimate {
+                resolved_page_count: 1_500,
+                ..
+            })
+        ));
+
+        let estimated = client
+            .administer_collection(CollectionAdministration::Estimate(collection_draft(
+                wiki_id, "Systems",
+            )))
+            .expect("estimate");
+        assert!(matches!(
+            estimated,
+            CollectionAdministrationOutcome::Estimated(CollectionDraftEstimate {
+                resolved_page_count: 1,
+                fits_budget: true,
+                ..
+            })
+        ));
+        let added = client
+            .administer_collection(CollectionAdministration::Add(collection_draft(
+                wiki_id, "Systems",
+            )))
+            .expect("add");
+        let CollectionAdministrationOutcome::Added { collection_id, .. } = added else {
+            panic!("unexpected add outcome");
+        };
+        let edited = client
+            .administer_collection(CollectionAdministration::Edit {
+                collection_id,
+                expected_generation: 1,
+                draft: collection_draft(wiki_id, "Programming systems"),
+            })
+            .expect("edit");
+        assert!(matches!(
+            edited,
+            CollectionAdministrationOutcome::Edited {
+                collection_id: edited_id,
+                ..
+            } if edited_id == collection_id
+        ));
+        let stale = client
+            .administer_collection(CollectionAdministration::Edit {
+                collection_id,
+                expected_generation: 1,
+                draft: collection_draft(wiki_id, "Stale replacement"),
+            })
+            .expect_err("stale forwarded preview must fail");
+        assert!(matches!(
+            stale,
+            DaemonError::Remote(ResponseError {
+                code: ErrorCode::OperationFailed,
+                ref message,
+            }) if message.contains("changed while it was being previewed")
+        ));
+        client
+            .administer_collection(CollectionAdministration::Remove { collection_id })
+            .expect("remove");
+        assert_eq!(client.status().expect("status").completed_mutations, 3);
+
+        client.shutdown().expect("shutdown");
+        daemon.join().expect("join").expect("daemon result");
+        let stored = wikisync_store::Library::open(library.path()).expect("reopen");
+        let retained = stored
+            .collection(collection_id)
+            .expect("collection")
+            .expect("retained tombstone");
+        assert_eq!(retained.name, "Programming systems");
+        assert_eq!(
+            retained.status,
+            wikisync_store::CollectionStatus::Tombstoned
+        );
+    }
+
+    #[test]
+    fn source_administration_preserves_idempotence_and_safe_removal_over_real_ipc() {
+        let library = TempLibrary::new();
+        let mut stored = wikisync_store::Library::open(library.path()).expect("library");
+        let used_wiki_id = stored
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("used source");
+        let used_collection_id = stored
+            .create_explicit_collection(used_wiki_id, "Retained collection")
+            .expect("collection");
+        drop(stored);
+
+        let handler = ApplicationHandler::new(library.path()).expect("handler");
+        let (client, daemon) = running_daemon(&library, handler);
+        let endpoint = "https://example.org/w/api.php";
+        let added = client
+            .administer_source(SourceAdministration::Add {
+                api_endpoint: endpoint.to_owned(),
+                language_code: "example".to_owned(),
+            })
+            .expect("add source");
+        let SourceAdministrationOutcome::Added {
+            wiki_id,
+            created,
+            language_code,
+            ..
+        } = added
+        else {
+            panic!("unexpected add outcome");
+        };
+        assert!(created);
+        assert_eq!(language_code, "example");
+
+        assert_eq!(
+            client
+                .administer_source(SourceAdministration::Add {
+                    api_endpoint: endpoint.to_owned(),
+                    language_code: "replacement".to_owned(),
+                })
+                .expect("repeat registration"),
+            SourceAdministrationOutcome::Added {
+                wiki_id,
+                api_endpoint: endpoint.to_owned(),
+                language_code: "example".to_owned(),
+                created: false,
+            }
+        );
+        let removal_error = client
+            .administer_source(SourceAdministration::Remove {
+                wiki_id: used_wiki_id,
+            })
+            .expect_err("in-use source removal must fail");
+        assert!(matches!(
+            removal_error,
+            DaemonError::Remote(ResponseError {
+                code: ErrorCode::OperationFailed,
+                ref message,
+            }) if message.contains("still in use")
+        ));
+        assert_eq!(
+            client
+                .administer_source(SourceAdministration::Remove { wiki_id })
+                .expect("remove unused source"),
+            SourceAdministrationOutcome::Removed { wiki_id }
+        );
+        assert_eq!(client.status().expect("status").completed_mutations, 3);
+
+        client.shutdown().expect("shutdown");
+        daemon.join().expect("join").expect("daemon result");
+        let stored = wikisync_store::Library::open(library.path()).expect("reopen");
+        assert!(stored.wiki(wiki_id).expect("removed source").is_none());
+        assert!(stored.wiki(used_wiki_id).expect("used source").is_some());
+        assert!(
+            stored
+                .collection(used_collection_id)
+                .expect("used collection")
+                .is_some()
+        );
     }
 
     #[test]

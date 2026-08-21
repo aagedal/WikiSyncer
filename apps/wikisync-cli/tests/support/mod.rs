@@ -24,15 +24,23 @@ pub struct FixtureServer {
 
 impl FixtureServer {
     pub fn start(responses: Vec<FixtureResponse>) -> Self {
+        Self::start_with_hook(responses, |_| {})
+    }
+
+    pub fn start_with_hook(
+        responses: Vec<FixtureResponse>,
+        mut before_response: impl FnMut(usize) + Send + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
         let address = listener.local_addr().expect("fixture server address");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&requests);
         let thread = thread::spawn(move || {
-            for response in responses {
+            for (index, response) in responses.into_iter().enumerate() {
                 let (mut stream, _) = listener.accept().expect("accept fixture request");
                 let request = read_request(&mut stream);
                 captured.lock().expect("request lock").push(request);
+                before_response(index);
                 write_response(&mut stream, response);
             }
         });

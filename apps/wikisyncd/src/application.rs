@@ -10,18 +10,22 @@ use wikisync_integrity::{VerificationScope, verify_library};
 use wikisync_mediawiki::{ClientConfig, MediaWikiClient};
 use wikisync_store::{Library, NetworkTransferPolicy, ScheduleCadence};
 use wikisync_sync::{
-    CategoryPreviewLimits, ReconciliationReport, reconcile_collection_heads_with_cancellation,
-    reconcile_dynamic_collection_membership,
+    BootstrapReport, CategoryPreviewLimits, ReconciliationReport, bootstrap_collection,
+    reconcile_collection_heads_with_cancellation, reconcile_dynamic_collection_membership,
 };
 
 use crate::{
-    HandlerStatus, MeteredNetworkState, MeteredNetworkStatus, Mutation, MutationOutcome,
-    OperationControl, OperationError, RequestHandler, SET_COLLECTION_SCHEDULE_EXTENSION,
-    SET_NETWORK_TRANSFER_POLICY_EXTENSION, canonical_library_root, detect_metered_network,
-    next_occurrence_after, recover,
+    CollectionAdminProtocolOutcome, CollectionAdminRequest, CollectionAdministration,
+    HandlerStatus, MAX_COLLECTION_DRAFT_BYTES, MAX_COLLECTION_DRAFT_CHUNK_BYTES,
+    MeteredNetworkState, MeteredNetworkStatus, Mutation, MutationOutcome, OperationControl,
+    OperationError, RequestHandler, SET_COLLECTION_SCHEDULE_EXTENSION,
+    SET_NETWORK_TRANSFER_POLICY_EXTENSION, SourceAdministration, SourceAdministrationOutcome,
+    administer_collection_direct, administer_source_direct, canonical_library_root,
+    decode_collection_draft, detect_metered_network, next_occurrence_after, recover,
 };
 
 const BACKGROUND_RETRY_DELAY: Duration = Duration::from_secs(30);
+const COLLECTION_DRAFT_EXPIRY: Duration = Duration::from_secs(10 * 60);
 
 /// Production mutation dispatcher backed by the durable WikiSyncer application APIs.
 ///
@@ -34,6 +38,16 @@ pub struct ApplicationHandler {
     last_network_status: Option<MeteredNetworkStatus>,
     metered_network_probe: fn() -> MeteredNetworkStatus,
     background_retry_not_before: HashMap<CollectionId, Instant>,
+    staged_collection_draft: Option<StagedCollectionDraft>,
+    next_collection_draft_token: u64,
+}
+
+#[derive(Debug)]
+struct StagedCollectionDraft {
+    token: u64,
+    total_bytes: u32,
+    bytes: Vec<u8>,
+    expires_at: Instant,
 }
 
 impl ApplicationHandler {
@@ -45,7 +59,198 @@ impl ApplicationHandler {
             last_network_status: None,
             metered_network_probe: detect_metered_network,
             background_retry_not_before: HashMap::new(),
+            staged_collection_draft: None,
+            next_collection_draft_token: 1,
         })
+    }
+
+    fn administer(
+        &mut self,
+        request: CollectionAdminRequest,
+        control: &OperationControl,
+    ) -> Result<CollectionAdminProtocolOutcome, OperationError> {
+        if control.is_shutdown_requested() {
+            return Err(OperationError::failed(
+                "collection administration cancelled by shutdown request",
+            ));
+        }
+        if self
+            .staged_collection_draft
+            .as_ref()
+            .is_some_and(|draft| draft.expires_at <= Instant::now())
+        {
+            self.staged_collection_draft = None;
+        }
+        match request {
+            CollectionAdminRequest::Begin { total_bytes } => {
+                let total = total_bytes as usize;
+                if total == 0 || total > MAX_COLLECTION_DRAFT_BYTES {
+                    return Err(OperationError::failed(
+                        "collection draft size is outside its bound",
+                    ));
+                }
+                if self.staged_collection_draft.is_some() {
+                    return Err(OperationError::failed(
+                        "another collection draft is already being staged",
+                    ));
+                }
+                let token = self.next_collection_draft_token;
+                self.next_collection_draft_token = self
+                    .next_collection_draft_token
+                    .checked_add(1)
+                    .filter(|token| *token != 0)
+                    .unwrap_or(1);
+                self.staged_collection_draft = Some(StagedCollectionDraft {
+                    token,
+                    total_bytes,
+                    bytes: Vec::new(),
+                    expires_at: Instant::now() + COLLECTION_DRAFT_EXPIRY,
+                });
+                Ok(CollectionAdminProtocolOutcome::Begun { token })
+            }
+            CollectionAdminRequest::Append {
+                token,
+                offset,
+                bytes,
+            } => {
+                if bytes.is_empty() || bytes.len() > MAX_COLLECTION_DRAFT_CHUNK_BYTES {
+                    return Err(OperationError::failed(
+                        "collection draft chunk size is outside its bound",
+                    ));
+                }
+                let staged = self.staged_draft_mut(token)?;
+                let expected_offset = u32::try_from(staged.bytes.len())
+                    .map_err(|_| OperationError::failed("collection draft offset overflowed"))?;
+                if offset != expected_offset {
+                    return Err(OperationError::failed(format!(
+                        "collection draft chunk offset {offset} does not match expected offset {expected_offset}"
+                    )));
+                }
+                let received =
+                    staged.bytes.len().checked_add(bytes.len()).ok_or_else(|| {
+                        OperationError::failed("collection draft size overflowed")
+                    })?;
+                if received > staged.total_bytes as usize {
+                    return Err(OperationError::failed(
+                        "collection draft chunk exceeds the declared total",
+                    ));
+                }
+                if received > MAX_COLLECTION_DRAFT_BYTES {
+                    return Err(OperationError::failed(
+                        "collection draft exceeds the total allocation bound",
+                    ));
+                }
+                if received > staged.bytes.capacity() {
+                    let target_capacity =
+                        received.saturating_mul(2).min(staged.total_bytes as usize);
+                    let additional = target_capacity.saturating_sub(staged.bytes.len());
+                    staged.bytes.try_reserve_exact(additional).map_err(|_| {
+                        OperationError::failed("cannot allocate collection draft chunk")
+                    })?;
+                }
+                staged.bytes.extend_from_slice(&bytes);
+                staged.expires_at = Instant::now() + COLLECTION_DRAFT_EXPIRY;
+                Ok(CollectionAdminProtocolOutcome::Appended {
+                    token,
+                    received_bytes: u32::try_from(received)
+                        .map_err(|_| OperationError::failed("collection draft is too large"))?,
+                    total_bytes: staged.total_bytes,
+                })
+            }
+            CollectionAdminRequest::Estimate { token } => {
+                let draft = self.complete_draft(token)?;
+                let outcome = administer_collection_direct(
+                    &mut Library::open(&self.library_root).map_err(operation_failed)?,
+                    CollectionAdministration::Estimate(draft),
+                )?;
+                Ok(CollectionAdminProtocolOutcome::Completed(outcome))
+            }
+            CollectionAdminRequest::Add { token } => {
+                let draft = self.complete_draft(token)?;
+                let mut library = Library::open(&self.library_root).map_err(operation_failed)?;
+                let outcome = administer_collection_direct(
+                    &mut library,
+                    CollectionAdministration::Add(draft),
+                )?;
+                self.consume_draft(token);
+                self.last_operation =
+                    Some("created a collection from a complete preview".to_owned());
+                Ok(CollectionAdminProtocolOutcome::Completed(outcome))
+            }
+            CollectionAdminRequest::Edit {
+                token,
+                collection_id,
+                expected_generation,
+            } => {
+                let collection_id = CollectionId::new(collection_id).map_err(operation_failed)?;
+                let draft = self.complete_draft(token)?;
+                let mut library = Library::open(&self.library_root).map_err(operation_failed)?;
+                let outcome = administer_collection_direct(
+                    &mut library,
+                    CollectionAdministration::Edit {
+                        collection_id,
+                        expected_generation,
+                        draft,
+                    },
+                )?;
+                self.consume_draft(token);
+                self.last_operation = Some(format!("edited collection {collection_id}"));
+                Ok(CollectionAdminProtocolOutcome::Completed(outcome))
+            }
+            CollectionAdminRequest::Remove { collection_id } => {
+                let collection_id = CollectionId::new(collection_id).map_err(operation_failed)?;
+                let mut library = Library::open(&self.library_root).map_err(operation_failed)?;
+                let outcome = administer_collection_direct(
+                    &mut library,
+                    CollectionAdministration::Remove { collection_id },
+                )?;
+                self.last_operation = Some(format!("tombstoned collection {collection_id}"));
+                Ok(CollectionAdminProtocolOutcome::Completed(outcome))
+            }
+            CollectionAdminRequest::Abort { token } => {
+                self.staged_draft_mut(token)?;
+                self.staged_collection_draft = None;
+                Ok(CollectionAdminProtocolOutcome::Aborted { token })
+            }
+        }
+    }
+
+    fn staged_draft_mut(
+        &mut self,
+        token: u64,
+    ) -> Result<&mut StagedCollectionDraft, OperationError> {
+        match self.staged_collection_draft.as_mut() {
+            Some(draft) if draft.token == token => Ok(draft),
+            Some(_) => Err(OperationError::failed(
+                "collection draft token does not match the active draft",
+            )),
+            None => Err(OperationError::failed(
+                "collection draft token is absent or expired",
+            )),
+        }
+    }
+
+    fn complete_draft(&mut self, token: u64) -> Result<crate::CollectionDraft, OperationError> {
+        let staged = self.staged_draft_mut(token)?;
+        if staged.bytes.len() != staged.total_bytes as usize {
+            return Err(OperationError::failed(format!(
+                "collection draft is incomplete: received {} of {} bytes",
+                staged.bytes.len(),
+                staged.total_bytes
+            )));
+        }
+        staged.expires_at = Instant::now() + COLLECTION_DRAFT_EXPIRY;
+        decode_collection_draft(&staged.bytes)
+    }
+
+    fn consume_draft(&mut self, token: u64) {
+        if self
+            .staged_collection_draft
+            .as_ref()
+            .is_some_and(|draft| draft.token == token)
+        {
+            self.staged_collection_draft = None;
+        }
     }
 
     fn runtime() -> Result<Runtime, OperationError> {
@@ -62,7 +267,7 @@ impl ApplicationHandler {
         checkpoint_candidate: u64,
         network_policy: NetworkTransferPolicy,
         control: &OperationControl,
-    ) -> Result<ReconciliationReport, OperationError> {
+    ) -> Result<CollectionSyncReport, OperationError> {
         let configuration = library
             .collection_configuration(collection_id)
             .map_err(operation_failed)?
@@ -97,6 +302,15 @@ impl ApplicationHandler {
             .map_err(|error| OperationError::failed(error.to_string()))?;
         let client = MediaWikiClient::new(client_config)
             .map_err(|error| OperationError::failed(error.to_string()))?;
+        let needs_bootstrap = library
+            .sync_checkpoints()
+            .map_err(operation_failed)?
+            .into_iter()
+            .find(|checkpoint| {
+                checkpoint.wiki_id == configuration.wiki_id
+                    && checkpoint.collection_id == Some(collection_id)
+            })
+            .is_none_or(|checkpoint| checkpoint.last_run_id.is_none());
         if control.is_shutdown_requested() {
             return Err(OperationError::failed(
                 "synchronization cancelled by shutdown request",
@@ -115,16 +329,24 @@ impl ApplicationHandler {
                 "synchronization cancelled by shutdown request",
             ));
         }
-        runtime
-            .block_on(reconcile_collection_heads_with_cancellation(
-                &client,
-                library,
-                configuration.wiki_id,
-                collection_id,
-                checkpoint_candidate,
-                &|| control.is_shutdown_requested(),
-            ))
-            .map_err(|error| OperationError::failed(error.to_string()))
+        if needs_bootstrap {
+            runtime
+                .block_on(bootstrap_collection(&client, library, collection_id))
+                .map(CollectionSyncReport::Bootstrap)
+                .map_err(|error| OperationError::failed(error.to_string()))
+        } else {
+            runtime
+                .block_on(reconcile_collection_heads_with_cancellation(
+                    &client,
+                    library,
+                    configuration.wiki_id,
+                    collection_id,
+                    checkpoint_candidate,
+                    &|| control.is_shutdown_requested(),
+                ))
+                .map(CollectionSyncReport::Reconciliation)
+                .map_err(|error| OperationError::failed(error.to_string()))
+        }
     }
 
     fn sync_one(
@@ -149,8 +371,17 @@ impl ApplicationHandler {
             control,
         )?;
         self.background_retry_not_before.remove(&collection_id);
-        let payload = reconciliation_payload(1, &report);
-        self.last_operation = Some(format!("synchronized collection {collection_id}"));
+        let mut totals = SynchronizationTotals::default();
+        totals.add(&report);
+        let payload = totals.payload(1);
+        self.last_operation = Some(match report {
+            CollectionSyncReport::Bootstrap(_) => {
+                format!("bootstrapped collection {collection_id}")
+            }
+            CollectionSyncReport::Reconciliation(_) => {
+                format!("synchronized collection {collection_id}")
+            }
+        });
         Ok(MutationOutcome {
             result: "synchronization-complete".to_owned(),
             payload: payload.into_bytes(),
@@ -166,7 +397,7 @@ impl ApplicationHandler {
         let collections = library.collections().map_err(operation_failed)?;
         let runtime = Self::runtime()?;
         let checkpoint_candidate = unix_time()?;
-        let mut totals = ReconciliationTotals::default();
+        let mut totals = SynchronizationTotals::default();
         for collection in &collections {
             if control.is_shutdown_requested() {
                 return Err(OperationError::failed(
@@ -477,6 +708,45 @@ impl RequestHandler for ApplicationHandler {
         }
     }
 
+    fn administer_collection(
+        &mut self,
+        request: CollectionAdminRequest,
+        control: OperationControl,
+    ) -> Result<CollectionAdminProtocolOutcome, OperationError> {
+        self.administer(request, &control)
+    }
+
+    fn administer_source(
+        &mut self,
+        administration: SourceAdministration,
+        control: OperationControl,
+    ) -> Result<SourceAdministrationOutcome, OperationError> {
+        if control.is_shutdown_requested() {
+            return Err(OperationError::failed(
+                "source administration cancelled by shutdown request",
+            ));
+        }
+        let outcome = administer_source_direct(
+            &mut Library::open(&self.library_root).map_err(operation_failed)?,
+            administration,
+        )?;
+        self.last_operation = Some(match &outcome {
+            SourceAdministrationOutcome::Added {
+                wiki_id, created, ..
+            } => {
+                if *created {
+                    format!("registered source {wiki_id}")
+                } else {
+                    format!("source {wiki_id} was already registered")
+                }
+            }
+            SourceAdministrationOutcome::Removed { wiki_id } => {
+                format!("removed unused source {wiki_id}")
+            }
+        });
+        Ok(outcome)
+    }
+
     fn poll_background(
         &mut self,
         control: OperationControl,
@@ -575,8 +845,23 @@ fn cadence_label(cadence: ScheduleCadence) -> &'static str {
     }
 }
 
+#[derive(Debug)]
+enum CollectionSyncReport {
+    Bootstrap(BootstrapReport),
+    Reconciliation(ReconciliationReport),
+}
+
 #[derive(Debug, Default)]
-struct ReconciliationTotals {
+struct SynchronizationTotals {
+    bootstrapped_collections: usize,
+    reconciled_collections: usize,
+    bootstrap_pages_captured: usize,
+    bootstrap_missing_pages: usize,
+    bootstrap_current_revisions_captured: usize,
+    bootstrap_history_batches: usize,
+    bootstrap_history_revisions_enumerated: usize,
+    bootstrap_history_revisions_captured: usize,
+    bootstrap_history_revisions_reused: usize,
     pages_checked: usize,
     differing_heads: usize,
     missing_pages: usize,
@@ -587,8 +872,47 @@ struct ReconciliationTotals {
     resumed_runs: usize,
 }
 
-impl ReconciliationTotals {
-    fn add(&mut self, report: &ReconciliationReport) {
+impl SynchronizationTotals {
+    fn add(&mut self, report: &CollectionSyncReport) {
+        match report {
+            CollectionSyncReport::Bootstrap(report) => self.add_bootstrap(report),
+            CollectionSyncReport::Reconciliation(report) => self.add_reconciliation(report),
+        }
+    }
+
+    fn add_bootstrap(&mut self, report: &BootstrapReport) {
+        self.bootstrapped_collections = self.bootstrapped_collections.saturating_add(1);
+        self.bootstrap_pages_captured = self
+            .bootstrap_pages_captured
+            .saturating_add(report.current.pages.len());
+        self.bootstrap_missing_pages = self
+            .bootstrap_missing_pages
+            .saturating_add(report.current.missing_titles.len());
+        self.bootstrap_current_revisions_captured =
+            self.bootstrap_current_revisions_captured.saturating_add(
+                report
+                    .current
+                    .pages
+                    .iter()
+                    .filter(|page| page.newly_captured)
+                    .count(),
+            );
+        self.bootstrap_history_batches = self
+            .bootstrap_history_batches
+            .saturating_add(report.history.batches);
+        self.bootstrap_history_revisions_enumerated = self
+            .bootstrap_history_revisions_enumerated
+            .saturating_add(report.history.revisions_enumerated);
+        self.bootstrap_history_revisions_captured = self
+            .bootstrap_history_revisions_captured
+            .saturating_add(report.history.revisions_captured);
+        self.bootstrap_history_revisions_reused = self
+            .bootstrap_history_revisions_reused
+            .saturating_add(report.history.revisions_reused);
+    }
+
+    fn add_reconciliation(&mut self, report: &ReconciliationReport) {
+        self.reconciled_collections = self.reconciled_collections.saturating_add(1);
         self.pages_checked = self.pages_checked.saturating_add(report.pages_checked);
         self.differing_heads = self.differing_heads.saturating_add(report.differing_heads);
         self.missing_pages = self.missing_pages.saturating_add(report.missing_pages);
@@ -611,7 +935,16 @@ impl ReconciliationTotals {
 
     fn payload(&self, collections: usize) -> String {
         format!(
-            "collections={collections} pages_checked={} differing_heads={} missing_pages={} revision_batches={} revisions_enumerated={} revisions_captured={} revisions_reused={} resumed_runs={}",
+            "collections={collections} bootstrapped_collections={} reconciled_collections={} bootstrap_pages_captured={} bootstrap_missing_pages={} bootstrap_current_revisions_captured={} bootstrap_history_batches={} bootstrap_history_revisions_enumerated={} bootstrap_history_revisions_captured={} bootstrap_history_revisions_reused={} pages_checked={} differing_heads={} missing_pages={} revision_batches={} revisions_enumerated={} revisions_captured={} revisions_reused={} resumed_runs={}",
+            self.bootstrapped_collections,
+            self.reconciled_collections,
+            self.bootstrap_pages_captured,
+            self.bootstrap_missing_pages,
+            self.bootstrap_current_revisions_captured,
+            self.bootstrap_history_batches,
+            self.bootstrap_history_revisions_enumerated,
+            self.bootstrap_history_revisions_captured,
+            self.bootstrap_history_revisions_reused,
             self.pages_checked,
             self.differing_heads,
             self.missing_pages,
@@ -622,12 +955,6 @@ impl ReconciliationTotals {
             self.resumed_runs,
         )
     }
-}
-
-fn reconciliation_payload(collections: usize, report: &ReconciliationReport) -> String {
-    let mut totals = ReconciliationTotals::default();
-    totals.add(report);
-    totals.payload(collections)
 }
 
 fn operation_failed(error: impl std::fmt::Display) -> OperationError {
@@ -660,10 +987,10 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use wikisync_core::{
-        CollectionBudget, CollectionRemovalPolicy, CollectionRule, HistoryPolicy, PageTitle,
-        TitleSelection,
+        CollectionBudget, CollectionRemovalPolicy, CollectionRule, HistoryPolicy, InclusionReason,
+        PageId, PageTitle, TitleSelection,
     };
-    use wikisync_store::ObjectKind;
+    use wikisync_store::{ObjectKind, ResolvedCollectionMember, SyncRunKind};
     use wikisync_sync::capture_explicit_titles;
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -822,6 +1149,153 @@ mod tests {
     }
 
     #[test]
+    fn collection_draft_staging_rejects_busy_tokens_duplicates_and_incomplete_commits() {
+        let temporary = TempLibrary::new();
+        let mut handler = ApplicationHandler::new(temporary.path()).expect("handler");
+        let begun = handler
+            .administer(
+                CollectionAdminRequest::Begin { total_bytes: 10 },
+                &operation_control(),
+            )
+            .expect("begin");
+        let CollectionAdminProtocolOutcome::Begun { token } = begun else {
+            panic!("unexpected begin outcome");
+        };
+        assert_eq!(
+            handler
+                .staged_collection_draft
+                .as_ref()
+                .expect("staged")
+                .bytes
+                .capacity(),
+            0,
+            "declared total must not be allocated eagerly"
+        );
+        assert!(
+            handler
+                .administer(
+                    CollectionAdminRequest::Begin { total_bytes: 10 },
+                    &operation_control(),
+                )
+                .is_err()
+        );
+        assert!(
+            handler
+                .administer(
+                    CollectionAdminRequest::Append {
+                        token: token + 1,
+                        offset: 0,
+                        bytes: b"abc".to_vec(),
+                    },
+                    &operation_control(),
+                )
+                .is_err()
+        );
+        handler
+            .administer(
+                CollectionAdminRequest::Append {
+                    token,
+                    offset: 0,
+                    bytes: b"abc".to_vec(),
+                },
+                &operation_control(),
+            )
+            .expect("first chunk");
+        let capacity_after_chunk = handler
+            .staged_collection_draft
+            .as_ref()
+            .expect("staged")
+            .bytes
+            .capacity();
+        assert!(
+            handler
+                .administer(
+                    CollectionAdminRequest::Append {
+                        token,
+                        offset: 3,
+                        bytes: vec![0; 8],
+                    },
+                    &operation_control(),
+                )
+                .is_err(),
+            "a chunk exceeding the declared total must fail before allocation"
+        );
+        let staged = handler.staged_collection_draft.as_ref().expect("staged");
+        assert_eq!(staged.bytes.len(), 3);
+        assert_eq!(staged.bytes.capacity(), capacity_after_chunk);
+        assert!(
+            handler
+                .administer(
+                    CollectionAdminRequest::Append {
+                        token,
+                        offset: 0,
+                        bytes: b"abc".to_vec(),
+                    },
+                    &operation_control(),
+                )
+                .is_err()
+        );
+        assert!(
+            handler
+                .administer(
+                    CollectionAdminRequest::Estimate { token },
+                    &operation_control(),
+                )
+                .is_err()
+        );
+        assert!(
+            handler
+                .administer(
+                    CollectionAdminRequest::Abort { token: token + 1 },
+                    &operation_control(),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            handler
+                .administer(
+                    CollectionAdminRequest::Abort { token },
+                    &operation_control(),
+                )
+                .expect("abort"),
+            CollectionAdminProtocolOutcome::Aborted { token }
+        );
+    }
+
+    #[test]
+    fn expired_collection_draft_is_replaced_without_durable_state() {
+        let temporary = TempLibrary::new();
+        let mut handler = ApplicationHandler::new(temporary.path()).expect("handler");
+        handler
+            .administer(
+                CollectionAdminRequest::Begin { total_bytes: 10 },
+                &operation_control(),
+            )
+            .expect("begin");
+        handler
+            .staged_collection_draft
+            .as_mut()
+            .expect("staged")
+            .expires_at = Instant::now();
+        assert!(matches!(
+            handler
+                .administer(
+                    CollectionAdminRequest::Begin { total_bytes: 20 },
+                    &operation_control(),
+                )
+                .expect("replace expired"),
+            CollectionAdminProtocolOutcome::Begun { .. }
+        ));
+        assert!(
+            Library::open(temporary.path())
+                .expect("library")
+                .collections_including_tombstones()
+                .expect("collections")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn compaction_returns_a_truthful_pack_receipt() {
         let temporary = TempLibrary::new();
         let mut library = Library::open(temporary.path()).expect("open library");
@@ -876,7 +1350,7 @@ mod tests {
             .mutate(Mutation::SyncAll, operation_control())
             .expect("sync empty library");
         assert_eq!(outcome.result, "synchronization-complete");
-        assert_eq!(outcome.payload, b"collections=0 pages_checked=0 differing_heads=0 missing_pages=0 revision_batches=0 revisions_enumerated=0 revisions_captured=0 revisions_reused=0 resumed_runs=0");
+        assert_eq!(outcome.payload, b"collections=0 bootstrapped_collections=0 reconciled_collections=0 bootstrap_pages_captured=0 bootstrap_missing_pages=0 bootstrap_current_revisions_captured=0 bootstrap_history_batches=0 bootstrap_history_revisions_enumerated=0 bootstrap_history_revisions_captured=0 bootstrap_history_revisions_reused=0 pages_checked=0 differing_heads=0 missing_pages=0 revision_batches=0 revisions_enumerated=0 revisions_captured=0 revisions_reused=0 resumed_runs=0");
     }
 
     #[test]
@@ -899,6 +1373,116 @@ mod tests {
             )
             .expect_err("unconfigured draft must fail");
         assert!(error.message().contains("no committed configuration"));
+    }
+
+    #[test]
+    fn newly_administered_collection_bootstraps_current_and_configured_history() {
+        let server = FixtureServer::start(vec![
+            FixtureResponse::json(include_str!(
+                "../../../fixtures/mediawiki/reconciliation-unchanged-title-resolution.json"
+            )),
+            FixtureResponse::json(REVISION_CONTENT),
+            FixtureResponse::json(include_str!(
+                "../../../fixtures/mediawiki/revisions-page-1.json"
+            )),
+            FixtureResponse::json(include_str!(
+                "../../../fixtures/mediawiki/revisions-page-2.json"
+            )),
+            FixtureResponse::json(include_str!(
+                "../../../fixtures/mediawiki/revision-content-older.json"
+            )),
+        ]);
+        let temporary = TempLibrary::new();
+        let mut library = Library::open(temporary.path()).expect("open library");
+        let wiki_id = library
+            .register_wiki(server.endpoint(), "en")
+            .expect("register fixture source");
+        let canonical_title = PageTitle::new("Rust (programming language)").expect("title");
+        let rule = CollectionRule::ExplicitTitles(
+            TitleSelection::new([canonical_title.clone()]).expect("selection"),
+        );
+        let draft = crate::CollectionDraft {
+            wiki_id,
+            name: "Admin bootstrap".to_owned(),
+            preview: wikisync_sync::CollectionSelectionPreview {
+                rule,
+                members: vec![ResolvedCollectionMember {
+                    page_id: PageId::new(25_357_340).expect("page ID"),
+                    namespace: 0,
+                    title: canonical_title.clone(),
+                    inclusion_reason: InclusionReason::ExplicitTitle(canonical_title),
+                }],
+                missing_titles: Vec::new(),
+                predicted_canonical_bytes: Some(42),
+                category_batches: 0,
+            },
+            history_policy: HistoryPolicy::last_n(2).expect("history policy"),
+            budget: CollectionBudget::unlimited(),
+            removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+        };
+        let outcome = crate::administer_collection_direct(
+            &mut library,
+            crate::CollectionAdministration::Add(draft),
+        )
+        .expect("admin add");
+        let crate::CollectionAdministrationOutcome::Added { collection_id, .. } = outcome else {
+            panic!("unexpected add outcome");
+        };
+        assert!(
+            library
+                .collection_pages(wiki_id, collection_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(library.sync_checkpoints().unwrap().is_empty());
+        drop(library);
+
+        let mut handler = ApplicationHandler::new(temporary.path()).expect("handler");
+        let outcome = handler
+            .mutate(
+                Mutation::SyncCollection(collection_id.get()),
+                operation_control(),
+            )
+            .expect("initial daemon sync");
+        assert_eq!(outcome.result, "synchronization-complete");
+        let receipt = String::from_utf8(outcome.payload).expect("UTF-8 receipt");
+        assert!(receipt.contains("bootstrapped_collections=1"));
+        assert!(receipt.contains("bootstrap_pages_captured=1"));
+        assert!(receipt.contains("bootstrap_current_revisions_captured=1"));
+        assert!(receipt.contains("bootstrap_history_revisions_captured=1"));
+        assert!(!receipt.contains("pages_checked=1"));
+
+        let library = Library::open(temporary.path()).expect("reopen library");
+        let page_id = PageId::new(25_357_340).expect("page ID");
+        let page = library
+            .page(wiki_id, page_id)
+            .expect("page lookup")
+            .expect("captured page");
+        assert_eq!(page.current_revision_id.expect("head").get(), 1_300_000_001);
+        let history = library
+            .revisions_for_page(wiki_id, page_id)
+            .expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].revision_id.get(), 1_300_000_001);
+        assert_eq!(history[1].revision_id.get(), 1_300_000_000);
+        let checkpoint = library
+            .sync_checkpoints()
+            .expect("checkpoint")
+            .into_iter()
+            .find(|checkpoint| checkpoint.collection_id == Some(collection_id))
+            .expect("collection checkpoint");
+        let run = library
+            .sync_run_status(checkpoint.last_run_id.expect("last run"))
+            .expect("run lookup")
+            .expect("bootstrap run");
+        assert_eq!(run.kind, SyncRunKind::Bootstrap);
+        drop(library);
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[0].contains("pageids=25357340"));
+        assert!(requests[2].contains("rvdir=older"));
+        assert!(requests[4].contains("rvstartid=1300000000"));
     }
 
     #[test]
@@ -1193,6 +1777,24 @@ mod tests {
                 &selection,
             ))
             .expect("initial fixture capture");
+        // This test prepares its initial capture through the low-level fixture
+        // helper rather than `bootstrap_collection`; record the equivalent durable
+        // bootstrap boundary so the daemon exercises reconciliation below.
+        let bootstrap = library
+            .start_or_resume_sync_run(
+                wiki_id,
+                Some(collection_id),
+                SyncRunKind::Bootstrap,
+                unix_time().expect("clock"),
+            )
+            .expect("start fixture bootstrap marker");
+        let bootstrap = library
+            .complete_sync_run(bootstrap.status.run_id, None)
+            .expect("complete fixture bootstrap marker");
+        let initial_checkpoint = bootstrap.checkpoint_candidate;
+        library
+            .append_sync_manifest(bootstrap.run_id)
+            .expect("append fixture bootstrap manifest");
         let page_id = initial.pages[0].page_id;
         let original_head = initial.pages[0].revision_id;
         let due_at = unix_time().expect("clock");
@@ -1254,7 +1856,7 @@ mod tests {
         );
         assert_eq!(
             library.sync_checkpoints().expect("checkpoint")[0].committed_through,
-            0
+            initial_checkpoint
         );
         drop(library);
         client.shutdown().expect("shutdown first daemon");
@@ -1291,7 +1893,10 @@ mod tests {
                 .len(),
             3
         );
-        assert!(library.sync_checkpoints().expect("checkpoint")[0].committed_through > 0);
+        assert!(
+            library.sync_checkpoints().expect("checkpoint")[0].committed_through
+                >= initial_checkpoint
+        );
         drop(library);
         client.shutdown().expect("shutdown restarted daemon");
         daemon_thread.join().expect("join").expect("daemon run");

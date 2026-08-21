@@ -1,3 +1,4 @@
+mod collection;
 mod doctor;
 mod export;
 mod trust;
@@ -25,7 +26,10 @@ use wikisync_store::{
     Library, StoreError, StoredPage, StoredRevision, SyncCheckpoint, SyncRunState, SyncRunStatus,
 };
 use wikisync_sync::{CategoryPreviewLimits, preview_category_selection};
-use wikisyncd::{ApplicationHandler, Mutation, OperationControl, RequestHandler, WriterAccess};
+use wikisyncd::{
+    ApplicationHandler, Mutation, OperationControl, RequestHandler, SourceAdministration,
+    SourceAdministrationOutcome, WriterAccess, administer_source_direct,
+};
 
 use trust::{AnchorComparison, AnchorWriteMode};
 
@@ -36,7 +40,11 @@ Usage:
   wikisync --library <path> source add --api-endpoint <url> --language <code> [--json]
   wikisync --library <path> source remove --wiki <id> [--json]
   wikisync --library <path> source list [--json]
-  wikisync --library <path> collection list [--json]
+  wikisync --library <path> collection add --wiki <id> --name <name> <scope> [policy options] [--commit] [--json]
+  wikisync --library <path> collection edit --collection <id> [configuration options] [--commit] [--json]
+  wikisync --library <path> collection list [--all] [--json]
+  wikisync --library <path> collection remove --collection <id> [--commit] [--json]
+  wikisync --library <path> collection estimate --collection <id> [--json]
   wikisync --library <path> trust key-generate --output <external-path>
   wikisync --library <path> trust key-validate --key <external-path>
   wikisync --library <path> trust key-import --source <external-path> --output <external-path>
@@ -62,7 +70,13 @@ The WIKISYNC_LIBRARY environment variable may replace --library.
 
 category-preview is network-only and does not change collection membership. It selects
 only main-namespace pages, traverses namespace-14 subcategories, and defaults to bounds
-of 16 levels, 1,000 categories, 10,000 pages, and 20,000 API responses.";
+of 16 levels, 1,000 categories, 10,000 pages, and 20,000 API responses.
+
+Collection scope is exactly one of repeated --title <title>, --title-list <file>, or
+--category <Category:title> [--depth <edges>]. History is current-and-future by default;
+use --history <current-and-future|last-n:COUNT|since:UNIX-SECONDS|complete>. Budgets use
+--max-pages <count|unlimited> and --max-bytes <bytes|unlimited>. Add, edit, and remove
+are previews by default and change the library only when --commit is supplied.";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1)) {
@@ -120,6 +134,12 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                 return doctor::run(&library_root, *json, bundle.as_deref(), *online)
                     .map_err(Into::into);
             }
+            let command = match command {
+                Command::Collection(command) => {
+                    return collection::run(&library_root, command).map_err(Into::into);
+                }
+                command => command,
+            };
             match command {
                 Command::TrustKeyGenerate { output } => {
                     let summary = trust::generate_signing_key(&library_root, &output)?;
@@ -203,21 +223,28 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                     return Ok(());
                 }
                 Command::SourceRemove { wiki_id, json } => {
-                    let WriterAccess::Direct(_lease) = WriterAccess::discover(&library_root)?
+                    let outcome =
+                        administer_source(&library_root, SourceAdministration::Remove { wiki_id })?;
+                    let SourceAdministrationOutcome::Removed {
+                        wiki_id: removed_wiki_id,
+                    } = outcome
                     else {
-                        return Err(CliError::message(
-                            "the daemon owns this library; source administration is not yet available through daemon protocol version 1",
+                        return Err(CliError::data(
+                            "source remove returned an unexpected administration receipt",
                         ));
                     };
-                    let mut library = Library::open(&library_root)?;
-                    library.remove_wiki(wiki_id)?;
+                    if removed_wiki_id != wiki_id {
+                        return Err(CliError::data(
+                            "source remove receipt identified a different wiki",
+                        ));
+                    }
                     if json {
                         write_json(&json!({
-                            "wiki_id": wiki_id.get(),
+                            "wiki_id": removed_wiki_id.get(),
                             "removed": true,
                         }))?;
                     } else {
-                        println!("Removed unused source wiki {wiki_id}.");
+                        println!("Removed unused source wiki {removed_wiki_id}.");
                     }
                     return Ok(());
                 }
@@ -234,27 +261,47 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                             env!("CARGO_PKG_REPOSITORY")
                         ),
                     )?;
-                    let WriterAccess::Direct(_lease) = WriterAccess::discover(&library_root)?
+                    let outcome = administer_source(
+                        &library_root,
+                        SourceAdministration::Add {
+                            api_endpoint,
+                            language_code,
+                        },
+                    )?;
+                    let SourceAdministrationOutcome::Added {
+                        wiki_id,
+                        api_endpoint,
+                        language_code,
+                        created,
+                    } = outcome
                     else {
-                        return Err(CliError::message(
-                            "the daemon owns this library; source administration is not yet available through daemon protocol version 1",
+                        return Err(CliError::data(
+                            "source add returned an unexpected administration receipt",
                         ));
                     };
-                    let mut library = Library::open(&library_root)?;
-                    let wiki_id = library.register_wiki(&api_endpoint, &language_code)?;
                     if json {
                         write_json(&json!({
                             "wiki_id": wiki_id.get(),
                             "api_endpoint": api_endpoint,
                             "language_code": language_code,
+                            "created": created,
                         }))?;
-                    } else {
+                    } else if created {
                         println!(
                             "Registered source {} ({}) as wiki {}.",
                             api_endpoint, language_code, wiki_id
                         );
+                    } else {
+                        println!(
+                            "Source {} ({}) is already registered as wiki {}.",
+                            api_endpoint, language_code, wiki_id
+                        );
                     }
                     return Ok(());
+                }
+                Command::SourceList { json } => {
+                    let library = Library::open_read_only(&library_root)?;
+                    return list_sources(&library, json);
                 }
                 Command::Sync { collection_id } => {
                     let mutation = collection_id
@@ -295,8 +342,6 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                     json,
                 } => revision_diff(&library, from, to, wiki_id, reading, json),
                 Command::Status { json } => status(&library, json),
-                Command::SourceList { json } => list_sources(&library, json),
-                Command::CollectionList { json } => list_collections(&library, json),
                 Command::Export {
                     format,
                     collection_id,
@@ -347,6 +392,12 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                 }
                 Command::SourceRemove { .. } => {
                     unreachable!("source remove returned before opening the normal reader")
+                }
+                Command::SourceList { .. } => {
+                    unreachable!("source list returned before opening the normal reader")
+                }
+                Command::Collection(_) => {
+                    unreachable!("collection administration returned before opening a reader")
                 }
                 Command::TrustKeyGenerate { .. }
                 | Command::TrustKeyValidate { .. }
@@ -451,36 +502,6 @@ fn list_sources(library: &Library, json_output: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-fn list_collections(library: &Library, json_output: bool) -> Result<(), CliError> {
-    let collections = library.collections()?;
-    if json_output {
-        write_json(&json!({
-            "collections": collections
-                .iter()
-                .map(|collection| json!({
-                    "collection_id": collection.collection_id.get(),
-                    "wiki_id": collection.wiki_id.get(),
-                    "name": collection.name,
-                    "page_count": collection.page_count,
-                }))
-                .collect::<Vec<_>>()
-        }))?;
-    } else if collections.is_empty() {
-        println!("No collections configured.");
-    } else {
-        for collection in collections {
-            println!(
-                "{}\twiki {}\t{} pages\t{}",
-                collection.collection_id,
-                collection.wiki_id,
-                collection.page_count,
-                collection.name
-            );
-        }
-    }
-    Ok(())
-}
-
 fn mutate_library(library_root: &std::path::Path, mutation: Mutation) -> Result<(), CliError> {
     let outcome = match WriterAccess::discover(library_root)? {
         WriterAccess::Daemon(client) => client.forward_mutation(mutation)?,
@@ -496,6 +517,19 @@ fn mutate_library(library_root: &std::path::Path, mutation: Mutation) -> Result<
         println!("{detail}");
     }
     Ok(())
+}
+
+fn administer_source(
+    library_root: &std::path::Path,
+    administration: SourceAdministration,
+) -> Result<SourceAdministrationOutcome, CliError> {
+    match WriterAccess::discover(library_root)? {
+        WriterAccess::Daemon(client) => Ok(client.administer_source(administration)?),
+        WriterAccess::Direct(_lease) => {
+            let mut library = Library::open(library_root)?;
+            Ok(administer_source_direct(&mut library, administration)?)
+        }
+    }
 }
 
 fn category_preview(
@@ -1065,9 +1099,7 @@ enum Command {
         wiki_id: WikiId,
         json: bool,
     },
-    CollectionList {
-        json: bool,
-    },
+    Collection(collection::Command),
     TrustKeyGenerate {
         output: PathBuf,
     },
@@ -1195,7 +1227,9 @@ fn parse(
     }
     let command = match command.to_str() {
         Some("source") => parse_source(values)?,
-        Some("collection") => parse_collection(values)?,
+        Some("collection") => {
+            Command::Collection(collection::parse(values).map_err(CliError::usage)?)
+        }
         Some("trust") => parse_trust(values)?,
         Some("search") => parse_search(values)?,
         Some("show") => parse_show(values)?,
@@ -1295,30 +1329,6 @@ fn parse_source(values: Vec<String>) -> Result<Command, CliError> {
             "unknown source subcommand {value:?}"
         ))),
         None => Err(CliError::usage("source requires add, remove, or list")),
-    }
-}
-
-fn parse_collection(values: Vec<String>) -> Result<Command, CliError> {
-    let mut values = values.into_iter();
-    match values.next().as_deref() {
-        Some("list") => {
-            let mut json = false;
-            for value in values {
-                match value.as_str() {
-                    "--json" => json = true,
-                    _ => {
-                        return Err(CliError::usage(format!(
-                            "unknown collection list option {value:?}"
-                        )));
-                    }
-                }
-            }
-            Ok(Command::CollectionList { json })
-        }
-        Some(value) => Err(CliError::usage(format!(
-            "unknown collection subcommand {value:?}"
-        ))),
-        None => Err(CliError::usage("collection requires list")),
     }
 }
 
@@ -1940,6 +1950,12 @@ impl From<wikisync_sync::CategoryPreviewError> for CliError {
     }
 }
 
+impl From<collection::Error> for CliError {
+    fn from(error: collection::Error) -> Self {
+        Self::message(error.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2057,7 +2073,10 @@ mod tests {
             parse(["--library", "/tmp/wiki", "collection", "list"]).expect("collection list parse"),
             Action::Command {
                 library: PathBuf::from("/tmp/wiki"),
-                command: Command::CollectionList { json: false },
+                command: Command::Collection(collection::Command::List {
+                    include_tombstones: false,
+                    json: false,
+                }),
             }
         );
     }

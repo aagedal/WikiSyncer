@@ -15,7 +15,7 @@ use iced::widget::{
 use iced::{Alignment, Element, Length, Task, Theme};
 use wikisync_core::{
     CollectionBudget, CollectionId, CollectionRemovalPolicy, CollectionRule, HistoryPolicy,
-    PageTitle, UnixTimestamp,
+    PageTitle, UnixTimestamp, WikiId,
 };
 use wikisync_integrity::{
     MAX_TRUSTED_HEAD_BYTES, ManifestSigningKey, TrustedManifestHead, VerificationFindingKind,
@@ -25,16 +25,17 @@ use wikisync_integrity::{
 use wikisync_mediawiki::ClientConfig;
 use wikisync_store::{
     CollectionSchedule, Library, NetworkTransferPolicy, ScheduleCadence, StoredCollection,
-    SyncCheckpoint, SyncRunState, SyncRunStatus,
+    StoredCollectionConfiguration, StoredWiki, SyncCheckpoint, SyncRunState, SyncRunStatus,
 };
 use wikisync_sync::{
-    CategoryPreviewLimits, CollectionSelectionPreview, bootstrap_collection,
-    commit_collection_preview, parse_title_list, preview_collection_rule,
-    reconcile_collection_heads,
+    CategoryPreviewLimits, CollectionSelectionPreview, bootstrap_collection, parse_title_list,
+    preview_collection_rule, reconcile_collection_heads,
 };
 use wikisync_web::ReaderHandle;
 use wikisyncd::{
-    MeteredNetworkState, Mutation, WriterAccess, WriterLease, detect_metered_network,
+    CollectionAdministration, CollectionAdministrationOutcome, CollectionDraft,
+    MeteredNetworkState, Mutation, SourceAdministration, SourceAdministrationOutcome, WriterAccess,
+    WriterLease, administer_collection_direct, administer_source_direct, detect_metered_network,
     next_occurrence_after, set_collection_schedule_mutation, set_network_transfer_policy_mutation,
 };
 
@@ -62,6 +63,8 @@ struct App {
     latest_probe_id: u64,
     path_status: PathStatus,
     collection_form: CollectionForm,
+    collection_editor: Option<CollectionEditor>,
+    remove_confirmation: Option<CollectionId>,
     schedule_editor: Option<ScheduleEditor>,
     network_policy_editor: NetworkPolicyEditor,
     selection_preview: Option<CollectionSelectionPreview>,
@@ -90,6 +93,8 @@ impl App {
             latest_probe_id: probe_key.id,
             path_status: PathStatus::Checking,
             collection_form: CollectionForm::default(),
+            collection_editor: None,
+            remove_confirmation: None,
             schedule_editor: None,
             network_policy_editor: NetworkPolicyEditor::default(),
             selection_preview: None,
@@ -245,6 +250,11 @@ impl App {
                     self.collection_form.maximum_bytes = value;
                 }
             }
+            Message::CreateRemovalPolicyChanged(value) => {
+                if !self.is_busy() {
+                    self.collection_form.removal_policy = value;
+                }
+            }
             Message::CreateScheduleModeChanged(value) => {
                 if !self.is_busy() {
                     self.collection_form.schedule_mode = value;
@@ -336,6 +346,7 @@ impl App {
                             return Task::none();
                         }
                     },
+                    removal_policy: self.collection_form.removal_policy,
                     schedule: match self.collection_form.schedule() {
                         Ok(schedule) => schedule,
                         Err(error) => {
@@ -386,6 +397,311 @@ impl App {
                         self.snapshot = Some(snapshot);
                         self.notice = Some(Notice::success(
                             "Collection update completed; every discovered intermediate revision is durable.",
+                        ));
+                    }
+                    Err(error) => self.notice = Some(Notice::error(error)),
+                }
+            }
+            Message::EditCollection(collection_id) => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let Some(snapshot) = &self.snapshot else {
+                    return Task::none();
+                };
+                let Some(configuration) = snapshot
+                    .collection_configurations
+                    .iter()
+                    .find(|configuration| configuration.collection_id == collection_id)
+                else {
+                    self.notice = Some(Notice::error("Collection configuration is unavailable."));
+                    return Task::none();
+                };
+                let Some(wiki) = snapshot
+                    .wikis
+                    .iter()
+                    .find(|wiki| wiki.wiki_id == configuration.wiki_id)
+                else {
+                    self.notice = Some(Notice::error("Collection source is unavailable."));
+                    return Task::none();
+                };
+                let schedule = snapshot
+                    .schedules
+                    .iter()
+                    .find(|schedule| schedule.collection_id == collection_id)
+                    .copied();
+                self.collection_editor = Some(CollectionEditor {
+                    collection_id,
+                    expected_generation: configuration.generation,
+                    form: CollectionForm::from_configuration(configuration, wiki, schedule),
+                    preview: None,
+                });
+                self.schedule_editor = None;
+                self.remove_confirmation = None;
+                self.notice = Some(Notice::success(
+                    "Edit loaded. Preview the complete replacement scope before saving.",
+                ));
+            }
+            Message::CancelCollectionEdit => {
+                if !self.is_busy() {
+                    self.collection_editor = None;
+                }
+            }
+            Message::EditCollectionNameChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.collection_editor {
+                        editor.form.name = value;
+                    }
+                }
+            }
+            Message::EditSelectionModeChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.collection_editor {
+                        editor.form.selection_mode = value;
+                        editor.preview = None;
+                    }
+                }
+            }
+            Message::EditSelectionChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.collection_editor {
+                        editor.form.selection = value;
+                        editor.preview = None;
+                    }
+                }
+            }
+            Message::EditCategoryDepthChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.collection_editor {
+                        editor.form.category_depth = value;
+                        editor.preview = None;
+                    }
+                }
+            }
+            Message::EditHistoryModeChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.collection_editor {
+                        editor.form.history_mode = value;
+                    }
+                }
+            }
+            Message::EditHistoryValueChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.collection_editor {
+                        editor.form.history_value = value;
+                    }
+                }
+            }
+            Message::EditMaximumPagesChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.collection_editor {
+                        editor.form.maximum_pages = value;
+                    }
+                }
+            }
+            Message::EditMaximumBytesChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.collection_editor {
+                        editor.form.maximum_bytes = value;
+                    }
+                }
+            }
+            Message::EditRemovalPolicyChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.collection_editor {
+                        editor.form.removal_policy = value;
+                    }
+                }
+            }
+            Message::EditCollectionScheduleModeChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.collection_editor {
+                        editor.form.schedule_mode = value;
+                    }
+                }
+            }
+            Message::EditCollectionScheduleValueChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.collection_editor {
+                        editor.form.schedule_value = value;
+                    }
+                }
+            }
+            Message::EditCollectionScheduleJitterChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.collection_editor {
+                        editor.form.schedule_jitter_minutes = value;
+                    }
+                }
+            }
+            Message::EditCollectionSchedulePaused(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.collection_editor {
+                        editor.form.schedule_paused = value;
+                    }
+                }
+            }
+            Message::PreviewCollectionEdit => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let Some(editor) = &self.collection_editor else {
+                    return Task::none();
+                };
+                let request = PreviewCollectionRequest {
+                    api_endpoint: editor.form.api_endpoint.clone(),
+                    network_policy: self
+                        .snapshot
+                        .as_ref()
+                        .map_or_else(NetworkTransferPolicy::default, |snapshot| {
+                            snapshot.network_policy
+                        }),
+                    rule: match editor.form.rule() {
+                        Ok(rule) => rule,
+                        Err(error) => {
+                            self.notice = Some(Notice::error(error));
+                            return Task::none();
+                        }
+                    },
+                };
+                let expected_generation = match collection_generation(
+                    Path::new(&self.library_path),
+                    editor.collection_id,
+                ) {
+                    Ok(generation) => generation,
+                    Err(error) => {
+                        self.notice = Some(Notice::error(error));
+                        return Task::none();
+                    }
+                };
+                if let Some(editor) = &mut self.collection_editor {
+                    editor.expected_generation = expected_generation;
+                }
+                self.notice = None;
+                let key = self.begin_request(PathBuf::from(&self.library_path));
+                return edit_preview_task(key, request);
+            }
+            Message::CollectionEditPreviewed(completion) => {
+                if !self.finish_request(&completion.key) {
+                    return Task::none();
+                }
+                match completion.result {
+                    Ok(preview) => {
+                        let pages = preview.members.len();
+                        let missing = preview.missing_titles.len();
+                        if let Some(editor) = &mut self.collection_editor {
+                            editor.preview = Some(preview);
+                        }
+                        self.notice = Some(Notice::success(format!(
+                            "Edit preview complete: {pages} resolved page(s), {missing} missing title(s). No configuration has changed yet."
+                        )));
+                    }
+                    Err(error) => self.notice = Some(Notice::error(error)),
+                }
+            }
+            Message::SaveCollectionEdit => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let Some(editor) = &self.collection_editor else {
+                    return Task::none();
+                };
+                let Some(preview) = editor.preview.clone() else {
+                    self.notice = Some(Notice::error("Preview the complete edit before saving."));
+                    return Task::none();
+                };
+                let Some(configuration) = self.snapshot.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .collection_configurations
+                        .iter()
+                        .find(|configuration| configuration.collection_id == editor.collection_id)
+                }) else {
+                    self.notice = Some(Notice::error("Collection configuration is unavailable."));
+                    return Task::none();
+                };
+                let request = EditCollectionRequest {
+                    library_path: PathBuf::from(&self.library_path),
+                    collection_id: editor.collection_id,
+                    expected_generation: editor.expected_generation,
+                    wiki_id: configuration.wiki_id,
+                    name: editor.form.name.trim().to_owned(),
+                    preview,
+                    history_policy: match editor.form.history_policy() {
+                        Ok(value) => value,
+                        Err(error) => {
+                            self.notice = Some(Notice::error(error));
+                            return Task::none();
+                        }
+                    },
+                    budget: match editor.form.budget() {
+                        Ok(value) => value,
+                        Err(error) => {
+                            self.notice = Some(Notice::error(error));
+                            return Task::none();
+                        }
+                    },
+                    removal_policy: editor.form.removal_policy,
+                    schedule: match editor.form.schedule() {
+                        Ok(value) => value,
+                        Err(error) => {
+                            self.notice = Some(Notice::error(error));
+                            return Task::none();
+                        }
+                    },
+                };
+                self.notice = None;
+                let key = self.begin_request(request.library_path.clone());
+                return edit_collection_task(key, request);
+            }
+            Message::CollectionEditSaved(completion) => {
+                if !self.finish_request(&completion.key) {
+                    return Task::none();
+                }
+                match completion.result {
+                    Ok(snapshot) => {
+                        self.snapshot = Some(snapshot);
+                        self.collection_editor = None;
+                        self.notice = Some(Notice::success(
+                            "The previewed collection configuration and schedule were saved. Use Update to capture newly selected revisions.",
+                        ));
+                    }
+                    Err(error) => self.notice = Some(Notice::error(error)),
+                }
+            }
+            Message::PreviewRemoveCollection(collection_id) => {
+                if !self.is_busy() {
+                    self.collection_editor = None;
+                    self.schedule_editor = None;
+                    self.remove_confirmation = Some(collection_id);
+                }
+            }
+            Message::CancelRemoveCollection => {
+                if !self.is_busy() {
+                    self.remove_confirmation = None;
+                }
+            }
+            Message::ConfirmRemoveCollection => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let Some(collection_id) = self.remove_confirmation else {
+                    return Task::none();
+                };
+                self.notice = None;
+                let path = PathBuf::from(&self.library_path);
+                let key = self.begin_request(path.clone());
+                return remove_collection_task(key, path, collection_id);
+            }
+            Message::CollectionRemoved(completion) => {
+                if !self.finish_request(&completion.key) {
+                    return Task::none();
+                }
+                match completion.result {
+                    Ok(snapshot) => {
+                        self.snapshot = Some(snapshot);
+                        self.remove_confirmation = None;
+                        self.notice = Some(Notice::success(
+                            "Tracking stopped. Captured revisions, historical runs, manifests, and integrity evidence were retained; no article data was purged.",
                         ));
                     }
                     Err(error) => self.notice = Some(Notice::error(error)),
@@ -913,7 +1229,7 @@ impl App {
         .into()
     }
 
-    fn collections_view<'a>(&self, snapshot: &'a DashboardSnapshot) -> Element<'a, Message> {
+    fn collections_view<'a>(&'a self, snapshot: &'a DashboardSnapshot) -> Element<'a, Message> {
         let mut list = column![text("Collections").size(30)].spacing(10);
         if snapshot.collections.is_empty() {
             list = list.push(text("No collections yet. Create one below."));
@@ -925,6 +1241,35 @@ impl App {
                     .find(|schedule| schedule.collection_id == collection.collection_id);
                 list = list.push(collection_row(collection, schedule, !self.is_busy()));
             }
+        }
+
+        if let Some(editor) = &self.collection_editor {
+            list = list.push(collection_edit_view(editor, !self.is_busy()));
+        }
+
+        if let Some(collection_id) = self.remove_confirmation {
+            let name = snapshot
+                .collections
+                .iter()
+                .find(|collection| collection.collection_id == collection_id)
+                .map_or("this collection", |collection| collection.name.as_str());
+            list = list.push(
+                container(
+                    column![
+                        text(format!("Stop tracking {name}?")).size(20),
+                        text("This non-destructive removal tombstones the collection and stops future membership resolution and synchronization. Every captured revision, historical sync run, manifest, and integrity record is retained. It does not reclaim article storage."),
+                        row![
+                            button("Cancel").on_press(Message::CancelRemoveCollection),
+                            button("Confirm: stop tracking").on_press_maybe(
+                                (!self.is_busy()).then_some(Message::ConfirmRemoveCollection)
+                            ),
+                        ]
+                        .spacing(8),
+                    ]
+                    .spacing(9),
+                )
+                .padding(12),
+            );
         }
 
         if let Some(editor) = &self.schedule_editor {
@@ -1099,6 +1444,22 @@ impl App {
                     .on_input(Message::MaximumBytesChanged)
                     .padding(10),
             ].spacing(10),
+            text("When a dynamic rule no longer selects a page").size(17),
+            row![
+                removal_policy_button(
+                    "Stop tracking; retain captured history",
+                    CollectionRemovalPolicy::StopTrackingRetainHistory,
+                    self.collection_form.removal_policy,
+                    Message::CreateRemovalPolicyChanged,
+                ),
+                removal_policy_button(
+                    "Keep tracking",
+                    CollectionRemovalPolicy::KeepTracking,
+                    self.collection_form.removal_policy,
+                    Message::CreateRemovalPolicyChanged,
+                ),
+            ]
+            .spacing(8),
             text("Automatic synchronization schedule").size(17),
             schedule_buttons,
             text_input(
@@ -1118,7 +1479,7 @@ impl App {
                 self.collection_form.schedule_paused,
             )
             .on_toggle(Message::CreateSchedulePaused),
-            text("If a page leaves a category, WikiSyncer stops tracking it but retains every already captured revision."),
+            text("Stopping tracking never deletes already captured revisions. Keep tracking leaves departed dynamic members active until explicitly changed."),
             row![
                 button("Preview selection")
                     .on_press_maybe(preview_enabled.then_some(Message::PreviewCollection)),
@@ -1356,6 +1717,7 @@ enum Message {
     HistoryValueChanged(String),
     MaximumPagesChanged(String),
     MaximumBytesChanged(String),
+    CreateRemovalPolicyChanged(CollectionRemovalPolicy),
     CreateScheduleModeChanged(ScheduleMode),
     CreateScheduleValueChanged(String),
     CreateScheduleJitterChanged(String),
@@ -1366,6 +1728,29 @@ enum Message {
     CollectionCreated(ScopedResult<DashboardSnapshot>),
     UpdateCollection(CollectionId),
     CollectionUpdated(ScopedResult<DashboardSnapshot>),
+    EditCollection(CollectionId),
+    CancelCollectionEdit,
+    EditCollectionNameChanged(String),
+    EditSelectionModeChanged(SelectionMode),
+    EditSelectionChanged(String),
+    EditCategoryDepthChanged(String),
+    EditHistoryModeChanged(HistoryMode),
+    EditHistoryValueChanged(String),
+    EditMaximumPagesChanged(String),
+    EditMaximumBytesChanged(String),
+    EditRemovalPolicyChanged(CollectionRemovalPolicy),
+    EditCollectionScheduleModeChanged(ScheduleMode),
+    EditCollectionScheduleValueChanged(String),
+    EditCollectionScheduleJitterChanged(String),
+    EditCollectionSchedulePaused(bool),
+    PreviewCollectionEdit,
+    CollectionEditPreviewed(ScopedResult<CollectionSelectionPreview>),
+    SaveCollectionEdit,
+    CollectionEditSaved(ScopedResult<DashboardSnapshot>),
+    PreviewRemoveCollection(CollectionId),
+    CancelRemoveCollection,
+    ConfirmRemoveCollection,
+    CollectionRemoved(ScopedResult<DashboardSnapshot>),
     EditSchedule(CollectionId),
     EditScheduleModeChanged(ScheduleMode),
     EditScheduleValueChanged(String),
@@ -1417,7 +1802,9 @@ enum PathStatus {
 struct DashboardSnapshot {
     path: PathBuf,
     network_policy: NetworkTransferPolicy,
+    wikis: Vec<StoredWiki>,
     collections: Vec<StoredCollection>,
+    collection_configurations: Vec<StoredCollectionConfiguration>,
     schedules: Vec<CollectionSchedule>,
     runs: Vec<SyncRunStatus>,
     checkpoints: Vec<SyncCheckpoint>,
@@ -1508,6 +1895,7 @@ struct CollectionForm {
     history_value: String,
     maximum_pages: String,
     maximum_bytes: String,
+    removal_policy: CollectionRemovalPolicy,
     schedule_mode: ScheduleMode,
     schedule_value: String,
     schedule_jitter_minutes: String,
@@ -1527,6 +1915,7 @@ impl Default for CollectionForm {
             history_value: String::new(),
             maximum_pages: "10000".to_owned(),
             maximum_bytes: String::new(),
+            removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
             schedule_mode: ScheduleMode::Manual,
             schedule_value: String::new(),
             schedule_jitter_minutes: "0".to_owned(),
@@ -1535,7 +1924,90 @@ impl Default for CollectionForm {
     }
 }
 
+#[derive(Clone, Debug)]
+struct CollectionEditor {
+    collection_id: CollectionId,
+    expected_generation: u64,
+    form: CollectionForm,
+    preview: Option<CollectionSelectionPreview>,
+}
+
 impl CollectionForm {
+    fn from_configuration(
+        configuration: &StoredCollectionConfiguration,
+        wiki: &StoredWiki,
+        schedule: Option<CollectionSchedule>,
+    ) -> Self {
+        let (selection_mode, selection, category_depth) = match &configuration.rule {
+            CollectionRule::ExplicitTitles(titles) => (
+                SelectionMode::Titles,
+                titles
+                    .iter()
+                    .map(PageTitle::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                "0".to_owned(),
+            ),
+            CollectionRule::TitleList(titles) => (
+                SelectionMode::TitleList,
+                titles
+                    .iter()
+                    .map(PageTitle::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                "0".to_owned(),
+            ),
+            CollectionRule::Category {
+                title,
+                recursion_depth,
+            } => (
+                SelectionMode::Category,
+                title.as_str().to_owned(),
+                recursion_depth.to_string(),
+            ),
+        };
+        let (history_mode, history_value) = match configuration.history_policy {
+            HistoryPolicy::CurrentAndFuture => (HistoryMode::CurrentAndFuture, String::new()),
+            HistoryPolicy::LastN(count) => (HistoryMode::LastN, count.get().to_string()),
+            HistoryPolicy::Since(timestamp) => {
+                (HistoryMode::Since, timestamp.as_seconds().to_string())
+            }
+            HistoryPolicy::Complete => (HistoryMode::Complete, String::new()),
+        };
+        let schedule = schedule.unwrap_or(CollectionSchedule {
+            collection_id: configuration.collection_id,
+            cadence: ScheduleCadence::Manual,
+            jitter_seconds: 0,
+            paused: false,
+            next_run_at: None,
+            last_started_at: None,
+        });
+        let schedule_editor = ScheduleEditor::from_schedule(configuration.collection_id, schedule);
+        Self {
+            name: configuration.name.clone(),
+            language_code: wiki.language_code.clone(),
+            api_endpoint: wiki.api_endpoint.clone(),
+            selection_mode,
+            selection,
+            category_depth,
+            history_mode,
+            history_value,
+            maximum_pages: configuration
+                .budget
+                .maximum_pages()
+                .map_or_else(String::new, |value| value.get().to_string()),
+            maximum_bytes: configuration
+                .budget
+                .maximum_bytes()
+                .map_or_else(String::new, |value| value.get().to_string()),
+            removal_policy: configuration.removal_policy,
+            schedule_mode: schedule_editor.mode,
+            schedule_value: schedule_editor.value,
+            schedule_jitter_minutes: schedule_editor.jitter_minutes,
+            schedule_paused: schedule_editor.paused,
+        }
+    }
+
     fn rule(&self) -> Result<CollectionRule, String> {
         match self.selection_mode {
             SelectionMode::Titles => parse_title_list(&self.selection, 10_000)
@@ -1702,6 +2174,21 @@ struct CreateCollectionRequest {
     preview: CollectionSelectionPreview,
     history_policy: HistoryPolicy,
     budget: CollectionBudget,
+    removal_policy: CollectionRemovalPolicy,
+    schedule: ScheduleSettings,
+}
+
+#[derive(Clone, Debug)]
+struct EditCollectionRequest {
+    library_path: PathBuf,
+    collection_id: CollectionId,
+    expected_generation: u64,
+    wiki_id: WikiId,
+    name: String,
+    preview: CollectionSelectionPreview,
+    history_policy: HistoryPolicy,
+    budget: CollectionBudget,
+    removal_policy: CollectionRemovalPolicy,
     schedule: ScheduleSettings,
 }
 
@@ -1791,6 +2278,40 @@ fn preview_task(key: RequestKey, request: PreviewCollectionRequest) -> Task<Mess
             ScopedResult { key, result }
         },
         Message::CollectionPreviewed,
+    )
+}
+
+fn edit_preview_task(key: RequestKey, request: PreviewCollectionRequest) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = preview_collection(request).await;
+            ScopedResult { key, result }
+        },
+        Message::CollectionEditPreviewed,
+    )
+}
+
+fn edit_collection_task(key: RequestKey, request: EditCollectionRequest) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = edit_collection(request).await;
+            ScopedResult { key, result }
+        },
+        Message::CollectionEditSaved,
+    )
+}
+
+fn remove_collection_task(
+    key: RequestKey,
+    path: PathBuf,
+    collection_id: CollectionId,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = remove_collection(path, collection_id).await;
+            ScopedResult { key, result }
+        },
+        Message::CollectionRemoved,
     )
 }
 
@@ -1945,7 +2466,12 @@ fn load_library_snapshot(path: &Path, create: bool) -> Result<DashboardSnapshot,
     } else {
         None
     };
-    let library = Library::open(path).map_err(|error| error.to_string())?;
+    let library = if create {
+        Library::open(path)
+    } else {
+        Library::open_read_only(path)
+    }
+    .map_err(|error| error.to_string())?;
     snapshot(&library)
 }
 
@@ -1974,67 +2500,287 @@ async fn create_collection_and_sync(
     {
         return Err("Collection name, language code, and API endpoint are required.".to_owned());
     }
-    let _writer_lease = match WriterAccess::discover(&request.library_path)
-        .map_err(|error| error.to_string())?
-    {
-        WriterAccess::Direct(lease) => lease,
-        WriterAccess::Daemon(_) => {
-            return Err(
-                "The daemon owns this library. Creating collections is not yet supported by the daemon contract; stop it cooperatively and retry."
-                    .to_owned(),
-            );
+    match WriterAccess::discover(&request.library_path).map_err(|error| error.to_string())? {
+        WriterAccess::Direct(_lease) => {
+            let mut library =
+                Library::open(&request.library_path).map_err(|error| error.to_string())?;
+            let network_policy = library
+                .network_transfer_policy()
+                .map_err(|error| error.to_string())?;
+            enforce_metered_policy(network_policy)?;
+            let client_config = configured_client(&request.api_endpoint, network_policy)?;
+            let source_outcome = administer_source_direct(
+                &mut library,
+                SourceAdministration::Add {
+                    api_endpoint: client_config.endpoint().as_str().to_owned(),
+                    language_code: request.language_code.clone(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            let (wiki_id, source_created) = added_source(source_outcome)?;
+            let draft = create_draft(request, wiki_id);
+            let outcome =
+                administer_collection_direct(&mut library, CollectionAdministration::Add(draft))
+                    .map_err(|error| {
+                        collection_add_error(&error, source_created.then_some(wiki_id))
+                    })?;
+            let collection_id = added_collection_id(outcome)?;
+            set_schedule_direct(&mut library, collection_id, request.schedule)?;
+            let client = wikisync_mediawiki::MediaWikiClient::new(client_config)
+                .map_err(|error| error.to_string())?;
+            bootstrap_collection(&client, &mut library, collection_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            snapshot(&library)
         }
-    };
-    let mut library = Library::open(&request.library_path).map_err(|error| error.to_string())?;
-    let network_policy = library
-        .network_transfer_policy()
-        .map_err(|error| error.to_string())?;
-    enforce_metered_policy(network_policy)?;
-    let client_config = configured_client(&request.api_endpoint, network_policy)?;
-    let wiki_id = library
-        .register_wiki(client_config.endpoint().as_str(), &request.language_code)
-        .map_err(|error| error.to_string())?;
-    let collection_id = library
-        .create_collection(
-            wiki_id,
-            &request.name,
-            &request.preview.rule,
-            request.history_policy,
-            request.budget,
-            CollectionRemovalPolicy::StopTrackingRetainHistory,
-        )
-        .map_err(|error| error.to_string())?;
-    commit_collection_preview(
-        &mut library,
-        collection_id,
-        &request.preview,
-        request.history_policy,
-        request.budget,
-        CollectionRemovalPolicy::StopTrackingRetainHistory,
-    )
-    .map_err(|error| error.to_string())?;
-    let now = unix_time_seconds()?;
+        WriterAccess::Daemon(client) => {
+            let library = Library::open_read_only(&request.library_path)
+                .map_err(|error| error.to_string())?;
+            let endpoint = configured_client(
+                &request.api_endpoint,
+                library
+                    .network_transfer_policy()
+                    .map_err(|error| error.to_string())?,
+            )?
+            .endpoint()
+            .as_str()
+            .to_owned();
+            let existing_wiki_id = library
+                .wikis()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|wiki| {
+                    wiki.api_endpoint == endpoint && wiki.language_code == request.language_code
+                })
+                .map(|wiki| wiki.wiki_id);
+            drop(library);
+            let (wiki_id, source_created) = if let Some(wiki_id) = existing_wiki_id {
+                (wiki_id, false)
+            } else {
+                let outcome = client
+                    .administer_source(SourceAdministration::Add {
+                        api_endpoint: endpoint,
+                        language_code: request.language_code.clone(),
+                    })
+                    .map_err(|error| error.to_string())?;
+                added_source(outcome)?
+            };
+            let outcome = client
+                .administer_collection(CollectionAdministration::Add(create_draft(
+                    request, wiki_id,
+                )))
+                .map_err(|error| collection_add_error(&error, source_created.then_some(wiki_id)))?;
+            let collection_id = added_collection_id(outcome)?;
+            client
+                .forward_mutation(set_collection_schedule_mutation(
+                    collection_id.get(),
+                    request.schedule.cadence,
+                    request.schedule.jitter_seconds,
+                    request.schedule.paused,
+                ))
+                .map_err(|error| {
+                    format!(
+                        "Collection {collection_id} was created, but its schedule could not be saved: {error}"
+                    )
+                })?;
+            client
+                .forward_mutation(Mutation::SyncCollection(collection_id.get()))
+                .map_err(|error| {
+                    format!(
+                        "Collection {collection_id} was created and scheduled, but its first synchronization did not complete: {error}"
+                    )
+                })?;
+            let library = Library::open_read_only(&request.library_path)
+                .map_err(|error| error.to_string())?;
+            snapshot(&library)
+        }
+    }
+}
+
+fn added_source(outcome: SourceAdministrationOutcome) -> Result<(WikiId, bool), String> {
+    match outcome {
+        SourceAdministrationOutcome::Added {
+            wiki_id, created, ..
+        } => Ok((wiki_id, created)),
+        SourceAdministrationOutcome::Removed { .. } => {
+            Err("Source administration returned an unexpected result.".to_owned())
+        }
+    }
+}
+
+fn collection_add_error(
+    error: &impl std::fmt::Display,
+    newly_registered_source: Option<WikiId>,
+) -> String {
+    let detail = error.to_string();
+    match newly_registered_source {
+        Some(wiki_id) => format!(
+            "Source wiki {wiki_id} was registered successfully, but collection creation failed: {detail} The source remains configured and can be reused."
+        ),
+        None => detail,
+    }
+}
+
+fn create_draft(request: &CreateCollectionRequest, wiki_id: WikiId) -> CollectionDraft {
+    CollectionDraft {
+        wiki_id,
+        name: request.name.clone(),
+        preview: request.preview.clone(),
+        history_policy: request.history_policy,
+        budget: request.budget,
+        removal_policy: request.removal_policy,
+    }
+}
+
+fn added_collection_id(outcome: CollectionAdministrationOutcome) -> Result<CollectionId, String> {
+    match outcome {
+        CollectionAdministrationOutcome::Added { collection_id, .. } => Ok(collection_id),
+        _ => Err("Collection administration returned an unexpected result.".to_owned()),
+    }
+}
+
+fn set_schedule_direct(
+    library: &mut Library,
+    collection_id: CollectionId,
+    schedule: ScheduleSettings,
+) -> Result<(), String> {
     let next_run_at = next_occurrence_after(
-        request.schedule.cadence,
+        schedule.cadence,
         collection_id.get(),
-        request.schedule.jitter_seconds,
-        now,
+        schedule.jitter_seconds,
+        unix_time_seconds()?,
     );
     library
         .set_collection_schedule(
             collection_id,
-            request.schedule.cadence,
-            request.schedule.jitter_seconds,
-            request.schedule.paused,
+            schedule.cadence,
+            schedule.jitter_seconds,
+            schedule.paused,
             next_run_at,
         )
-        .map_err(|error| error.to_string())?;
-    let client = wikisync_mediawiki::MediaWikiClient::new(client_config)
-        .map_err(|error| error.to_string())?;
-    bootstrap_collection(&client, &mut library, collection_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    snapshot(&library)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+async fn edit_collection(request: EditCollectionRequest) -> Result<DashboardSnapshot, String> {
+    if request.name.is_empty() {
+        return Err("Collection name is required.".to_owned());
+    }
+    let draft = CollectionDraft {
+        wiki_id: request.wiki_id,
+        name: request.name,
+        preview: request.preview,
+        history_policy: request.history_policy,
+        budget: request.budget,
+        removal_policy: request.removal_policy,
+    };
+    match WriterAccess::discover(&request.library_path).map_err(|error| error.to_string())? {
+        WriterAccess::Direct(_lease) => {
+            let mut library =
+                Library::open(&request.library_path).map_err(|error| error.to_string())?;
+            let outcome = administer_collection_direct(
+                &mut library,
+                CollectionAdministration::Edit {
+                    collection_id: request.collection_id,
+                    expected_generation: request.expected_generation,
+                    draft,
+                },
+            )
+            .map_err(|error| collection_edit_error(&error))?;
+            ensure_edited_outcome(outcome, request.collection_id)?;
+            set_schedule_direct(&mut library, request.collection_id, request.schedule)?;
+            snapshot(&library)
+        }
+        WriterAccess::Daemon(client) => {
+            let outcome = client
+                .administer_collection(CollectionAdministration::Edit {
+                    collection_id: request.collection_id,
+                    expected_generation: request.expected_generation,
+                    draft,
+                })
+                .map_err(|error| collection_edit_error(&error))?;
+            ensure_edited_outcome(outcome, request.collection_id)?;
+            client
+                .forward_mutation(set_collection_schedule_mutation(
+                    request.collection_id.get(),
+                    request.schedule.cadence,
+                    request.schedule.jitter_seconds,
+                    request.schedule.paused,
+                ))
+                .map_err(|error| {
+                    format!(
+                        "Collection {} was edited, but its schedule could not be saved: {error}",
+                        request.collection_id
+                    )
+                })?;
+            let library = Library::open_read_only(&request.library_path)
+                .map_err(|error| error.to_string())?;
+            snapshot(&library)
+        }
+    }
+}
+
+fn collection_edit_error(error: &impl std::fmt::Display) -> String {
+    let detail = error.to_string();
+    if detail.contains("changed while it was being previewed")
+        || detail.contains("stale collection generation")
+    {
+        format!(
+            "The collection changed after this edit was loaded, so the stale preview was not applied. Reload the collection, preview it again, and then save. Details: {detail}"
+        )
+    } else {
+        detail
+    }
+}
+
+fn ensure_edited_outcome(
+    outcome: CollectionAdministrationOutcome,
+    expected: CollectionId,
+) -> Result<(), String> {
+    match outcome {
+        CollectionAdministrationOutcome::Edited { collection_id, .. }
+            if collection_id == expected =>
+        {
+            Ok(())
+        }
+        _ => Err("Collection administration returned an unexpected result.".to_owned()),
+    }
+}
+
+async fn remove_collection(
+    path: PathBuf,
+    collection_id: CollectionId,
+) -> Result<DashboardSnapshot, String> {
+    let administration = CollectionAdministration::Remove { collection_id };
+    match WriterAccess::discover(&path).map_err(|error| error.to_string())? {
+        WriterAccess::Direct(_lease) => {
+            let mut library = Library::open(&path).map_err(|error| error.to_string())?;
+            let outcome = administer_collection_direct(&mut library, administration)
+                .map_err(|error| error.to_string())?;
+            ensure_removed_outcome(outcome, collection_id)?;
+            snapshot(&library)
+        }
+        WriterAccess::Daemon(client) => {
+            let outcome = client
+                .administer_collection(administration)
+                .map_err(|error| error.to_string())?;
+            ensure_removed_outcome(outcome, collection_id)?;
+            let library = Library::open_read_only(&path).map_err(|error| error.to_string())?;
+            snapshot(&library)
+        }
+    }
+}
+
+fn ensure_removed_outcome(
+    outcome: CollectionAdministrationOutcome,
+    expected: CollectionId,
+) -> Result<(), String> {
+    match outcome {
+        CollectionAdministrationOutcome::Removed { collection_id } if collection_id == expected => {
+            Ok(())
+        }
+        _ => Err("Collection administration returned an unexpected result.".to_owned()),
+    }
 }
 
 async fn update_collection(
@@ -2047,7 +2793,7 @@ async fn update_collection(
             client
                 .forward_mutation(Mutation::SyncCollection(collection_id.get()))
                 .map_err(|error| error.to_string())?;
-            let library = Library::open(&path).map_err(|error| error.to_string())?;
+            let library = Library::open_read_only(&path).map_err(|error| error.to_string())?;
             return snapshot(&library);
         }
     };
@@ -2118,7 +2864,7 @@ async fn save_collection_schedule(
                 .map_err(|error| error.to_string())?;
         }
     }
-    let library = Library::open(&path).map_err(|error| error.to_string())?;
+    let library = Library::open_read_only(&path).map_err(|error| error.to_string())?;
     snapshot(&library)
 }
 
@@ -2139,7 +2885,7 @@ async fn save_network_transfer_policy(
                 .map_err(|error| error.to_string())?;
         }
     }
-    let library = Library::open(&path).map_err(|error| error.to_string())?;
+    let library = Library::open_read_only(&path).map_err(|error| error.to_string())?;
     snapshot(&library)
 }
 
@@ -2484,6 +3230,18 @@ fn snapshot(library: &Library) -> Result<DashboardSnapshot, String> {
         .network_transfer_policy()
         .map_err(|error| error.to_string())?;
     let collections = library.collections().map_err(|error| error.to_string())?;
+    let wikis = library.wikis().map_err(|error| error.to_string())?;
+    let collection_configurations = collections
+        .iter()
+        .map(|collection| {
+            library
+                .collection_configuration(collection.collection_id)
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<Option<StoredCollectionConfiguration>>, String>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     let schedules = library.schedules().map_err(|error| error.to_string())?;
     let mut unique_pages = BTreeSet::new();
     for collection in &collections {
@@ -2533,7 +3291,9 @@ fn snapshot(library: &Library) -> Result<DashboardSnapshot, String> {
     Ok(DashboardSnapshot {
         path: library.root().to_path_buf(),
         network_policy,
+        wikis,
         collections,
+        collection_configurations,
         schedules,
         runs,
         checkpoints,
@@ -2545,6 +3305,15 @@ fn snapshot(library: &Library) -> Result<DashboardSnapshot, String> {
             .schema_version()
             .map_err(|error| error.to_string())?,
     })
+}
+
+fn collection_generation(path: &Path, collection_id: CollectionId) -> Result<u64, String> {
+    let library = Library::open_read_only(path).map_err(|error| error.to_string())?;
+    library
+        .collection_configuration(collection_id)
+        .map_err(|error| error.to_string())?
+        .map(|configuration| configuration.generation)
+        .ok_or_else(|| "Collection configuration is unavailable; refresh the library.".to_owned())
 }
 
 fn directory_usage(root: &Path) -> std::io::Result<(u64, u64)> {
@@ -2600,6 +3369,20 @@ fn mode_button(
         .into()
 }
 
+fn mode_button_with(
+    label: &str,
+    mode: SelectionMode,
+    selected: SelectionMode,
+    message: fn(SelectionMode) -> Message,
+) -> Element<'static, Message> {
+    let label = if mode == selected {
+        format!("• {label}")
+    } else {
+        label.to_owned()
+    };
+    button(text(label)).on_press(message(mode)).into()
+}
+
 fn history_button(
     label: &str,
     mode: HistoryMode,
@@ -2613,6 +3396,34 @@ fn history_button(
     button(text(label))
         .on_press(Message::HistoryModeChanged(mode))
         .into()
+}
+
+fn history_button_with(
+    label: &str,
+    mode: HistoryMode,
+    selected: HistoryMode,
+    message: fn(HistoryMode) -> Message,
+) -> Element<'static, Message> {
+    let label = if mode == selected {
+        format!("• {label}")
+    } else {
+        label.to_owned()
+    };
+    button(text(label)).on_press(message(mode)).into()
+}
+
+fn removal_policy_button(
+    label: &str,
+    policy: CollectionRemovalPolicy,
+    selected: CollectionRemovalPolicy,
+    message: fn(CollectionRemovalPolicy) -> Message,
+) -> Element<'static, Message> {
+    let label = if policy == selected {
+        format!("• {label}")
+    } else {
+        label.to_owned()
+    };
+    button(text(label)).on_press(message(policy)).into()
 }
 
 fn schedule_button(
@@ -2752,6 +3563,174 @@ fn verification_report_view(report: &VerificationReport) -> Element<'_, Message>
     content.into()
 }
 
+fn collection_edit_view<'a>(editor: &'a CollectionEditor, enabled: bool) -> Element<'a, Message> {
+    let form = &editor.form;
+    let selection_hint = match form.selection_mode {
+        SelectionMode::Titles => "One page title per line",
+        SelectionMode::TitleList => "Paste a newline-delimited title list",
+        SelectionMode::Category => "Category:Name",
+    };
+    let preview_summary = editor.preview.as_ref().map_or_else(
+        || "A fresh full preview is required; no edit has been committed.".to_owned(),
+        |preview| {
+            let bytes = preview.predicted_canonical_bytes.map_or_else(
+                || "source bytes unknown until capture".to_owned(),
+                format_bytes,
+            );
+            format!(
+                "Complete replacement preview: {} pages, {} missing titles, {bytes}.",
+                preview.members.len(),
+                preview.missing_titles.len()
+            )
+        },
+    );
+    container(
+        column![
+            text(format!("Edit collection {}", editor.collection_id)).size(22),
+            text(format!(
+                "Source is fixed for this collection: {} ({})",
+                form.language_code, form.api_endpoint
+            )),
+            text_input("Collection name", &form.name)
+                .on_input(Message::EditCollectionNameChanged)
+                .padding(10),
+            row![
+                mode_button_with(
+                    "Page titles",
+                    SelectionMode::Titles,
+                    form.selection_mode,
+                    Message::EditSelectionModeChanged,
+                ),
+                mode_button_with(
+                    "Title-list import",
+                    SelectionMode::TitleList,
+                    form.selection_mode,
+                    Message::EditSelectionModeChanged,
+                ),
+                mode_button_with(
+                    "Category",
+                    SelectionMode::Category,
+                    form.selection_mode,
+                    Message::EditSelectionModeChanged,
+                ),
+            ]
+            .spacing(8),
+            text_input(selection_hint, &form.selection)
+                .on_input(Message::EditSelectionChanged)
+                .padding(10),
+            text_input("Category recursion depth (0–16)", &form.category_depth)
+                .on_input(Message::EditCategoryDepthChanged)
+                .padding(10),
+            text("History retention").size(17),
+            row![
+                history_button_with(
+                    "Current + future",
+                    HistoryMode::CurrentAndFuture,
+                    form.history_mode,
+                    Message::EditHistoryModeChanged,
+                ),
+                history_button_with(
+                    "Last N",
+                    HistoryMode::LastN,
+                    form.history_mode,
+                    Message::EditHistoryModeChanged,
+                ),
+                history_button_with(
+                    "Since",
+                    HistoryMode::Since,
+                    form.history_mode,
+                    Message::EditHistoryModeChanged,
+                ),
+                history_button_with(
+                    "Complete",
+                    HistoryMode::Complete,
+                    form.history_mode,
+                    Message::EditHistoryModeChanged,
+                ),
+            ]
+            .spacing(8),
+            text_input("Last-N count or Since Unix timestamp", &form.history_value)
+                .on_input(Message::EditHistoryValueChanged)
+                .padding(10),
+            row![
+                text_input("Hard maximum pages (blank = unlimited)", &form.maximum_pages)
+                    .on_input(Message::EditMaximumPagesChanged)
+                    .padding(10),
+                text_input("Hard maximum canonical bytes (blank = unlimited)", &form.maximum_bytes)
+                    .on_input(Message::EditMaximumBytesChanged)
+                    .padding(10),
+            ]
+            .spacing(8),
+            text("When a dynamic rule no longer selects a page").size(17),
+            row![
+                removal_policy_button(
+                    "Stop tracking; retain captured history",
+                    CollectionRemovalPolicy::StopTrackingRetainHistory,
+                    form.removal_policy,
+                    Message::EditRemovalPolicyChanged,
+                ),
+                removal_policy_button(
+                    "Keep tracking",
+                    CollectionRemovalPolicy::KeepTracking,
+                    form.removal_policy,
+                    Message::EditRemovalPolicyChanged,
+                ),
+            ]
+            .spacing(8),
+            text("Automatic synchronization schedule").size(17),
+            row![
+                schedule_button(
+                    "Manual",
+                    ScheduleMode::Manual,
+                    form.schedule_mode,
+                    Message::EditCollectionScheduleModeChanged,
+                ),
+                schedule_button(
+                    "Interval",
+                    ScheduleMode::Interval,
+                    form.schedule_mode,
+                    Message::EditCollectionScheduleModeChanged,
+                ),
+                schedule_button(
+                    "Daily UTC",
+                    ScheduleMode::DailyUtc,
+                    form.schedule_mode,
+                    Message::EditCollectionScheduleModeChanged,
+                ),
+            ]
+            .spacing(8),
+            text_input(
+                schedule_value_hint(form.schedule_mode),
+                &form.schedule_value,
+            )
+            .on_input(Message::EditCollectionScheduleValueChanged)
+            .padding(10),
+            text_input(
+                "Maximum jitter in minutes",
+                &form.schedule_jitter_minutes,
+            )
+            .on_input(Message::EditCollectionScheduleJitterChanged)
+            .padding(10),
+            checkbox("Pause automatic synchronization", form.schedule_paused)
+                .on_toggle(Message::EditCollectionSchedulePaused),
+            text("If scope changes, absent members follow the selected removal policy. Already captured revisions are retained in either mode."),
+            text(preview_summary),
+            row![
+                button("Cancel").on_press(Message::CancelCollectionEdit),
+                button("Preview complete edit")
+                    .on_press_maybe(enabled.then_some(Message::PreviewCollectionEdit)),
+                button("Save previewed edit").on_press_maybe(
+                    (enabled && editor.preview.is_some()).then_some(Message::SaveCollectionEdit)
+                ),
+            ]
+            .spacing(8),
+        ]
+        .spacing(9),
+    )
+    .padding(12)
+    .into()
+}
+
 fn collection_row<'a>(
     collection: &'a StoredCollection,
     schedule: Option<&CollectionSchedule>,
@@ -2796,8 +3775,14 @@ fn collection_row<'a>(
         button("Update").on_press_maybe(
             update_enabled.then_some(Message::UpdateCollection(collection.collection_id))
         ),
+        button("Edit").on_press_maybe(
+            update_enabled.then_some(Message::EditCollection(collection.collection_id))
+        ),
         button("Schedule").on_press_maybe(
             update_enabled.then_some(Message::EditSchedule(collection.collection_id))
+        ),
+        button("Stop tracking").on_press_maybe(
+            update_enabled.then_some(Message::PreviewRemoveCollection(collection.collection_id))
         ),
     ])
     .padding(12)
@@ -2973,7 +3958,7 @@ mod tests {
 
         let created = load_library_snapshot(&root, true).expect("create library");
         assert_eq!(created.path, root);
-        assert_eq!(created.schema_version, 9);
+        assert_eq!(created.schema_version, 10);
         assert!(root.join(DATABASE_NAME).is_file());
 
         let reopened = load_library_snapshot(&root, false).expect("reopen library");
@@ -3038,6 +4023,278 @@ mod tests {
             avoid_metered_networks: true,
         };
         assert!(invalid.policy().is_err());
+    }
+
+    fn administration_preview(title: &str, page_id: u64) -> CollectionSelectionPreview {
+        let title = PageTitle::new(title).expect("title");
+        CollectionSelectionPreview {
+            rule: CollectionRule::ExplicitTitles(
+                wikisync_core::TitleSelection::new([title.clone()]).expect("selection"),
+            ),
+            members: vec![wikisync_store::ResolvedCollectionMember {
+                page_id: PageId::new(page_id).expect("page ID"),
+                namespace: 0,
+                title: title.clone(),
+                inclusion_reason: wikisync_core::InclusionReason::ExplicitTitle(title),
+            }],
+            missing_titles: Vec::new(),
+            predicted_canonical_bytes: Some(1_024),
+            category_batches: 0,
+        }
+    }
+
+    fn seeded_admin_collection(path: &Path) -> (WikiId, CollectionId) {
+        let mut library = Library::open(path).expect("library");
+        let wiki_id = library
+            .register_wiki("https://example.invalid/w/api.php", "en")
+            .expect("source");
+        let outcome = administer_collection_direct(
+            &mut library,
+            CollectionAdministration::Add(CollectionDraft {
+                wiki_id,
+                name: "Original".to_owned(),
+                preview: administration_preview("Rust", 10),
+                history_policy: HistoryPolicy::CurrentAndFuture,
+                budget: CollectionBudget::unlimited(),
+                removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            }),
+        )
+        .expect("seed collection");
+        (
+            wiki_id,
+            added_collection_id(outcome).expect("added outcome"),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn collection_edit_and_removal_match_direct_and_daemon_paths() {
+        let direct_root = tempfile::tempdir().expect("direct library");
+        let daemon_root = tempfile::tempdir().expect("daemon library");
+        let (direct_wiki, direct_id) = seeded_admin_collection(direct_root.path());
+        let (daemon_wiki, daemon_id) = seeded_admin_collection(daemon_root.path());
+        assert_eq!(direct_wiki, daemon_wiki);
+        assert_eq!(direct_id, daemon_id);
+
+        let handler =
+            wikisyncd::ApplicationHandler::new(daemon_root.path()).expect("application handler");
+        let daemon = wikisyncd::Daemon::bind(daemon_root.path(), handler).expect("daemon");
+        let shutdown = daemon.shutdown_handle();
+        let daemon_thread = thread::spawn(move || daemon.run());
+        let daemon_client =
+            wikisyncd::Client::for_library(daemon_root.path()).expect("daemon client");
+        daemon_client.health().expect("daemon readiness");
+
+        let edit = |path: &Path, collection_id, wiki_id| EditCollectionRequest {
+            library_path: path.to_path_buf(),
+            collection_id,
+            expected_generation: 1,
+            wiki_id,
+            name: "Edited".to_owned(),
+            preview: administration_preview("Ferris", 20),
+            history_policy: HistoryPolicy::Complete,
+            budget: CollectionBudget::unlimited()
+                .with_maximum_pages(50)
+                .expect("page budget"),
+            removal_policy: CollectionRemovalPolicy::KeepTracking,
+            schedule: ScheduleSettings {
+                cadence: ScheduleCadence::interval(7_200).expect("interval"),
+                jitter_seconds: 300,
+                paused: true,
+            },
+        };
+        edit_collection(edit(direct_root.path(), direct_id, direct_wiki))
+            .await
+            .expect("direct edit");
+        edit_collection(edit(daemon_root.path(), daemon_id, daemon_wiki))
+            .await
+            .expect("daemon edit");
+
+        for root in [direct_root.path(), daemon_root.path()] {
+            let library = Library::open_read_only(root).expect("inspect library");
+            let configuration = library
+                .collection_configuration(direct_id)
+                .expect("configuration")
+                .expect("configured");
+            assert_eq!(configuration.name, "Edited");
+            assert_eq!(configuration.history_policy, HistoryPolicy::Complete);
+            assert_eq!(
+                configuration.removal_policy,
+                CollectionRemovalPolicy::KeepTracking
+            );
+            let members = library
+                .resolved_collection_members(direct_id)
+                .expect("members");
+            assert_eq!(members.len(), 2);
+            assert!(members.iter().any(|member| member.title.as_str() == "Rust"));
+            assert!(
+                members
+                    .iter()
+                    .any(|member| member.title.as_str() == "Ferris")
+            );
+            let schedule = library
+                .collection_schedule(direct_id)
+                .expect("schedule")
+                .expect("scheduled");
+            assert!(schedule.paused);
+            assert!(matches!(schedule.cadence, ScheduleCadence::Interval(_)));
+        }
+
+        remove_collection(direct_root.path().to_path_buf(), direct_id)
+            .await
+            .expect("direct removal");
+        remove_collection(daemon_root.path().to_path_buf(), daemon_id)
+            .await
+            .expect("daemon removal");
+        for root in [direct_root.path(), daemon_root.path()] {
+            let library = Library::open_read_only(root).expect("inspect tombstone");
+            assert!(
+                library
+                    .collections()
+                    .expect("active collections")
+                    .is_empty()
+            );
+            let retained = library
+                .collections_including_tombstones()
+                .expect("retained collections");
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained[0].status.as_str(), "tombstoned");
+        }
+
+        shutdown.shutdown();
+        daemon_thread
+            .join()
+            .expect("daemon thread")
+            .expect("daemon shutdown");
+    }
+
+    #[tokio::test]
+    async fn stale_gui_edit_is_rejected_with_reload_and_repreview_guidance() {
+        let temporary = tempfile::tempdir().expect("library");
+        let (wiki_id, collection_id) = seeded_admin_collection(temporary.path());
+        let stale_request = EditCollectionRequest {
+            library_path: temporary.path().to_path_buf(),
+            collection_id,
+            expected_generation: 1,
+            wiki_id,
+            name: "Stale GUI edit".to_owned(),
+            preview: administration_preview("Ferris", 20),
+            history_policy: HistoryPolicy::Complete,
+            budget: CollectionBudget::unlimited(),
+            removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            schedule: ScheduleSettings {
+                cadence: ScheduleCadence::Manual,
+                jitter_seconds: 0,
+                paused: false,
+            },
+        };
+        let mut library = Library::open(temporary.path()).expect("concurrent writer");
+        administer_collection_direct(
+            &mut library,
+            CollectionAdministration::Edit {
+                collection_id,
+                expected_generation: 1,
+                draft: CollectionDraft {
+                    wiki_id,
+                    name: "Concurrent edit".to_owned(),
+                    preview: administration_preview("Rust", 10),
+                    history_policy: HistoryPolicy::CurrentAndFuture,
+                    budget: CollectionBudget::unlimited(),
+                    removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+                },
+            },
+        )
+        .expect("concurrent edit");
+        drop(library);
+
+        let error = edit_collection(stale_request)
+            .await
+            .expect_err("stale preview must fail");
+        assert!(error.contains("Reload the collection"));
+        assert!(error.contains("preview it again"));
+        let library = Library::open_read_only(temporary.path()).expect("inspect library");
+        let configuration = library
+            .collection_configuration(collection_id)
+            .expect("configuration")
+            .expect("configured");
+        assert_eq!(configuration.name, "Concurrent edit");
+        assert_eq!(configuration.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn direct_create_reports_registered_source_when_collection_commit_fails() {
+        let temporary = tempfile::tempdir().expect("library");
+        Library::open(temporary.path()).expect("initialize library");
+        let error = create_collection_and_sync(&CreateCollectionRequest {
+            library_path: temporary.path().to_path_buf(),
+            name: "Over budget".to_owned(),
+            language_code: "en".to_owned(),
+            api_endpoint: "https://example.invalid/w/api.php".to_owned(),
+            preview: administration_preview("Rust", 10),
+            history_policy: HistoryPolicy::CurrentAndFuture,
+            budget: CollectionBudget::unlimited()
+                .with_maximum_bytes(1)
+                .expect("byte budget"),
+            removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            schedule: ScheduleSettings {
+                cadence: ScheduleCadence::Manual,
+                jitter_seconds: 0,
+                paused: false,
+            },
+        })
+        .await
+        .expect_err("collection must exceed budget");
+        assert!(error.contains("was registered successfully"));
+        assert!(error.contains("remains configured and can be reused"));
+        let library = Library::open_read_only(temporary.path()).expect("inspect library");
+        assert_eq!(library.wikis().expect("sources").len(), 1);
+        assert!(library.collections().expect("collections").is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_create_reports_registered_source_when_collection_commit_fails() {
+        let temporary = tempfile::tempdir().expect("library");
+        Library::open(temporary.path()).expect("initialize library");
+        let handler =
+            wikisyncd::ApplicationHandler::new(temporary.path()).expect("application handler");
+        let daemon = wikisyncd::Daemon::bind(temporary.path(), handler).expect("daemon");
+        let shutdown = daemon.shutdown_handle();
+        let daemon_thread = thread::spawn(move || daemon.run());
+        wikisyncd::Client::for_library(temporary.path())
+            .expect("daemon client")
+            .health()
+            .expect("daemon readiness");
+
+        let error = create_collection_and_sync(&CreateCollectionRequest {
+            library_path: temporary.path().to_path_buf(),
+            name: "Over budget".to_owned(),
+            language_code: "en".to_owned(),
+            api_endpoint: "https://example.invalid/w/api.php".to_owned(),
+            preview: administration_preview("Rust", 10),
+            history_policy: HistoryPolicy::CurrentAndFuture,
+            budget: CollectionBudget::unlimited()
+                .with_maximum_bytes(1)
+                .expect("byte budget"),
+            removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            schedule: ScheduleSettings {
+                cadence: ScheduleCadence::Manual,
+                jitter_seconds: 0,
+                paused: false,
+            },
+        })
+        .await
+        .expect_err("collection must exceed budget");
+        assert!(error.contains("was registered successfully"));
+        assert!(error.contains("remains configured and can be reused"));
+        let library = Library::open_read_only(temporary.path()).expect("inspect library");
+        assert_eq!(library.wikis().expect("sources").len(), 1);
+        assert!(library.collections().expect("collections").is_empty());
+        drop(library);
+
+        shutdown.shutdown();
+        daemon_thread
+            .join()
+            .expect("daemon thread")
+            .expect("daemon shutdown");
     }
 
     #[test]
@@ -3275,6 +4532,72 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_owned_create_registers_new_source_then_bootstraps_fixture_collection() {
+        let server = FixtureServer::start(vec![TITLE_RESOLUTION, UNCHANGED_HEAD, REVISION_CONTENT]);
+        let temporary = tempfile::tempdir().expect("temporary library");
+        Library::open(temporary.path()).expect("library");
+
+        let preview = preview_collection(PreviewCollectionRequest {
+            api_endpoint: server.endpoint.clone(),
+            network_policy: NetworkTransferPolicy::default(),
+            rule: CollectionRule::ExplicitTitles(
+                wikisync_core::TitleSelection::new([
+                    PageTitle::new("Rust_programming_language").expect("title")
+                ])
+                .expect("selection"),
+            ),
+        })
+        .await
+        .expect("preview");
+
+        let handler =
+            wikisyncd::ApplicationHandler::new(temporary.path()).expect("application handler");
+        let daemon = wikisyncd::Daemon::bind(temporary.path(), handler).expect("daemon");
+        let shutdown = daemon.shutdown_handle();
+        let daemon_thread = thread::spawn(move || daemon.run());
+        wikisyncd::Client::for_library(temporary.path())
+            .expect("daemon client")
+            .health()
+            .expect("daemon readiness");
+
+        let snapshot = create_collection_and_sync(&CreateCollectionRequest {
+            library_path: temporary.path().to_path_buf(),
+            name: "Daemon collection".to_owned(),
+            language_code: "en".to_owned(),
+            api_endpoint: server.endpoint.clone(),
+            preview,
+            history_policy: HistoryPolicy::CurrentAndFuture,
+            budget: CollectionBudget::unlimited(),
+            removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            schedule: ScheduleSettings {
+                cadence: ScheduleCadence::Manual,
+                jitter_seconds: 0,
+                paused: false,
+            },
+        })
+        .await
+        .expect("daemon create and bootstrap");
+        assert_eq!(snapshot.collections.len(), 1);
+        assert_eq!(snapshot.collections[0].page_count, 1);
+        assert_eq!(snapshot.wikis.len(), 1);
+        assert_eq!(snapshot.wikis[0].api_endpoint, server.endpoint);
+        assert_eq!(snapshot.wikis[0].language_code, "en");
+        assert!(
+            snapshot
+                .runs
+                .iter()
+                .any(|run| run.state == SyncRunState::Succeeded)
+        );
+
+        shutdown.shutdown();
+        daemon_thread
+            .join()
+            .expect("daemon thread")
+            .expect("daemon shutdown");
+        assert_eq!(server.finish().len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn nontechnical_gate_flow_creates_syncs_updates_verifies_and_starts_reader() {
         let server = FixtureServer::start(vec![
             TITLE_RESOLUTION,
@@ -3311,6 +4634,7 @@ mod tests {
                 .unwrap()
                 .with_maximum_bytes(1_000_000)
                 .unwrap(),
+            removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
             schedule: ScheduleSettings {
                 cadence: ScheduleCadence::interval(3_600).unwrap(),
                 jitter_seconds: 300,

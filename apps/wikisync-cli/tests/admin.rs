@@ -28,6 +28,7 @@ fn initializes_and_lists_registered_sources_and_collections() {
     let added_json: Value = serde_json::from_slice(&added.stdout).expect("source add JSON");
     assert_eq!(added_json["wiki_id"], 1);
     assert_eq!(added_json["language_code"], "en");
+    assert_eq!(added_json["created"], true);
 
     let sources = run(&library, &["source", "list", "--json"]);
     assert_success(&sources);

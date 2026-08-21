@@ -34,6 +34,7 @@ const MIGRATION_6: &str = include_str!("../migrations/0006_collections.sql");
 const MIGRATION_7: &str = include_str!("../migrations/0007_schedules.sql");
 const MIGRATION_8: &str = include_str!("../migrations/0008_manifest_configuration.sql");
 const MIGRATION_9: &str = include_str!("../migrations/0009_network_transfer_policy.sql");
+const MIGRATION_10: &str = include_str!("../migrations/0010_collection_status.sql");
 const OBJECT_DOMAIN: &[u8] = b"wikisync-object-v1\0";
 const DATABASE_NAME: &str = "library.sqlite3";
 const MANIFEST_DOMAIN: &[u8] = b"wikisync-manifest-v1\0";
@@ -491,6 +492,7 @@ struct ManifestPageHeadWire {
 }
 
 type ManifestConfigurationRow = (
+    i64,
     String,
     Option<String>,
     Option<i64>,
@@ -633,6 +635,26 @@ pub struct StoredRevision {
     pub captured_at: u64,
 }
 
+/// Whether a collection still participates in membership resolution and synchronization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CollectionStatus {
+    /// The collection is configured and may be synchronized.
+    Active,
+    /// Tracking has stopped while all captured history and audit evidence is retained.
+    Tombstoned,
+}
+
+impl CollectionStatus {
+    /// Returns the stable lowercase value stored in SQLite and emitted in JSON.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Tombstoned => "tombstoned",
+        }
+    }
+}
+
 /// Read-only collection summary used by local readers and status interfaces.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredCollection {
@@ -642,6 +664,12 @@ pub struct StoredCollection {
     pub wiki_id: WikiId,
     /// User-visible collection name.
     pub name: String,
+    /// Monotonic configuration/membership generation used to reject stale previews.
+    pub generation: u64,
+    /// Whether this collection is still tracked or retained only for audit/history.
+    pub status: CollectionStatus,
+    /// Unix timestamp when tracking stopped, if the collection is tombstoned.
+    pub tombstoned_at: Option<u64>,
     /// Number of currently resolved pages in the collection.
     pub page_count: u64,
 }
@@ -666,6 +694,10 @@ pub struct StoredCollectionConfiguration {
     pub wiki_id: WikiId,
     /// User-visible name.
     pub name: String,
+    /// Monotonic configuration/membership generation used to reject stale previews.
+    pub generation: u64,
+    /// Whether this collection is still tracked or retained only for audit/history.
+    pub status: CollectionStatus,
     /// Rule committed after any potentially large preview.
     pub rule: CollectionRule,
     /// Public revision-history capture policy.
@@ -687,6 +719,25 @@ pub struct ResolvedCollectionMember {
     pub title: PageTitle,
     /// Auditable reason this rule included the page.
     pub inclusion_reason: InclusionReason,
+}
+
+/// A fully resolved, bounded collection preview ready for one atomic commit.
+#[derive(Clone, Copy, Debug)]
+pub struct CollectionPreviewCommit<'a> {
+    /// Selection rule used to produce the preview.
+    pub rule: &'a CollectionRule,
+    /// Revision-history policy to apply to every preview member.
+    pub history_policy: HistoryPolicy,
+    /// Hard limits checked before and during the transaction.
+    pub budget: CollectionBudget,
+    /// Policy for members absent from a later dynamic preview.
+    pub removal_policy: CollectionRemovalPolicy,
+    /// Complete resolved stable-page membership.
+    pub members: &'a [ResolvedCollectionMember],
+    /// Complete unresolved explicit/title-list inputs, assumed to be main namespace.
+    pub missing_titles: &'a [PageTitle],
+    /// Resolver prediction for canonical bytes, when one was available.
+    pub predicted_canonical_bytes: Option<u64>,
 }
 
 /// Result of atomically replacing resolved membership.
@@ -1581,12 +1632,15 @@ impl Library {
              ) VALUES (?1, ?2, 'explicit-titles', 'current-and-future', ?3)",
             params![to_sql_integer(wiki_id.get())?, name, now],
         )?;
-        let raw_id: i64 = self.connection.query_row(
-            "SELECT collection_id FROM collections WHERE wiki_id = ?1 AND name = ?2",
+        let (raw_id, status): (i64, String) = self.connection.query_row(
+            "SELECT collection_id, status FROM collections WHERE wiki_id = ?1 AND name = ?2",
             params![to_sql_integer(wiki_id.get())?, name],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let collection_id: CollectionId = sql_id(raw_id, "invalid collection ID")?;
+        if stored_collection_status(&status)? == CollectionStatus::Tombstoned {
+            return Err(StoreError::CollectionTombstoned(collection_id));
+        }
         self.connection.execute(
             "INSERT OR IGNORE INTO collection_schedules (
                 collection_id, cadence_kind, cadence_seconds, jitter_seconds,
@@ -1607,7 +1661,90 @@ impl Library {
         Ok(collection_id)
     }
 
-    /// Creates or reopens a collection and atomically commits its complete policy.
+    /// Renames an active collection without changing its stable identity or evidence.
+    pub fn rename_collection(
+        &mut self,
+        collection_id: CollectionId,
+        name: &str,
+    ) -> Result<(), StoreError> {
+        self.ensure_writable()?;
+        if name.trim().is_empty() {
+            return Err(StoreError::InvalidConfig(
+                "collection name must be non-empty",
+            ));
+        }
+        let raw_collection_id = to_sql_integer(collection_id.get())?;
+        ensure_collection_active(&self.connection, collection_id, raw_collection_id)?;
+        let changed = self.connection.execute(
+            "UPDATE collections SET name = ?2, generation = generation + 1
+             WHERE collection_id = ?1 AND status = 'active'",
+            params![raw_collection_id, name],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::CollectionTombstoned(collection_id));
+        }
+        Ok(())
+    }
+
+    /// Stops tracking a collection while retaining all canonical and audit history.
+    ///
+    /// The operation is idempotent. It atomically disables its schedule, cancels any
+    /// unfinished run without advancing a checkpoint, and marks active membership as
+    /// removed. Collection, configuration, resolved-member, checkpoint, sync-run and
+    /// manifest scope identities remain intact; no canonical page, revision or object
+    /// is deleted.
+    pub fn tombstone_collection(&mut self, collection_id: CollectionId) -> Result<(), StoreError> {
+        self.ensure_writable()?;
+        let raw_collection_id = to_sql_integer(collection_id.get())?;
+        let now = unix_time()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let status = collection_status(&transaction, collection_id, raw_collection_id)?;
+        if status == CollectionStatus::Tombstoned {
+            transaction.commit()?;
+            return Ok(());
+        }
+        transaction.execute(
+            "UPDATE sync_runs
+             SET state = 'cancelled', finished_at = ?2
+             WHERE collection_id = ?1 AND state = 'running'",
+            params![raw_collection_id, now],
+        )?;
+        transaction.execute(
+            "UPDATE collection_schedules
+             SET paused = 1, updated_at = ?2
+             WHERE collection_id = ?1",
+            params![raw_collection_id, now],
+        )?;
+        transaction.execute(
+            "UPDATE collection_resolved_members
+             SET membership_state = 'removed', removed_at = ?2
+             WHERE collection_id = ?1 AND membership_state = 'active'",
+            params![raw_collection_id, now],
+        )?;
+        transaction.execute(
+            "DELETE FROM collection_pages WHERE collection_id = ?1",
+            [raw_collection_id],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE collections
+             SET status = 'tombstoned', tombstoned_at = ?2,
+                 generation = generation + 1
+             WHERE collection_id = ?1 AND status = 'active'",
+            params![raw_collection_id, now],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::CollectionTombstoned(collection_id));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Creates a new collection and atomically commits its complete initial policy.
+    ///
+    /// A duplicate source/name is rejected; validation or persistence failure leaves
+    /// no draft collection or child configuration behind.
     pub fn create_collection(
         &mut self,
         wiki_id: WikiId,
@@ -1617,15 +1754,117 @@ impl Library {
         budget: CollectionBudget,
         removal_policy: CollectionRemovalPolicy,
     ) -> Result<CollectionId, StoreError> {
-        let collection_id = self.create_explicit_collection(wiki_id, name)?;
-        self.set_collection_configuration(
-            collection_id,
-            rule,
-            history_policy,
-            budget,
-            removal_policy,
+        self.create_collection_from_preview(
+            wiki_id,
+            name,
+            CollectionPreviewCommit {
+                rule,
+                history_policy,
+                budget,
+                removal_policy,
+                members: &[],
+                missing_titles: &[],
+                predicted_canonical_bytes: None,
+            },
+        )
+        .map(|(collection_id, _membership)| collection_id)
+    }
+
+    /// Creates a collection and commits its complete preview in one transaction.
+    ///
+    /// Validation or budget failure leaves no draft collection, schedule, estimate,
+    /// unresolved title, or membership row behind.
+    pub fn create_collection_from_preview(
+        &mut self,
+        wiki_id: WikiId,
+        name: &str,
+        preview: CollectionPreviewCommit<'_>,
+    ) -> Result<(CollectionId, MembershipCommit), StoreError> {
+        self.ensure_writable()?;
+        validate_collection_name(name)?;
+        validate_preview_commit(preview)?;
+        let now = unix_time()?;
+        let raw_wiki_id = to_sql_integer(wiki_id.get())?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let raw_collection_id: i64 = transaction.query_row(
+            "INSERT INTO collections (
+                wiki_id, name, rule_kind, history_policy, created_at
+             ) VALUES (?1, ?2, 'explicit-titles', 'current-and-future', ?3)
+             RETURNING collection_id",
+            params![raw_wiki_id, name, now],
+            |row| row.get(0),
         )?;
-        Ok(collection_id)
+        let collection_id = sql_id(raw_collection_id, "invalid collection ID")?;
+        transaction.execute(
+            "INSERT INTO collection_schedules (
+                collection_id, cadence_kind, cadence_seconds, jitter_seconds,
+                paused, next_run_at, last_started_at, updated_at
+             ) VALUES (?1, 'manual', NULL, 0, 0, NULL, NULL, ?2)",
+            params![raw_collection_id, now],
+        )?;
+        let membership =
+            commit_preview_transaction(&transaction, raw_collection_id, raw_wiki_id, preview, now)?;
+        transaction.commit()?;
+        Ok((collection_id, membership))
+    }
+
+    /// Atomically replaces an active collection's name, policy, estimate and preview.
+    ///
+    /// `expected_generation` must match the generation read before preview began.
+    /// Passing `None` for `name` retains the current name. Every other input is a
+    /// complete replacement, including unresolved titles and resolved membership.
+    /// A successful commit advances the generation exactly once.
+    pub fn update_collection_from_preview(
+        &mut self,
+        collection_id: CollectionId,
+        expected_generation: u64,
+        name: Option<&str>,
+        preview: CollectionPreviewCommit<'_>,
+    ) -> Result<MembershipCommit, StoreError> {
+        self.ensure_writable()?;
+        if let Some(name) = name {
+            validate_collection_name(name)?;
+        }
+        validate_preview_commit(preview)?;
+        let now = unix_time()?;
+        let raw_collection_id = to_sql_integer(collection_id.get())?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_collection_active(&transaction, collection_id, raw_collection_id)?;
+        let raw_wiki_id: i64 = transaction.query_row(
+            "SELECT wiki_id FROM collections WHERE collection_id = ?1",
+            [raw_collection_id],
+            |row| row.get(0),
+        )?;
+        let changed = transaction.execute(
+            "UPDATE collections
+             SET name = COALESCE(?3, name), generation = generation + 1
+             WHERE collection_id = ?1 AND generation = ?2 AND status = 'active'",
+            params![
+                raw_collection_id,
+                to_sql_integer(expected_generation)?,
+                name
+            ],
+        )?;
+        if changed != 1 {
+            let actual: i64 = transaction.query_row(
+                "SELECT generation FROM collections WHERE collection_id = ?1",
+                [raw_collection_id],
+                |row| row.get(0),
+            )?;
+            return Err(StoreError::StaleCollectionGeneration {
+                collection_id,
+                expected: expected_generation,
+                actual: sql_u64(actual, "invalid collection generation")?,
+            });
+        }
+        let membership =
+            commit_preview_transaction(&transaction, raw_collection_id, raw_wiki_id, preview, now)?;
+        transaction.commit()?;
+        Ok(membership)
     }
 
     /// Atomically replaces a collection rule and its persisted policy fields.
@@ -1655,14 +1894,7 @@ impl Library {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let exists: bool = transaction.query_row(
-            "SELECT EXISTS (SELECT 1 FROM collections WHERE collection_id = ?1)",
-            [raw_collection_id],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(StoreError::CollectionNotFound(collection_id));
-        }
+        ensure_collection_active(&transaction, collection_id, raw_collection_id)?;
         transaction.execute(
             "INSERT INTO collection_configuration (
                 collection_id, rule_kind, category_title, category_recursion_depth,
@@ -1705,6 +1937,14 @@ impl Library {
                 )?;
             }
         }
+        let changed = transaction.execute(
+            "UPDATE collections SET generation = generation + 1
+             WHERE collection_id = ?1 AND status = 'active'",
+            [raw_collection_id],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::CollectionTombstoned(collection_id));
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -1718,7 +1958,8 @@ impl Library {
         let row = self
             .connection
             .query_row(
-                "SELECT collections.wiki_id, collections.name,
+                "SELECT collections.wiki_id, collections.name, collections.generation,
+                        collections.status,
                         config.rule_kind, config.category_title,
                         config.category_recursion_depth, config.history_kind,
                         config.history_value, config.maximum_pages,
@@ -1731,14 +1972,16 @@ impl Library {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                         row.get::<_, Option<i64>>(6)?,
-                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, String>(7)?,
                         row.get::<_, Option<i64>>(8)?,
-                        row.get::<_, String>(9)?,
+                        row.get::<_, Option<i64>>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, String>(11)?,
                     ))
                 },
             )
@@ -1746,6 +1989,8 @@ impl Library {
         let Some((
             raw_wiki_id,
             name,
+            generation,
+            status,
             rule_kind,
             category_title,
             category_depth,
@@ -1771,6 +2016,8 @@ impl Library {
             collection_id,
             wiki_id: sql_id(raw_wiki_id, "invalid wiki ID")?,
             name,
+            generation: sql_u64(generation, "invalid collection generation")?,
+            status: stored_collection_status(&status)?,
             rule,
             history_policy: stored_history_policy(&history_kind, history_value)?,
             budget: stored_collection_budget(maximum_pages, maximum_bytes)?,
@@ -1837,20 +2084,29 @@ impl Library {
         title: &PageTitle,
         namespace: i32,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
+        let raw_collection_id = to_sql_integer(collection_id.get())?;
+        ensure_collection_active(&self.connection, collection_id, raw_collection_id)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
             "INSERT INTO unresolved_titles (
                 collection_id, title, namespace, last_observed_at
              ) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(collection_id, title) DO UPDATE SET
                 namespace = excluded.namespace,
                 last_observed_at = excluded.last_observed_at",
-            params![
-                to_sql_integer(collection_id.get())?,
-                title.as_str(),
-                namespace,
-                unix_time()?,
-            ],
+            params![raw_collection_id, title.as_str(), namespace, unix_time()?,],
         )?;
+        let changed = transaction.execute(
+            "UPDATE collections SET generation = generation + 1
+             WHERE collection_id = ?1 AND status = 'active'",
+            [raw_collection_id],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::CollectionTombstoned(collection_id));
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1890,6 +2146,9 @@ impl Library {
         let configuration = self
             .collection_configuration(collection_id)?
             .ok_or(StoreError::CollectionNotConfigured(collection_id))?;
+        if configuration.status == CollectionStatus::Tombstoned {
+            return Err(StoreError::CollectionTombstoned(collection_id));
+        }
         let active_members = u64::try_from(members.len())
             .map_err(|_| StoreError::InvalidConfig("collection member count is too large"))?;
         if configuration
@@ -1985,6 +2244,28 @@ impl Library {
                 params![raw_collection_id, raw_wiki_id, raw_page_id, now],
             )?;
         }
+        let raw_active_members: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM collection_resolved_members
+             WHERE collection_id = ?1 AND membership_state = 'active'",
+            [raw_collection_id],
+            |row| row.get(0),
+        )?;
+        let active_members = sql_u64(raw_active_members, "invalid active member count")?;
+        if configuration
+            .budget
+            .maximum_pages()
+            .is_some_and(|maximum| active_members > maximum.get())
+        {
+            return Err(StoreError::CollectionBudgetExceeded {
+                resource: "pages",
+                limit: configuration
+                    .budget
+                    .maximum_pages()
+                    .expect("checked maximum")
+                    .get(),
+                estimated: active_members,
+            });
+        }
         let raw_removed_members: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM collection_resolved_members
              WHERE collection_id = ?1 AND membership_state = 'removed'
@@ -1992,6 +2273,14 @@ impl Library {
             params![raw_collection_id, now],
             |row| row.get(0),
         )?;
+        let changed = transaction.execute(
+            "UPDATE collections SET generation = generation + 1
+             WHERE collection_id = ?1 AND status = 'active'",
+            [raw_collection_id],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::CollectionTombstoned(collection_id));
+        }
         transaction.commit()?;
         Ok(MembershipCommit {
             active_members,
@@ -2049,6 +2338,9 @@ impl Library {
         let configuration = self
             .collection_configuration(collection_id)?
             .ok_or(StoreError::CollectionNotConfigured(collection_id))?;
+        if configuration.status == CollectionStatus::Tombstoned {
+            return Err(StoreError::CollectionTombstoned(collection_id));
+        }
         if !configuration.budget.permits(
             resolved_page_count,
             predicted_canonical_bytes.unwrap_or_default(),
@@ -2179,14 +2471,7 @@ impl Library {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let exists: bool = transaction.query_row(
-            "SELECT EXISTS (SELECT 1 FROM collections WHERE collection_id = ?1)",
-            [raw_collection_id],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(StoreError::CollectionNotFound(collection_id));
-        }
+        ensure_collection_active(&transaction, collection_id, raw_collection_id)?;
         transaction.execute(
             "INSERT INTO collection_schedules (
                 collection_id, cadence_kind, cadence_seconds, jitter_seconds,
@@ -2261,8 +2546,13 @@ impl Library {
         let mut statement = self.connection.prepare(
             "SELECT collection_id, cadence_kind, cadence_seconds, jitter_seconds,
                     paused, next_run_at, last_started_at
-             FROM collection_schedules
+             FROM collection_schedules AS schedules
              WHERE paused = 0 AND cadence_kind != 'manual' AND next_run_at <= ?1
+               AND EXISTS (
+                    SELECT 1 FROM collections
+                    WHERE collections.collection_id = schedules.collection_id
+                      AND collections.status = 'active'
+               )
              ORDER BY next_run_at, collection_id LIMIT ?2",
         )?;
         let rows = statement
@@ -2299,7 +2589,12 @@ impl Library {
              SET last_started_at = ?1, next_run_at = ?2, updated_at = ?1
              WHERE collection_id = ?3 AND paused = 0
                AND cadence_kind != 'manual'
-               AND next_run_at = ?4 AND next_run_at <= ?1",
+               AND next_run_at = ?4 AND next_run_at <= ?1
+               AND EXISTS (
+                    SELECT 1 FROM collections
+                    WHERE collections.collection_id = collection_schedules.collection_id
+                      AND collections.status = 'active'
+               )",
             params![
                 to_sql_integer(started_at)?,
                 to_sql_integer(next_run_at)?,
@@ -2354,17 +2649,23 @@ impl Library {
         if !wiki_exists {
             return Err(StoreError::WikiNotFound(wiki_id));
         }
-        if let Some(collection_id) = raw_collection_id {
-            let owns_collection: bool = transaction.query_row(
-                "SELECT EXISTS (
-                    SELECT 1 FROM collections
-                    WHERE collection_id = ?1 AND wiki_id = ?2
-                 )",
-                params![collection_id, raw_wiki_id],
-                |row| row.get(0),
-            )?;
-            if !owns_collection {
+        if let Some(raw_collection_id) = raw_collection_id {
+            let collection: Option<(i64, String)> = transaction
+                .query_row(
+                    "SELECT wiki_id, status FROM collections WHERE collection_id = ?1",
+                    [raw_collection_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((collection_wiki_id, status)) = collection else {
                 return Err(StoreError::CollectionWikiMismatch);
+            };
+            if collection_wiki_id != raw_wiki_id {
+                return Err(StoreError::CollectionWikiMismatch);
+            }
+            let collection_id = collection_id.expect("raw collection ID came from this value");
+            if stored_collection_status(&status)? == CollectionStatus::Tombstoned {
+                return Err(StoreError::CollectionTombstoned(collection_id));
             }
         }
         let configuration_hash =
@@ -2708,20 +3009,19 @@ impl Library {
             ));
         }
         if let Some(collection_id) = collection_id {
-            let owns_collection: bool = self.connection.query_row(
-                "SELECT EXISTS (
-                    SELECT 1 FROM collections
-                    WHERE collection_id = ?1 AND wiki_id = ?2
-                 )",
-                params![
-                    to_sql_integer(collection_id.get())?,
-                    to_sql_integer(wiki_id.get())?
-                ],
-                |row| row.get(0),
-            )?;
-            if !owns_collection {
+            let raw_collection_id = to_sql_integer(collection_id.get())?;
+            let collection_wiki_id: Option<i64> = self
+                .connection
+                .query_row(
+                    "SELECT wiki_id FROM collections WHERE collection_id = ?1",
+                    [raw_collection_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if collection_wiki_id != Some(to_sql_integer(wiki_id.get())?) {
                 return Err(StoreError::CollectionWikiMismatch);
             }
+            ensure_collection_active(&self.connection, collection_id, raw_collection_id)?;
         }
         let changed = self.connection.execute(
             "INSERT INTO sync_checkpoints (
@@ -3239,10 +3539,24 @@ impl Library {
         capture: &CurrentRevisionCapture<'_>,
     ) -> Result<StoredObject, StoreError> {
         validate_mediawiki_timestamp(capture.timestamp)?;
+        let raw_wiki_id = to_sql_integer(wiki_id.get())?;
+        let raw_collection_id = to_sql_integer(collection_id.get())?;
+        let collection_wiki_id: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT wiki_id FROM collections WHERE collection_id = ?1",
+                [raw_collection_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if collection_wiki_id != Some(raw_wiki_id) {
+            return Err(StoreError::CollectionWikiMismatch);
+        }
+        ensure_collection_active(&self.connection, collection_id, raw_collection_id)?;
         let object = self.put_bytes(ObjectKind::Wikitext, capture.source)?;
         let now = unix_time()?;
-        let wiki_id = to_sql_integer(wiki_id.get())?;
-        let collection_id = to_sql_integer(collection_id.get())?;
+        let wiki_id = raw_wiki_id;
+        let collection_id = raw_collection_id;
         let page_id = to_sql_integer(capture.page_id.get())?;
         let revision_id = to_sql_integer(capture.revision_id.get())?;
         let revision = RevisionCapture {
@@ -3287,7 +3601,8 @@ impl Library {
                 page_id: capture.page_id,
             });
         }
-        if membership_state.is_none() {
+        let membership_added = membership_state.is_none();
+        if membership_added {
             transaction.execute(
                 "INSERT INTO collection_resolved_members (
                     collection_id, wiki_id, page_id, namespace, title,
@@ -3345,10 +3660,23 @@ impl Library {
              ) VALUES (?1, ?2, ?3, 'explicit-title', ?4)",
             params![collection_id, wiki_id, page_id, now],
         )?;
-        transaction.execute(
+        let unresolved_removed = transaction.execute(
             "DELETE FROM unresolved_titles WHERE collection_id = ?1 AND title = ?2",
             params![collection_id, capture.title.as_str()],
         )?;
+        if membership_added || unresolved_removed != 0 {
+            let changed = transaction.execute(
+                "UPDATE collections SET generation = generation + 1
+                 WHERE collection_id = ?1 AND status = 'active'",
+                [collection_id],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::CollectionTombstoned(sql_id(
+                    collection_id,
+                    "invalid collection ID",
+                )?));
+            }
+        }
         transaction.commit()?;
         Ok(object)
     }
@@ -3596,10 +3924,20 @@ impl Library {
                 last_observed_at = excluded.last_observed_at",
             params![raw_wiki_id, raw_page_id, title.as_str(), now],
         )?;
-        transaction.execute(
+        let unresolved_removed = transaction.execute(
             "DELETE FROM unresolved_titles WHERE collection_id = ?1 AND title = ?2",
             params![raw_collection_id, title.as_str()],
         )?;
+        if unresolved_removed != 0 {
+            let changed = transaction.execute(
+                "UPDATE collections SET generation = generation + 1
+                 WHERE collection_id = ?1 AND status = 'active'",
+                [raw_collection_id],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::CollectionTombstoned(collection_id));
+            }
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -3876,37 +4214,105 @@ impl Library {
         rows.into_iter().map(stored_revision).collect()
     }
 
-    /// Lists collection summaries in deterministic name and identity order.
+    /// Looks up one collection, including a tombstoned collection retained for audit.
+    pub fn collection(
+        &self,
+        collection_id: CollectionId,
+    ) -> Result<Option<StoredCollection>, StoreError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT collections.wiki_id, collections.name, collections.generation,
+                        collections.status, collections.tombstoned_at,
+                        COUNT(members.page_id)
+                 FROM collections
+                 LEFT JOIN collection_resolved_members AS members
+                   ON members.collection_id = collections.collection_id
+                  AND members.membership_state = 'active'
+                 WHERE collections.collection_id = ?1
+                 GROUP BY collections.collection_id",
+                [to_sql_integer(collection_id.get())?],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(
+            |(wiki_id, name, generation, status, tombstoned_at, page_count)| {
+                stored_collection(
+                    collection_id.get(),
+                    wiki_id,
+                    name,
+                    generation,
+                    status,
+                    tombstoned_at,
+                    page_count,
+                )
+            },
+        )
+        .transpose()
+    }
+
+    /// Lists active collection summaries in deterministic name and identity order.
     pub fn collections(&self) -> Result<Vec<StoredCollection>, StoreError> {
+        self.collection_summaries(false)
+    }
+
+    /// Lists active and tombstoned collections for audit and administrative views.
+    pub fn collections_including_tombstones(&self) -> Result<Vec<StoredCollection>, StoreError> {
+        self.collection_summaries(true)
+    }
+
+    fn collection_summaries(
+        &self,
+        include_tombstones: bool,
+    ) -> Result<Vec<StoredCollection>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT collections.collection_id, collections.wiki_id, collections.name,
-                    COUNT(collection_pages.page_id)
+                    collections.generation, collections.status, collections.tombstoned_at,
+                    COUNT(members.page_id)
              FROM collections
-             LEFT JOIN collection_pages USING (collection_id)
+             LEFT JOIN collection_resolved_members AS members
+               ON members.collection_id = collections.collection_id
+              AND members.membership_state = 'active'
+             WHERE (?1 OR collections.status = 'active')
              GROUP BY collections.collection_id
              ORDER BY collections.name, collections.collection_id",
         )?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map([include_tombstones], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(collection_id, wiki_id, name, page_count)| {
-                Ok(StoredCollection {
-                    collection_id: sql_id(collection_id, "invalid collection ID")?,
-                    wiki_id: sql_id(wiki_id, "invalid wiki ID")?,
-                    name,
-                    page_count: u64::try_from(page_count).map_err(|_| {
-                        StoreError::CorruptMetadata("invalid collection page count")
-                    })?,
-                })
-            })
+            .map(
+                |(collection_id, wiki_id, name, generation, status, tombstoned_at, page_count)| {
+                    stored_collection(
+                        sql_u64(collection_id, "invalid collection ID")?,
+                        wiki_id,
+                        name,
+                        generation,
+                        status,
+                        tombstoned_at,
+                        page_count,
+                    )
+                },
+            )
             .collect()
     }
 
@@ -6140,6 +6546,282 @@ fn is_safe_relative_path(path: &Path) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
+fn validate_collection_name(name: &str) -> Result<(), StoreError> {
+    if name.trim().is_empty() {
+        Err(StoreError::InvalidConfig(
+            "collection name must be non-empty",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_preview_commit(preview: CollectionPreviewCommit<'_>) -> Result<(), StoreError> {
+    let page_count = u64::try_from(preview.members.len())
+        .map_err(|_| StoreError::InvalidConfig("collection preview is too large"))?;
+    if preview
+        .budget
+        .maximum_pages()
+        .is_some_and(|limit| page_count > limit.get())
+    {
+        return Err(StoreError::CollectionBudgetExceeded {
+            resource: "pages",
+            limit: preview
+                .budget
+                .maximum_pages()
+                .expect("checked page maximum")
+                .get(),
+            estimated: page_count,
+        });
+    }
+    if let (Some(limit), Some(predicted)) = (
+        preview.budget.maximum_bytes(),
+        preview.predicted_canonical_bytes,
+    ) && predicted > limit.get()
+    {
+        return Err(StoreError::CollectionBudgetExceeded {
+            resource: "bytes",
+            limit: limit.get(),
+            estimated: predicted,
+        });
+    }
+    let mut unique_page_ids = HashSet::with_capacity(preview.members.len());
+    for member in preview.members {
+        if !unique_page_ids.insert(member.page_id) {
+            return Err(StoreError::InvalidConfig(
+                "resolved membership contains a duplicate page ID",
+            ));
+        }
+        validate_inclusion_reason(preview.rule, member)?;
+    }
+    let mut unique_missing_titles = HashSet::with_capacity(preview.missing_titles.len());
+    if preview
+        .missing_titles
+        .iter()
+        .any(|title| !unique_missing_titles.insert(title))
+    {
+        return Err(StoreError::InvalidConfig(
+            "unresolved title preview contains a duplicate title",
+        ));
+    }
+    Ok(())
+}
+
+fn commit_preview_transaction(
+    transaction: &Transaction<'_>,
+    raw_collection_id: i64,
+    raw_wiki_id: i64,
+    preview: CollectionPreviewCommit<'_>,
+    now: i64,
+) -> Result<MembershipCommit, StoreError> {
+    let (rule_kind, category_title, category_depth) = collection_rule_values(preview.rule);
+    let (history_kind, history_value) = history_policy_values(preview.history_policy)?;
+    let maximum_pages = preview
+        .budget
+        .maximum_pages()
+        .map(|value| to_sql_integer(value.get()))
+        .transpose()?;
+    let maximum_bytes = preview
+        .budget
+        .maximum_bytes()
+        .map(|value| to_sql_integer(value.get()))
+        .transpose()?;
+    transaction.execute(
+        "INSERT INTO collection_configuration (
+            collection_id, rule_kind, category_title, category_recursion_depth,
+            history_kind, history_value, maximum_pages, maximum_bytes,
+            removal_policy, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(collection_id) DO UPDATE SET
+            rule_kind = excluded.rule_kind,
+            category_title = excluded.category_title,
+            category_recursion_depth = excluded.category_recursion_depth,
+            history_kind = excluded.history_kind,
+            history_value = excluded.history_value,
+            maximum_pages = excluded.maximum_pages,
+            maximum_bytes = excluded.maximum_bytes,
+            removal_policy = excluded.removal_policy,
+            updated_at = excluded.updated_at",
+        params![
+            raw_collection_id,
+            rule_kind,
+            category_title,
+            category_depth,
+            history_kind,
+            history_value,
+            maximum_pages,
+            maximum_bytes,
+            removal_policy_value(preview.removal_policy),
+            now,
+        ],
+    )?;
+    transaction.execute(
+        "DELETE FROM collection_rule_titles WHERE collection_id = ?1",
+        [raw_collection_id],
+    )?;
+    if let Some(titles) = preview.rule.titles() {
+        for title in titles.iter() {
+            transaction.execute(
+                "INSERT INTO collection_rule_titles (collection_id, title) VALUES (?1, ?2)",
+                params![raw_collection_id, title.as_str()],
+            )?;
+        }
+    }
+    transaction.execute(
+        "DELETE FROM unresolved_titles WHERE collection_id = ?1",
+        [raw_collection_id],
+    )?;
+    for title in preview.missing_titles {
+        transaction.execute(
+            "INSERT INTO unresolved_titles (
+                collection_id, title, namespace, last_observed_at
+             ) VALUES (?1, ?2, 0, ?3)",
+            params![raw_collection_id, title.as_str(), now],
+        )?;
+    }
+
+    if preview.removal_policy == CollectionRemovalPolicy::StopTrackingRetainHistory {
+        transaction.execute(
+            "UPDATE collection_resolved_members
+             SET membership_state = 'removed', removed_at = ?2
+             WHERE collection_id = ?1 AND membership_state = 'active'",
+            params![raw_collection_id, now],
+        )?;
+        transaction.execute(
+            "DELETE FROM collection_pages WHERE collection_id = ?1",
+            [raw_collection_id],
+        )?;
+    }
+    for member in preview.members {
+        let (kind, inclusion_title, inclusion_depth) =
+            inclusion_reason_values(&member.inclusion_reason);
+        let raw_page_id = to_sql_integer(member.page_id.get())?;
+        transaction.execute(
+            "INSERT INTO collection_resolved_members (
+                collection_id, wiki_id, page_id, namespace, title,
+                inclusion_kind, inclusion_title, inclusion_depth,
+                membership_state, first_resolved_at, last_resolved_at, removed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                       'active', ?9, ?9, NULL)
+             ON CONFLICT(collection_id, page_id) DO UPDATE SET
+                wiki_id = excluded.wiki_id,
+                namespace = excluded.namespace,
+                title = excluded.title,
+                inclusion_kind = excluded.inclusion_kind,
+                inclusion_title = excluded.inclusion_title,
+                inclusion_depth = excluded.inclusion_depth,
+                membership_state = 'active',
+                last_resolved_at = excluded.last_resolved_at,
+                removed_at = NULL",
+            params![
+                raw_collection_id,
+                raw_wiki_id,
+                raw_page_id,
+                member.namespace,
+                member.title.as_str(),
+                kind,
+                inclusion_title,
+                inclusion_depth,
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO collection_pages (
+                collection_id, wiki_id, page_id, inclusion_reason, added_at
+             )
+             SELECT ?1, ?2, ?3, 'explicit-title', ?4
+             WHERE EXISTS (
+                SELECT 1 FROM pages WHERE wiki_id = ?2 AND page_id = ?3
+             )",
+            params![raw_collection_id, raw_wiki_id, raw_page_id, now],
+        )?;
+    }
+    let active_members: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM collection_resolved_members
+         WHERE collection_id = ?1 AND membership_state = 'active'",
+        [raw_collection_id],
+        |row| row.get(0),
+    )?;
+    let active_members = sql_u64(active_members, "invalid active member count")?;
+    if preview
+        .budget
+        .maximum_pages()
+        .is_some_and(|limit| active_members > limit.get())
+    {
+        return Err(StoreError::CollectionBudgetExceeded {
+            resource: "pages",
+            limit: preview
+                .budget
+                .maximum_pages()
+                .expect("checked page maximum")
+                .get(),
+            estimated: active_members,
+        });
+    }
+    let current_canonical_bytes: i64 = transaction.query_row(
+        "SELECT COALESCE(SUM(uncompressed_length), 0)
+         FROM content_objects
+         WHERE object_id IN (
+            SELECT DISTINCT revisions.content_object_id
+            FROM collection_resolved_members AS members
+            JOIN revisions
+              ON revisions.wiki_id = members.wiki_id
+             AND revisions.page_id = members.page_id
+            WHERE members.collection_id = ?1
+              AND members.membership_state = 'active'
+         )",
+        [raw_collection_id],
+        |row| row.get(0),
+    )?;
+    let current_canonical_bytes = sql_u64(
+        current_canonical_bytes,
+        "invalid collection canonical byte count",
+    )?;
+    let expected_bytes = preview
+        .predicted_canonical_bytes
+        .unwrap_or_default()
+        .max(current_canonical_bytes);
+    if preview
+        .budget
+        .maximum_bytes()
+        .is_some_and(|limit| expected_bytes > limit.get())
+    {
+        return Err(StoreError::CollectionBudgetExceeded {
+            resource: "bytes",
+            limit: preview
+                .budget
+                .maximum_bytes()
+                .expect("checked byte maximum")
+                .get(),
+            estimated: expected_bytes,
+        });
+    }
+    transaction.execute(
+        "INSERT INTO collection_estimates (
+            collection_id, resolved_page_count, predicted_canonical_bytes, estimated_at
+         ) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            raw_collection_id,
+            to_sql_integer(active_members)?,
+            preview
+                .predicted_canonical_bytes
+                .map(to_sql_integer)
+                .transpose()?,
+            now,
+        ],
+    )?;
+    let removed_members: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM collection_resolved_members
+         WHERE collection_id = ?1 AND membership_state = 'removed' AND removed_at = ?2",
+        params![raw_collection_id, now],
+        |row| row.get(0),
+    )?;
+    Ok(MembershipCommit {
+        active_members,
+        removed_members: sql_u64(removed_members, "invalid removed member count")?,
+    })
+}
+
 fn collection_rule_values(rule: &CollectionRule) -> (&'static str, Option<&str>, Option<i64>) {
     match rule {
         CollectionRule::ExplicitTitles(_) => ("explicit-titles", None, None),
@@ -6363,7 +7045,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
          ) STRICT;",
     )?;
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > 9 {
+    if version > 10 {
         return Err(StoreError::UnsupportedSchemaVersion(version));
     }
     if version == 0 {
@@ -6473,6 +7155,18 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
         transaction.pragma_update(None, "user_version", 9)?;
         transaction.commit()?;
     }
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 9 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(MIGRATION_10)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (10, 'collection-status', ?1)",
+            [unix_time()?],
+        )?;
+        transaction.pragma_update(None, "user_version", 10)?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -6486,6 +7180,74 @@ where
 
 fn sql_u64(value: i64, message: &'static str) -> Result<u64, StoreError> {
     u64::try_from(value).map_err(|_| StoreError::CorruptMetadata(message))
+}
+
+fn stored_collection_status(value: &str) -> Result<CollectionStatus, StoreError> {
+    match value {
+        "active" => Ok(CollectionStatus::Active),
+        "tombstoned" => Ok(CollectionStatus::Tombstoned),
+        _ => Err(StoreError::CorruptMetadata("unknown collection status")),
+    }
+}
+
+fn collection_status(
+    connection: &Connection,
+    collection_id: CollectionId,
+    raw_collection_id: i64,
+) -> Result<CollectionStatus, StoreError> {
+    let status = connection
+        .query_row(
+            "SELECT status FROM collections WHERE collection_id = ?1",
+            [raw_collection_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    status
+        .as_deref()
+        .map(stored_collection_status)
+        .transpose()?
+        .ok_or(StoreError::CollectionNotFound(collection_id))
+}
+
+fn ensure_collection_active(
+    connection: &Connection,
+    collection_id: CollectionId,
+    raw_collection_id: i64,
+) -> Result<(), StoreError> {
+    match collection_status(connection, collection_id, raw_collection_id)? {
+        CollectionStatus::Active => Ok(()),
+        CollectionStatus::Tombstoned => Err(StoreError::CollectionTombstoned(collection_id)),
+    }
+}
+
+fn stored_collection(
+    collection_id: u64,
+    wiki_id: i64,
+    name: String,
+    generation: i64,
+    status: String,
+    tombstoned_at: Option<i64>,
+    page_count: i64,
+) -> Result<StoredCollection, StoreError> {
+    let status = stored_collection_status(&status)?;
+    let tombstoned_at = tombstoned_at
+        .map(|value| sql_u64(value, "invalid collection tombstone time"))
+        .transpose()?;
+    if (status == CollectionStatus::Active) != tombstoned_at.is_none() {
+        return Err(StoreError::CorruptMetadata(
+            "collection status and tombstone time disagree",
+        ));
+    }
+    Ok(StoredCollection {
+        collection_id: CollectionId::new(collection_id)
+            .map_err(|_| StoreError::CorruptMetadata("invalid collection ID"))?,
+        wiki_id: sql_id(wiki_id, "invalid wiki ID")?,
+        name,
+        generation: sql_u64(generation, "invalid collection generation")?,
+        status,
+        tombstoned_at,
+        page_count: sql_u64(page_count, "invalid collection page count")?,
+    })
 }
 
 fn unix_time() -> Result<i64, StoreError> {
@@ -6771,15 +7533,18 @@ fn manifest_configuration_hash_for(
     collection_id: Option<CollectionId>,
 ) -> Result<String, StoreError> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"wikisync-manifest-configuration-v2\0");
+    hasher.update(b"wikisync-manifest-configuration-v3\0");
     hash_manifest_field(&mut hasher, &wiki_id.get().to_string());
     if let Some(collection_id) = collection_id {
         hash_manifest_field(&mut hasher, &collection_id.get().to_string());
         let configuration: ManifestConfigurationRow = connection.query_row(
-            "SELECT rule_kind, category_title, category_recursion_depth,
+            "SELECT collections.generation,
+                    config.rule_kind, config.category_title, config.category_recursion_depth,
                     history_kind, history_value, maximum_pages, maximum_bytes,
                     removal_policy
-             FROM collection_configuration WHERE collection_id = ?1",
+             FROM collection_configuration AS config
+             JOIN collections USING (collection_id)
+             WHERE collection_id = ?1",
             [to_sql_integer(collection_id.get())?],
             |row| {
                 Ok((
@@ -6791,18 +7556,20 @@ fn manifest_configuration_hash_for(
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         )?;
         for field in [
-            Some(configuration.0),
-            configuration.1,
-            configuration.2.map(|value| value.to_string()),
-            Some(configuration.3),
-            configuration.4.map(|value| value.to_string()),
+            Some(configuration.0.to_string()),
+            Some(configuration.1),
+            configuration.2,
+            configuration.3.map(|value| value.to_string()),
+            Some(configuration.4),
             configuration.5.map(|value| value.to_string()),
             configuration.6.map(|value| value.to_string()),
-            Some(configuration.7),
+            configuration.7.map(|value| value.to_string()),
+            Some(configuration.8),
         ] {
             hash_manifest_optional_field(&mut hasher, field.as_deref());
         }
@@ -6907,6 +7674,17 @@ pub enum StoreError {
     CollectionWikiMismatch,
     /// No collection exists for the supplied identity.
     CollectionNotFound(CollectionId),
+    /// A mutation or synchronization was requested for a retained collection tombstone.
+    CollectionTombstoned(CollectionId),
+    /// An administrative preview was based on an older collection generation.
+    StaleCollectionGeneration {
+        /// Collection whose preview is stale.
+        collection_id: CollectionId,
+        /// Generation read before the preview began.
+        expected: u64,
+        /// Durable generation observed while attempting the commit.
+        actual: u64,
+    },
     /// A legacy empty collection has not committed a selection rule yet.
     CollectionNotConfigured(CollectionId),
     /// A resolved member reason did not match the committed rule.
@@ -7052,6 +7830,17 @@ impl fmt::Display for StoreError {
             Self::CollectionNotFound(collection_id) => {
                 write!(formatter, "collection {collection_id} was not found")
             }
+            Self::CollectionTombstoned(collection_id) => {
+                write!(formatter, "collection {collection_id} is no longer tracked")
+            }
+            Self::StaleCollectionGeneration {
+                collection_id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "collection {collection_id} changed while it was being previewed (expected generation {expected}, found {actual}); reload and preview again; no changes were committed"
+            ),
             Self::CollectionNotConfigured(collection_id) => {
                 write!(
                     formatter,
@@ -7367,7 +8156,7 @@ mod tests {
         let before = filesystem_snapshot(directory.path());
 
         let mut library = Library::open_read_only(directory.path()).expect("read-only library");
-        assert_eq!(library.schema_version().expect("schema version"), 9);
+        assert_eq!(library.schema_version().expect("schema version"), 10);
         assert_eq!(library.wikis().expect("wikis")[0].wiki_id, wiki_id);
         assert_eq!(library.logical_object_count().expect("object count"), 1);
         assert_eq!(
@@ -7469,13 +8258,13 @@ mod tests {
     #[test]
     fn migration_is_applied_once_and_keeps_locations_separate() {
         let (directory, library) = test_library();
-        assert_eq!(library.schema_version().expect("schema version"), 9);
-        assert_eq!(migration_count(&library), 9);
+        assert_eq!(library.schema_version().expect("schema version"), 10);
+        assert_eq!(migration_count(&library), 10);
 
         drop(library);
         let reopened = Library::open(directory.path()).expect("reopen library");
-        assert_eq!(reopened.schema_version().expect("schema version"), 9);
-        assert_eq!(migration_count(&reopened), 9);
+        assert_eq!(reopened.schema_version().expect("schema version"), 10);
+        assert_eq!(migration_count(&reopened), 10);
 
         let logical_columns: Vec<String> = reopened
             .connection()
@@ -7649,20 +8438,76 @@ mod tests {
         connection
             .execute_batch(
                 "DROP TABLE network_transfer_policy;
-                 DELETE FROM schema_migrations WHERE version = 9;
+                 DROP INDEX collections_by_status_name;
+                 ALTER TABLE collections DROP COLUMN status;
+                 ALTER TABLE collections DROP COLUMN generation;
+                 ALTER TABLE collections DROP COLUMN tombstoned_at;
+                 DELETE FROM schema_migrations WHERE version IN (9, 10);
                  PRAGMA user_version = 8;",
             )
             .expect("downgrade fixture metadata");
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade version eight library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 9);
-        assert_eq!(migration_count(&upgraded), 9);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 10);
+        assert_eq!(migration_count(&upgraded), 10);
         assert_eq!(
             upgraded
                 .network_transfer_policy()
                 .expect("migrated default policy"),
             NetworkTransferPolicy::default()
+        );
+    }
+
+    #[test]
+    fn version_nine_collection_fixture_upgrades_active_without_losing_run_scope() {
+        let directory = tempfile::tempdir().expect("temporary library");
+        let mut library = Library::open(directory.path()).expect("create current library");
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Legacy collection")
+            .expect("legacy collection");
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 100)
+            .expect("legacy run")
+            .status
+            .run_id;
+        library.cancel_sync_run(run_id).expect("finish fixture run");
+        drop(library);
+
+        let connection = Connection::open(directory.path().join(DATABASE_NAME))
+            .expect("open database for version-nine fixture");
+        connection
+            .execute_batch(
+                "DROP INDEX collections_by_status_name;
+                 ALTER TABLE collections DROP COLUMN status;
+                 ALTER TABLE collections DROP COLUMN generation;
+                 ALTER TABLE collections DROP COLUMN tombstoned_at;
+                 DELETE FROM schema_migrations WHERE version = 10;
+                 PRAGMA user_version = 9;",
+            )
+            .expect("downgrade fixture metadata");
+        drop(connection);
+
+        let upgraded = Library::open(directory.path()).expect("upgrade version nine fixture");
+        assert_eq!(upgraded.schema_version().expect("schema version"), 10);
+        assert_eq!(migration_count(&upgraded), 10);
+        let collection = upgraded
+            .collection(collection_id)
+            .expect("collection lookup")
+            .expect("migrated collection");
+        assert_eq!(collection.status, CollectionStatus::Active);
+        assert_eq!(collection.tombstoned_at, None);
+        assert_eq!(collection.generation, 1);
+        assert_eq!(
+            upgraded
+                .sync_run_status(run_id)
+                .expect("run lookup")
+                .expect("retained run")
+                .collection_id,
+            Some(collection_id)
         );
     }
 
@@ -7709,8 +8554,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 9);
-        assert_eq!(migration_count(&upgraded), 9);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 10);
+        assert_eq!(migration_count(&upgraded), 10);
         assert_eq!(table_count(&upgraded, "revisions"), 0);
     }
 
@@ -7746,8 +8591,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 9);
-        assert_eq!(migration_count(&upgraded), 9);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 10);
+        assert_eq!(migration_count(&upgraded), 10);
         assert_eq!(table_count(&upgraded, "search_documents"), 0);
         let fts_definition: String = upgraded
             .connection()
@@ -8100,6 +8945,660 @@ mod tests {
                 .expect("retained history")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn atomic_preview_create_and_edit_roll_back_every_field_on_failure() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let title = PageTitle::new("Atomic page").expect("title");
+        let selection = TitleSelection::new([title.clone()]).expect("selection");
+        let rule = CollectionRule::ExplicitTitles(selection);
+        let member = ResolvedCollectionMember {
+            page_id: PageId::new(10).expect("page ID"),
+            namespace: 0,
+            title: title.clone(),
+            inclusion_reason: InclusionReason::ExplicitTitle(title.clone()),
+        };
+        let missing = PageTitle::new("Missing atomic page").expect("missing title");
+        let oversized = CollectionPreviewCommit {
+            rule: &rule,
+            history_policy: HistoryPolicy::CurrentAndFuture,
+            budget: CollectionBudget::unlimited()
+                .with_maximum_pages(1)
+                .expect("budget"),
+            removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            members: &[member.clone(), member.clone()],
+            missing_titles: std::slice::from_ref(&missing),
+            predicted_canonical_bytes: Some(100),
+        };
+        assert!(matches!(
+            library.create_collection_from_preview(wiki_id, "Rejected", oversized),
+            Err(StoreError::CollectionBudgetExceeded {
+                resource: "pages",
+                ..
+            }) | Err(StoreError::InvalidConfig(_))
+        ));
+        assert!(library.collections().expect("no orphan drafts").is_empty());
+
+        let accepted = CollectionPreviewCommit {
+            members: std::slice::from_ref(&member),
+            ..oversized
+        };
+        let (collection_id, membership) = library
+            .create_collection_from_preview(wiki_id, "Accepted", accepted)
+            .expect("atomic create");
+        assert_eq!(membership.active_members, 1);
+        assert_eq!(
+            library
+                .unresolved_titles(collection_id)
+                .expect("missing titles"),
+            std::slice::from_ref(&missing)
+        );
+
+        let before_configuration = library
+            .collection_configuration(collection_id)
+            .expect("configuration")
+            .expect("configured");
+        let before_members = library
+            .resolved_collection_members(collection_id)
+            .expect("members");
+        let rejected_edit = CollectionPreviewCommit {
+            budget: CollectionBudget::unlimited()
+                .with_maximum_pages(1)
+                .expect("budget"),
+            members: &[
+                member.clone(),
+                ResolvedCollectionMember {
+                    page_id: PageId::new(11).expect("page ID"),
+                    ..member.clone()
+                },
+            ],
+            missing_titles: &[],
+            ..accepted
+        };
+        assert!(matches!(
+            library.update_collection_from_preview(
+                collection_id,
+                before_configuration.generation,
+                Some("Partially applied"),
+                rejected_edit,
+            ),
+            Err(StoreError::CollectionBudgetExceeded {
+                resource: "pages",
+                ..
+            })
+        ));
+        assert_eq!(
+            library
+                .collection(collection_id)
+                .expect("collection")
+                .expect("present")
+                .name,
+            "Accepted"
+        );
+        assert_eq!(
+            library
+                .collection_configuration(collection_id)
+                .expect("configuration")
+                .expect("configured"),
+            before_configuration
+        );
+        assert_eq!(
+            library
+                .resolved_collection_members(collection_id)
+                .expect("members"),
+            before_members
+        );
+    }
+
+    #[test]
+    fn stale_preview_generation_rejects_a_racing_writer_and_rolls_back_every_field() {
+        let (directory, mut first_writer) = test_library();
+        let wiki_id = first_writer
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let first_title = PageTitle::new("First generation page").expect("title");
+        let second_title = PageTitle::new("Second generation page").expect("title");
+        let rule = CollectionRule::ExplicitTitles(
+            TitleSelection::new([first_title.clone(), second_title.clone()]).expect("selection"),
+        );
+        let first_member = ResolvedCollectionMember {
+            page_id: PageId::new(10).expect("page ID"),
+            namespace: 0,
+            title: first_title.clone(),
+            inclusion_reason: InclusionReason::ExplicitTitle(first_title),
+        };
+        let second_member = ResolvedCollectionMember {
+            page_id: PageId::new(11).expect("page ID"),
+            namespace: 0,
+            title: second_title.clone(),
+            inclusion_reason: InclusionReason::ExplicitTitle(second_title),
+        };
+        let initial = CollectionPreviewCommit {
+            rule: &rule,
+            history_policy: HistoryPolicy::CurrentAndFuture,
+            budget: CollectionBudget::unlimited(),
+            removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            members: std::slice::from_ref(&first_member),
+            missing_titles: &[],
+            predicted_canonical_bytes: Some(10),
+        };
+        let (collection_id, _) = first_writer
+            .create_collection_from_preview(wiki_id, "Original", initial)
+            .expect("create collection");
+        let stale_generation = first_writer
+            .collection(collection_id)
+            .expect("collection")
+            .expect("present")
+            .generation;
+        assert_eq!(stale_generation, 1);
+        let mut second_writer = Library::open(directory.path()).expect("second writer");
+        assert_eq!(
+            second_writer
+                .collection(collection_id)
+                .expect("collection")
+                .expect("present")
+                .generation,
+            stale_generation
+        );
+
+        let first_commit = CollectionPreviewCommit {
+            members: std::slice::from_ref(&second_member),
+            predicted_canonical_bytes: Some(20),
+            ..initial
+        };
+        first_writer
+            .update_collection_from_preview(
+                collection_id,
+                stale_generation,
+                Some("First writer won"),
+                first_commit,
+            )
+            .expect("first writer commit");
+        let durable_after_first = first_writer
+            .collection_configuration(collection_id)
+            .expect("configuration")
+            .expect("configured");
+        assert_eq!(durable_after_first.generation, stale_generation + 1);
+
+        let stale_error = second_writer
+            .update_collection_from_preview(
+                collection_id,
+                stale_generation,
+                Some("Stale writer must roll back"),
+                initial,
+            )
+            .expect_err("stale preview");
+        assert!(matches!(
+            stale_error,
+            StoreError::StaleCollectionGeneration {
+                collection_id: stale_id,
+                expected,
+                actual,
+            } if stale_id == collection_id
+                && expected == stale_generation
+                && actual == stale_generation + 1
+        ));
+        let after_stale = second_writer
+            .collection_configuration(collection_id)
+            .expect("configuration")
+            .expect("configured");
+        assert_eq!(after_stale, durable_after_first);
+        assert_eq!(
+            second_writer
+                .resolved_collection_members(collection_id)
+                .expect("members"),
+            [second_member]
+        );
+    }
+
+    #[test]
+    fn keep_tracking_uses_accumulated_members_for_budget_and_commit_counts() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let first_title = PageTitle::new("Retained first").expect("title");
+        let second_title = PageTitle::new("Retained second").expect("title");
+        let rule = CollectionRule::ExplicitTitles(
+            TitleSelection::new([first_title.clone(), second_title.clone()]).expect("selection"),
+        );
+        let collection_id = library
+            .create_collection(
+                wiki_id,
+                "Keep tracking budget",
+                &rule,
+                HistoryPolicy::CurrentAndFuture,
+                CollectionBudget::unlimited()
+                    .with_maximum_pages(1)
+                    .expect("budget"),
+                CollectionRemovalPolicy::KeepTracking,
+            )
+            .expect("create collection");
+        let first = ResolvedCollectionMember {
+            page_id: PageId::new(10).expect("page ID"),
+            namespace: 0,
+            title: first_title.clone(),
+            inclusion_reason: InclusionReason::ExplicitTitle(first_title),
+        };
+        let second = ResolvedCollectionMember {
+            page_id: PageId::new(11).expect("page ID"),
+            namespace: 0,
+            title: second_title.clone(),
+            inclusion_reason: InclusionReason::ExplicitTitle(second_title),
+        };
+        assert_eq!(
+            library
+                .commit_resolved_membership(collection_id, std::slice::from_ref(&first))
+                .expect("first preview")
+                .active_members,
+            1
+        );
+        let generation_before_failure = library
+            .collection(collection_id)
+            .expect("collection")
+            .expect("present")
+            .generation;
+        assert!(matches!(
+            library.commit_resolved_membership(collection_id, std::slice::from_ref(&second)),
+            Err(StoreError::CollectionBudgetExceeded {
+                resource: "pages",
+                limit: 1,
+                estimated: 2,
+            })
+        ));
+        assert_eq!(
+            library
+                .resolved_collection_members(collection_id)
+                .expect("rolled back membership"),
+            std::slice::from_ref(&first)
+        );
+        assert_eq!(
+            library
+                .collection(collection_id)
+                .expect("collection")
+                .expect("present")
+                .generation,
+            generation_before_failure
+        );
+
+        library
+            .set_collection_configuration(
+                collection_id,
+                &rule,
+                HistoryPolicy::CurrentAndFuture,
+                CollectionBudget::unlimited()
+                    .with_maximum_pages(2)
+                    .expect("budget"),
+                CollectionRemovalPolicy::KeepTracking,
+            )
+            .expect("raise budget");
+        assert_eq!(
+            library
+                .commit_resolved_membership(collection_id, std::slice::from_ref(&second))
+                .expect("disjoint preview after raising budget"),
+            MembershipCommit {
+                active_members: 2,
+                removed_members: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn collection_generation_tracks_mutations_but_not_schedule_only_edits() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Generation")
+            .expect("create collection");
+        let generation = |library: &Library| {
+            library
+                .collection(collection_id)
+                .expect("collection")
+                .expect("present")
+                .generation
+        };
+        assert_eq!(generation(&library), 1);
+        let missing = PageTitle::new("Missing generation page").expect("title");
+        library
+            .record_missing_title(collection_id, &missing, 0)
+            .expect("record missing title");
+        assert_eq!(generation(&library), 2);
+        library
+            .rename_collection(collection_id, "Renamed generation")
+            .expect("rename");
+        assert_eq!(generation(&library), 3);
+
+        let title = PageTitle::new("Generation page").expect("title");
+        let rule = CollectionRule::ExplicitTitles(
+            TitleSelection::new([title.clone()]).expect("selection"),
+        );
+        library
+            .set_collection_configuration(
+                collection_id,
+                &rule,
+                HistoryPolicy::CurrentAndFuture,
+                CollectionBudget::unlimited(),
+                CollectionRemovalPolicy::StopTrackingRetainHistory,
+            )
+            .expect("configuration");
+        assert_eq!(generation(&library), 4);
+        let member = ResolvedCollectionMember {
+            page_id: PageId::new(10).expect("page ID"),
+            namespace: 0,
+            title: title.clone(),
+            inclusion_reason: InclusionReason::ExplicitTitle(title),
+        };
+        library
+            .commit_resolved_membership(collection_id, std::slice::from_ref(&member))
+            .expect("membership");
+        assert_eq!(generation(&library), 5);
+        library
+            .set_collection_schedule(
+                collection_id,
+                ScheduleCadence::interval(60).expect("cadence"),
+                0,
+                false,
+                Some(100),
+            )
+            .expect("schedule");
+        assert_eq!(generation(&library), 5);
+        library
+            .tombstone_collection(collection_id)
+            .expect("tombstone");
+        assert_eq!(generation(&library), 6);
+    }
+
+    #[test]
+    fn legacy_create_collection_rolls_back_the_draft_when_configuration_fails() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let title = PageTitle::new("Atomic legacy create").expect("title");
+        let rule = CollectionRule::ExplicitTitles(TitleSelection::new([title]).expect("selection"));
+        let error = library
+            .create_collection(
+                wiki_id,
+                "Must roll back",
+                &rule,
+                HistoryPolicy::CurrentAndFuture,
+                CollectionBudget::unlimited()
+                    .with_maximum_bytes(u64::MAX)
+                    .expect("domain budget"),
+                CollectionRemovalPolicy::StopTrackingRetainHistory,
+            )
+            .expect_err("SQLite-unrepresentable budget");
+        assert!(matches!(error, StoreError::IntegerOutOfRange(u64::MAX)));
+        assert!(library.collections().expect("collections").is_empty());
+        assert_eq!(table_count(&library, "collection_configuration"), 0);
+        assert_eq!(table_count(&library, "collection_schedules"), 0);
+        assert_eq!(table_count(&library, "collection_rule_titles"), 0);
+    }
+
+    #[test]
+    fn tombstone_stops_tracking_and_preserves_run_manifest_and_canonical_history() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let title = PageTitle::new("Retained page").expect("title");
+        let rule = CollectionRule::ExplicitTitles(
+            TitleSelection::new([title.clone()]).expect("selection"),
+        );
+        let member = ResolvedCollectionMember {
+            page_id: PageId::new(10).expect("page ID"),
+            namespace: 0,
+            title: title.clone(),
+            inclusion_reason: InclusionReason::ExplicitTitle(title.clone()),
+        };
+        let preview = CollectionPreviewCommit {
+            rule: &rule,
+            history_policy: HistoryPolicy::CurrentAndFuture,
+            budget: CollectionBudget::unlimited(),
+            removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            members: std::slice::from_ref(&member),
+            missing_titles: &[],
+            predicted_canonical_bytes: Some(64),
+        };
+        let (collection_id, _) = library
+            .create_collection_from_preview(wiki_id, "Retained", preview)
+            .expect("create collection");
+        capture_test_page(
+            &mut library,
+            wiki_id,
+            collection_id,
+            10,
+            100,
+            "2026-08-21T10:00:00Z",
+            "Retained page",
+        );
+        let completed_run = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 100)
+            .expect("start completed run")
+            .status
+            .run_id;
+        library
+            .complete_sync_run(completed_run, None)
+            .expect("complete run");
+        let manifest = library
+            .append_sync_manifest(completed_run)
+            .expect("append manifest");
+        assert_eq!(manifest.manifest.collection_id, Some(collection_id));
+        let running_run = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Update, 200)
+            .expect("start running update")
+            .status
+            .run_id;
+        library
+            .set_collection_schedule(
+                collection_id,
+                ScheduleCadence::interval(60).expect("cadence"),
+                0,
+                false,
+                Some(1),
+            )
+            .expect("due schedule");
+        let object_count = table_count(&library, "content_objects");
+        let revision_count = table_count(&library, "revisions");
+
+        library
+            .tombstone_collection(collection_id)
+            .expect("tombstone");
+        let tombstone = library
+            .collection(collection_id)
+            .expect("collection")
+            .expect("retained tombstone");
+        assert_eq!(tombstone.status, CollectionStatus::Tombstoned);
+        assert!(tombstone.tombstoned_at.is_some());
+        assert_eq!(tombstone.page_count, 0);
+        assert!(
+            library
+                .collections()
+                .expect("active collections")
+                .is_empty()
+        );
+        assert_eq!(
+            library
+                .collections_including_tombstones()
+                .expect("audit collections"),
+            std::slice::from_ref(&tombstone)
+        );
+        assert!(
+            library
+                .due_schedules(10, 10)
+                .expect("due schedules")
+                .is_empty()
+        );
+        assert!(
+            library
+                .collection_schedule(collection_id)
+                .expect("schedule")
+                .expect("retained schedule")
+                .paused
+        );
+        assert_eq!(
+            library
+                .sync_run_status(running_run)
+                .expect("run status")
+                .expect("retained run")
+                .state,
+            SyncRunState::Cancelled
+        );
+        assert_eq!(
+            library
+                .sync_run_status(completed_run)
+                .expect("completed status")
+                .expect("retained run")
+                .collection_id,
+            Some(collection_id)
+        );
+        assert_eq!(table_count(&library, "content_objects"), object_count);
+        assert_eq!(table_count(&library, "revisions"), revision_count);
+        assert_eq!(table_count(&library, "collection_resolved_members"), 1);
+        assert_eq!(table_count(&library, "collection_pages"), 0);
+        assert_eq!(
+            library
+                .validated_manifest_chain()
+                .expect("retained manifest")[0]
+                .manifest
+                .collection_id,
+            Some(collection_id)
+        );
+        assert!(matches!(
+            library.update_collection_from_preview(
+                collection_id,
+                tombstone.generation,
+                None,
+                preview,
+            ),
+            Err(StoreError::CollectionTombstoned(id)) if id == collection_id
+        ));
+        assert!(matches!(
+            library.start_or_resume_sync_run(
+                wiki_id,
+                Some(collection_id),
+                SyncRunKind::Update,
+                300,
+            ),
+            Err(StoreError::CollectionTombstoned(id)) if id == collection_id
+        ));
+        library
+            .tombstone_collection(collection_id)
+            .expect("idempotent tombstone");
+        assert_eq!(
+            library
+                .collection(collection_id)
+                .expect("collection")
+                .expect("tombstone")
+                .tombstoned_at,
+            tombstone.tombstoned_at
+        );
+    }
+
+    #[test]
+    fn tombstoned_partial_run_remains_hash_verifiable_without_becoming_manifest_evidence() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let title = PageTitle::new("Partially durable page").expect("title");
+        let rule = CollectionRule::ExplicitTitles(
+            TitleSelection::new([title.clone()]).expect("selection"),
+        );
+        let member = ResolvedCollectionMember {
+            page_id: PageId::new(10).expect("page ID"),
+            namespace: 0,
+            title: title.clone(),
+            inclusion_reason: InclusionReason::ExplicitTitle(title),
+        };
+        let preview = CollectionPreviewCommit {
+            rule: &rule,
+            history_policy: HistoryPolicy::CurrentAndFuture,
+            budget: CollectionBudget::unlimited(),
+            removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            members: std::slice::from_ref(&member),
+            missing_titles: &[],
+            predicted_canonical_bytes: None,
+        };
+        let (collection_id, _) = library
+            .create_collection_from_preview(wiki_id, "Partial run", preview)
+            .expect("create collection");
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 100)
+            .expect("start run")
+            .status
+            .run_id;
+        library
+            .enqueue_sync_job(run_id, "capture:10", "capture-current", Some("10"))
+            .expect("queue job");
+        library
+            .claim_next_sync_job(run_id)
+            .expect("claim job")
+            .expect("running job");
+        capture_test_page(
+            &mut library,
+            wiki_id,
+            collection_id,
+            10,
+            100,
+            "2026-08-21T10:00:00Z",
+            "Partially durable page",
+        );
+
+        library
+            .tombstone_collection(collection_id)
+            .expect("tombstone partial run");
+        assert_eq!(
+            library
+                .sync_run_status(run_id)
+                .expect("run status")
+                .expect("retained cancelled run")
+                .state,
+            SyncRunState::Cancelled
+        );
+        assert!(matches!(
+            library.append_sync_manifest(run_id),
+            Err(StoreError::SyncRunNotSucceeded(id)) if id == run_id
+        ));
+        assert!(
+            library
+                .unmanifested_succeeded_run_ids(10)
+                .expect("manifest coverage candidates")
+                .is_empty()
+        );
+        assert!(
+            library
+                .validated_manifest_chain()
+                .expect("manifest inventory")
+                .is_empty()
+        );
+
+        let objects = library
+            .logical_objects_after(None, 100)
+            .expect("logical object inventory");
+        assert_eq!(objects.len(), 1);
+        assert_eq!(
+            library
+                .read_object(objects[0].object.id)
+                .expect("full hash-verified read"),
+            b"Partially durable page"
+        );
+        let metadata = library
+            .integrity_metadata_records_after(None, 100)
+            .expect("full metadata verification page");
+        assert_eq!(
+            u64::try_from(metadata.len()).expect("metadata count"),
+            library
+                .integrity_metadata_record_count()
+                .expect("expected metadata count")
+        );
+        assert!(metadata.iter().all(|record| record.issues.is_empty()));
     }
 
     #[test]

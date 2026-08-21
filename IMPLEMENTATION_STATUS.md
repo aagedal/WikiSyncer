@@ -1,6 +1,6 @@
 # WikiSyncer implementation status
 
-Updated: 2026-08-21
+Updated: 2026-08-22
 
 ## Completed backlog items
 
@@ -93,9 +93,9 @@ diagnostics checkpoints are implemented and validated:
   quick/full logical-object verification, and immutable-object compaction;
 - CLI `sync`, `verify`, and `compact` commands that forward to the daemon when it owns
   the library or hold a short exclusive writer lease when it is absent;
-- GUI collection updates using the same forwarding/direct-writer contract, while
-  collection creation fails clearly if the daemon owns the writer because that
-  mutation is not yet in protocol version 1;
+- GUI collection synchronization and collection administration using the same
+  forwarding/direct-writer contract, including daemon-owned creation for an already
+  configured source;
 - parameterized launchd and hardened systemd user-service templates, including a
   health-only systemd timer that does not pretend to schedule synchronization; and
 - a pre-beta threat model plus service, backup/restore/migration, and redacted manual
@@ -206,19 +206,63 @@ Durable network transfer policy now also includes:
   fail-visible but do not pretend to prove that a connection is unmetered. macOS
   currently reports unsupported because no reliable safe integration is implemented.
 
+Collection lifecycle administration now also includes:
+
+- schema migration 10 with durable active/tombstoned collection status and a monotonic
+  configuration/membership generation. Tombstoning stops tracking, pauses scheduling,
+  cancels unfinished scoped work without checkpoint advancement, and retains collection
+  identity, configuration, resolved-member history, checkpoints, runs, manifests,
+  pages, revisions, and canonical objects;
+- all-or-nothing collection create/edit transactions covering name, selection rule,
+  history and removal policy, hard budgets, complete resolved membership, unresolved
+  titles, and estimates. Accumulated `keep-tracking` membership is included in budget
+  enforcement, and stale previews are rejected by generation compare-and-swap instead
+  of overwriting later reconciliation or administrative changes;
+- daemon protocol version 2 with version-1 compatibility and a bounded, expiring,
+  non-durable draft upload. Ordered chunks preserve the 64 KiB frame ceiling while
+  exact preflight and incremental allocation bounds cap a complete draft at 16 MiB;
+- shared direct/daemon typed operations for estimate, add, edit, and non-destructive
+  remove. A newly administered collection takes the bootstrap path before later
+  reconciliation, including configured history capture, and `sync all` uses the same
+  bootstrap decision;
+- CLI `collection add|edit|list|remove|estimate` with complete bounded previews,
+  explicit `--commit`, stable versioned JSON, active/all inspection, bounded
+  single-handle title-list reads, durable transfer/metered policy, and direct or
+  daemon-owned writer execution; and
+- an Iced collection editor for complete previewed scope, history, budgets, removal
+  policy, and scheduling plus confirmed tombstone removal. Existing-library and
+  post-daemon inspection is read-only, and fixture gates prove direct/daemon behavior,
+  daemon-owned create-and-bootstrap, and stale-edit rejection.
+
+A cancelled partial run is deliberately not promoted to successful manifest evidence.
+Its durable objects remain locally catalogued and hash-verifiable, while the last
+successful manifest remains the authenticated boundary.
+
+Daemon-owned source administration now also includes:
+
+- bounded typed protocol-v2 source add/remove operations with protocol-v1 behavior
+  unchanged, shared validation for direct and daemon-owned writers, and idempotent
+  registration receipts that return the durable source identity and configuration;
+- transactional refusal to remove a source referenced by any collection, with tests
+  proving the source and its dependent state are unchanged on rejection; and
+- CLI forwarding for source add/remove plus GUI registration of a missing source
+  before daemon-owned collection creation. Fixture tests cover new-source bootstrap,
+  safe unused removal, in-use rejection, and explicit partial receipts when source
+  registration succeeds but a later collection budget check fails.
+
 Additional stable-v1 application progress now includes:
 
 - periodic bounded category re-resolution in every daemon collection sync, with a
   network-free no-op for static title rules, atomic membership replacement, retained
   history for removed members, budget enforcement, and failure tests proving an
   incomplete preview never changes membership;
-- initial administrative CLI commands for library initialization, validated source
-  add/list, safe removal of wholly unused sources, and collection listing, including
-  stable JSON inspection output and direct-writer exclusion while protocol version 1
-  lacks these mutations; and
-- refusal to physically remove a collection under the current schema because its
-  foreign key would null historical sync-run scope. Correct collection removal needs
-  a tombstone/status migration that preserves manifest and run evidence.
+- administrative CLI commands for library initialization, validated source add/list,
+  safe removal of wholly unused sources, and the complete planned non-destructive
+  collection administration surface. Mutations use the same typed direct/daemon
+  boundary while inspection remains read-only; and
+- explicit refusal to treat collection removal as destructive purging. Tombstoning
+  preserves historical scope and captured data; a separate purge command would still
+  require its own bounded preview and evidence-preservation design.
 
 Credential-free beta packaging readiness now includes:
 
@@ -247,11 +291,12 @@ release identities/trust distribution, and signed artifact publication remain.
 ## Plan audit notes
 
 The ordered first implementation backlog (items 1–13) is complete. The broader
-milestone delivery lists are not all closed: the administrative CLI surface is only
-partial, credentialed platform packages remain outstanding, and optional media, dump
+milestone delivery lists are not all closed: destructive purge is not implemented,
+credentialed platform packages remain outstanding, and optional media, dump
 bootstrap, pack tuning, stable contracts, and release acceptance remain Milestone 5
-work. User-facing external signing/trusted-anchor workflows, historical export, and
-periodic dynamic-category membership reconciliation are now implemented.
+work. Daemon-owned source administration, the planned non-destructive collection
+CLI/GUI surface, user-facing external signing/trusted-anchor workflows, historical
+export, and periodic dynamic-category membership reconciliation are implemented.
 Full verification now covers stable scans of every logical canonical object, the
 manifest chain and eligible-run coverage, and the current-schema metadata pointers
 listed above. A separately retained signed trusted head can authenticate the observed
@@ -264,13 +309,14 @@ replaced alongside the library.
 
 ## Next checkpoint
 
-Add a collection tombstone/status migration, preserve historical run/manifest scope,
-and complete previewed collection add/edit/remove plus daemon-protocol administration.
-Complete credentialed Apple signing/notarization and define the Linux
-package/repository trust model before calling the candidate archives signed beta
-packages. Optional attributed thumbnail media, current-language dump bootstrap, pack
-tuning, stable configuration/database/JSON/export/backup contracts, and release
-acceptance on macOS/Ubuntu remain separately tracked Milestone 5 work.
+Define the Linux package/repository trust model and complete credentialed Apple
+signing/notarization, native release validation, protected release identities/trust
+distribution, and signed publication
+before calling the candidate archives signed beta packages; those credentialed
+external actions remain unauthorized/unavailable in this checkpoint. Optional
+attributed thumbnail media, current-language dump bootstrap, pack tuning, stable
+configuration/database/JSON/export/backup contracts, destructive purge design, and
+release acceptance on macOS/Ubuntu remain separately tracked Milestone 5 work.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening
