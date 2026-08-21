@@ -8,12 +8,23 @@ overwriting an existing file:
 wikisync --library /absolute/path/to/library doctor
 wikisync --library /absolute/path/to/library doctor --json
 wikisync --library /absolute/path/to/library doctor --bundle ./wikisync-doctor.json
+wikisync --library /absolute/path/to/library doctor --online
 ```
+
+Doctor remains entirely offline unless `--online` is explicitly supplied. With that
+flag it sends one bounded Action API probe to each of at most 20 configured sources,
+with no retry, a five-second request timeout, a three-second connect timeout, and a
+256 KiB response limit per source. The report contains only aggregate reachable,
+unreachable, rejected-configuration, and omitted counts; it never includes source
+hosts, endpoints, probe query values, or raw network errors. A successful probe means
+only that the configured Action API returned a structurally usable response at that
+moment. It does not establish archive freshness, upstream completeness, or trust.
 
 The bundle is created with mode `0600`. It contains versions, OS/architecture,
 filesystem and database-file aggregates, source/collection/schedule counts, bounded
-run/error aggregates, local control-plane state, and a quick logical-object integrity
-summary. It omits source endpoints, titles, collection names, paths, raw errors,
+run/error aggregates, local control-plane state, optional aggregate reachability, and
+a quick logical-object integrity summary. It omits source endpoints and hosts, probe
+queries, titles, collection names, paths, raw errors,
 content, object IDs, environment variables, and logs. Review every bundle before
 sharing it. Never attach the library database, canonical objects, article/search
 text, socket files, or an unreviewed service log to a public issue.
@@ -98,10 +109,14 @@ the canonical content objects. Use the GUI's **Verify full library** action for 
 implemented full verification. It checks every catalogued object through the store's
 normal loose/pack reconstruction and identity validation, then validates bounded
 canonical manifest JSON, embedded identities, strict append sequence, predecessor
-links, and coverage of manifest-eligible successful runs. It does not yet validate
-every planned revision-chain, search-pointer, cache, signature, or external trusted-
-head invariant, so report its exact scope rather than saying the archive is
-universally verified.
+links, and coverage of manifest-eligible successful runs. Full verification also
+performs a stable, bounded metadata scan over revision-to-page/object references,
+locally present parents, page heads, checkpoint advancing runs, search-document/FTS
+pointers, orphan FTS rows, and the current search transformer version. The integrity
+library has Ed25519 trusted-head primitives, but the CLI/GUI does not yet expose key
+storage or anchor export/import. The current schema has no derived-cache table, and
+contentless FTS cannot reproduce its indexed token stream for comparison, so report
+the exact scope rather than saying the archive is universally verified.
 
 If verification reports corruption, stop synchronization, keep the original library
 unchanged, and make a permission-preserving copy for investigation. Restoring a known

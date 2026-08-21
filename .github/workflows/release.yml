@@ -1,0 +1,67 @@
+name: Release candidate dry run
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "packaging/**"
+      - "docs/operations/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  archive-dry-run:
+    name: ${{ matrix.target_os }} native archive
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target_os: macos
+          - runner: ubuntu-24.04
+            target_os: linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      # actions/checkout v4.2.2, pinned because release jobs must not follow mutable tags.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Test packaging and detached-signature tooling
+        run: python3 -m unittest discover -s packaging/tests -v
+      - name: Build release binaries
+        run: cargo build --workspace --bins --release --locked
+      - name: Build and verify deterministic release candidate
+        env:
+          TARGET_OS: ${{ matrix.target_os }}
+        run: |
+          set -eu
+          version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          case "$(uname -m)" in
+            arm64|aarch64) target_arch=aarch64 ;;
+            x86_64|amd64) target_arch=x86_64 ;;
+            *) echo "unsupported runner architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          python3 packaging/scripts/release.py package \
+            --input-dir target/release \
+            --output-dir target/release-candidate \
+            --version "$version" \
+            --target-os "$TARGET_OS" \
+            --target-arch "$target_arch" \
+            --source-date-epoch "$source_date_epoch"
+          python3 packaging/scripts/release.py checksums --output-dir target/release-candidate
+          python3 packaging/scripts/release.py verify-checksums \
+            --checksum-file target/release-candidate/SHA256SUMS
+          archive="target/release-candidate/wikisync-${version}-${TARGET_OS}-${target_arch}.tar.gz"
+          python3 packaging/scripts/release.py verify-archive --archive "$archive"
+          test ! -e target/release-candidate/SHA256SUMS.sig
+
+# This workflow deliberately performs no publication, platform signing, notarization,
+# or secret-backed checksum signing. Those release gates require explicit identities
+# and protected credentials, and the resulting artifacts need separate review.

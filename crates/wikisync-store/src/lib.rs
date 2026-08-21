@@ -85,6 +85,9 @@ pub const MAX_DUE_SCHEDULES: u32 = 10_000;
 /// Maximum manifest records returned by one bounded enumeration call.
 pub const MAX_MANIFEST_PAGE_SIZE: u32 = 1_000;
 
+/// Maximum metadata-reference records returned by one integrity enumeration call.
+pub const MAX_INTEGRITY_METADATA_PAGE_SIZE: u32 = 1_000;
+
 /// Default maximum number of source requests in flight across one library process.
 pub const DEFAULT_MAX_CONCURRENT_REQUESTS: u32 = 4;
 
@@ -541,7 +544,7 @@ pub struct CurrentRevisionCapture<'a> {
     pub revision_id: RevisionId,
     /// Parent revision, which need not be captured by a current-and-future policy.
     pub parent_id: Option<RevisionId>,
-    /// MediaWiki UTC timestamp string.
+    /// Canonical MediaWiki UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`).
     pub timestamp: &'a str,
     /// Public author name or IP, when available.
     pub author: Option<&'a str>,
@@ -566,7 +569,7 @@ pub struct RevisionCapture<'a> {
     pub revision_id: RevisionId,
     /// Parent revision, absent for the first revision in page history.
     pub parent_id: Option<RevisionId>,
-    /// MediaWiki UTC timestamp string.
+    /// Canonical MediaWiki UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`).
     pub timestamp: &'a str,
     /// Public author name or IP, when available.
     pub author: Option<&'a str>,
@@ -608,7 +611,7 @@ pub struct StoredRevision {
     pub page_id: PageId,
     /// Parent revision identity, whether or not that revision is captured locally.
     pub parent_id: Option<RevisionId>,
-    /// MediaWiki UTC timestamp string.
+    /// Canonical MediaWiki UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`).
     pub timestamp: String,
     /// Public author name or IP, when available.
     pub author: Option<String>,
@@ -823,6 +826,88 @@ pub enum ObjectVerificationState {
     Verified,
     /// A prior verification detected corruption.
     Corrupt,
+}
+
+/// Stable subject of one metadata-reference record examined by full verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IntegrityMetadataSubject {
+    /// One immutable captured revision, identified within its source wiki.
+    Revision { wiki_id: u64, revision_id: u64 },
+    /// One captured page, identified within its source wiki.
+    Page { wiki_id: u64, page_id: u64 },
+    /// One durable source checkpoint.
+    Checkpoint { checkpoint_id: u64 },
+    /// One rebuildable search-document pointer.
+    SearchDocument { search_id: u64 },
+    /// One contentless FTS row pointer.
+    SearchFtsRow { row_id: i64 },
+}
+
+/// Metadata-reference invariant violated by a persisted record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntegrityMetadataIssue {
+    RevisionPageMissing,
+    RevisionObjectMissing,
+    RevisionParentWrongPage,
+    RevisionParentSelfReference,
+    PageHeadRevisionMissing,
+    PageHeadRevisionWrongPage,
+    CheckpointCollectionWikiMismatch,
+    CheckpointRunMissing,
+    CheckpointRunNotSucceeded,
+    CheckpointRunScopeMismatch,
+    CheckpointBoundaryMismatch,
+    SearchPageMissing,
+    SearchRevisionMissing,
+    SearchRevisionWrongPage,
+    SearchRevisionNotCurrent,
+    SearchFtsRowMissing,
+    SearchFtsRowOrphan,
+}
+
+/// One bounded metadata record and every pointer inconsistency visible in the
+/// current schema.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IntegrityMetadataRecord {
+    pub subject: IntegrityMetadataSubject,
+    pub issues: Vec<IntegrityMetadataIssue>,
+    /// Transformer version persisted for a search document, absent for other kinds.
+    pub search_transformer_version: Option<String>,
+}
+
+/// Opaque keyset cursor for [`Library::integrity_metadata_records_after`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IntegrityMetadataCursor {
+    category: u8,
+    first_key: i64,
+    second_key: i64,
+}
+
+impl IntegrityMetadataRecord {
+    /// Returns the opaque cursor used to continue after this exact record.
+    pub fn cursor(&self) -> Result<IntegrityMetadataCursor, StoreError> {
+        let (category, first_key, second_key) = match self.subject {
+            IntegrityMetadataSubject::Revision {
+                wiki_id,
+                revision_id,
+            } => (0, to_sql_integer(wiki_id)?, to_sql_integer(revision_id)?),
+            IntegrityMetadataSubject::Page { wiki_id, page_id } => {
+                (1, to_sql_integer(wiki_id)?, to_sql_integer(page_id)?)
+            }
+            IntegrityMetadataSubject::Checkpoint { checkpoint_id } => {
+                (2, to_sql_integer(checkpoint_id)?, 0)
+            }
+            IntegrityMetadataSubject::SearchDocument { search_id } => {
+                (3, to_sql_integer(search_id)?, 0)
+            }
+            IntegrityMetadataSubject::SearchFtsRow { row_id } => (4, row_id, 0),
+        };
+        Ok(IntegrityMetadataCursor {
+            category,
+            first_key,
+            second_key,
+        })
+    }
 }
 
 impl ObjectVerificationState {
@@ -1413,6 +1498,69 @@ impl Library {
                 })
             })
             .collect()
+    }
+
+    /// Removes an unused source registration without deleting captured evidence.
+    ///
+    /// A source is unused only when it has no collections, captured pages,
+    /// synchronization runs or checkpoints, and no immutable manifest names it.
+    /// The operation otherwise fails with [`StoreError::WikiInUse`].
+    pub fn remove_wiki(&mut self, wiki_id: WikiId) -> Result<(), StoreError> {
+        self.ensure_writable()?;
+        let raw_wiki_id = to_sql_integer(wiki_id.get())?;
+        let exists: bool = self.connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM wikis WHERE wiki_id = ?1)",
+            [raw_wiki_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::WikiNotFound(wiki_id));
+        }
+
+        let manifests = self
+            .validated_manifest_chain()?
+            .into_iter()
+            .filter(|stored| stored.manifest.wiki_id == wiki_id)
+            .count();
+        let manifests = u64::try_from(manifests).map_err(|_| StoreError::ManifestLimitExceeded)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (collections, captured_pages, sync_runs, checkpoints): (i64, i64, i64, i64) =
+            transaction.query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM collections WHERE wiki_id = ?1),
+                    (SELECT COUNT(*) FROM pages WHERE wiki_id = ?1),
+                    (SELECT COUNT(*) FROM sync_runs WHERE wiki_id = ?1),
+                    (SELECT COUNT(*) FROM sync_checkpoints WHERE wiki_id = ?1)",
+                [raw_wiki_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        let collections = sql_u64(collections, "invalid source collection count")?;
+        let captured_pages = sql_u64(captured_pages, "invalid source page count")?;
+        let sync_runs = sql_u64(sync_runs, "invalid source sync-run count")?;
+        let checkpoints = sql_u64(checkpoints, "invalid source checkpoint count")?;
+        if collections != 0
+            || captured_pages != 0
+            || sync_runs != 0
+            || checkpoints != 0
+            || manifests != 0
+        {
+            return Err(StoreError::WikiInUse {
+                wiki_id,
+                collections,
+                captured_pages,
+                sync_runs,
+                checkpoints,
+                manifests,
+            });
+        }
+        let changed = transaction.execute("DELETE FROM wikis WHERE wiki_id = ?1", [raw_wiki_id])?;
+        if changed != 1 {
+            return Err(StoreError::WikiNotFound(wiki_id));
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Creates or reopens an explicit-title, current-and-future collection.
@@ -3090,6 +3238,7 @@ impl Library {
         collection_id: CollectionId,
         capture: &CurrentRevisionCapture<'_>,
     ) -> Result<StoredObject, StoreError> {
+        validate_mediawiki_timestamp(capture.timestamp)?;
         let object = self.put_bytes(ObjectKind::Wikitext, capture.source)?;
         let now = unix_time()?;
         let wiki_id = to_sql_integer(wiki_id.get())?;
@@ -3218,6 +3367,7 @@ impl Library {
         if self.page(wiki_id, page_id)?.is_none() {
             return Err(StoreError::PageNotFound { wiki_id, page_id });
         }
+        validate_mediawiki_timestamp(capture.timestamp)?;
         let object = self.put_bytes(ObjectKind::Wikitext, capture.source)?;
         let now = unix_time()?;
         let raw_wiki_id = to_sql_integer(wiki_id.get())?;
@@ -3637,6 +3787,41 @@ impl Library {
                 params![
                     to_sql_integer(wiki_id.get())?,
                     to_sql_integer(page_id.get())?
+                ],
+                revision_row,
+            )
+            .optional()?
+            .map(|row| stored_revision(row).map(|(_, revision)| revision))
+            .transpose()
+    }
+
+    /// Returns the newest durable revision for a page at or before `cutoff`.
+    ///
+    /// `cutoff` must use MediaWiki's canonical UTC RFC 3339 representation,
+    /// `YYYY-MM-DDTHH:MM:SSZ`. Captured revision timestamps use that same fixed-width
+    /// representation, so SQLite's binary text comparison is chronological. Equal
+    /// timestamps are resolved deterministically in favor of the larger revision ID.
+    /// The page-time index and `LIMIT 1` keep this query from materializing history.
+    pub fn newest_revision_for_page_at_or_before(
+        &self,
+        wiki_id: WikiId,
+        page_id: PageId,
+        cutoff: &str,
+    ) -> Result<Option<StoredRevision>, StoreError> {
+        validate_mediawiki_timestamp(cutoff)?;
+        self.connection
+            .query_row(
+                "SELECT wiki_id, revision_id, page_id, parent_revision_id,
+                        revision_time, author_name, author_id, comment, is_minor,
+                        source_size, upstream_sha1, content_model, content_object_id,
+                        captured_at
+                 FROM revisions
+                 WHERE wiki_id = ?1 AND page_id = ?2 AND revision_time <= ?3
+                 ORDER BY revision_time DESC, revision_id DESC LIMIT 1",
+                params![
+                    to_sql_integer(wiki_id.get())?,
+                    to_sql_integer(page_id.get())?,
+                    cutoff
                 ],
                 revision_row,
             )
@@ -4340,6 +4525,346 @@ impl Library {
             .collect()
     }
 
+    /// Returns the number of revision, page, checkpoint, search-document, and FTS
+    /// pointer records covered by the current full metadata-integrity scan.
+    pub fn integrity_metadata_record_count(&self) -> Result<u64, StoreError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM revisions)
+              + (SELECT COUNT(*) FROM pages)
+              + (SELECT COUNT(*) FROM sync_checkpoints)
+              + (SELECT COUNT(*) FROM search_documents)
+              + (SELECT COUNT(*) FROM search_fts)",
+            [],
+            |row| row.get(0),
+        )?;
+        sql_u64(count, "negative integrity metadata record count")
+    }
+
+    /// Returns SQLite's connection-local change counter used to detect commits from
+    /// another connection during a multi-page metadata scan.
+    pub fn integrity_metadata_change_counter(&self) -> Result<u64, StoreError> {
+        let version: i64 = self
+            .connection
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        sql_u64(version, "negative SQLite data version")
+    }
+
+    /// Enumerates current-schema metadata references in stable kind/key order.
+    ///
+    /// Parent revisions that are not captured are valid and are not reported. If a
+    /// parent is present locally, it must belong to the same page. Search text is
+    /// rebuildable, so this validates pointers but does not treat an absent search
+    /// document for a page as canonical-content loss.
+    pub fn integrity_metadata_records_after(
+        &self,
+        after: Option<IntegrityMetadataCursor>,
+        limit: u32,
+    ) -> Result<Vec<IntegrityMetadataRecord>, StoreError> {
+        if !(1..=MAX_INTEGRITY_METADATA_PAGE_SIZE).contains(&limit) {
+            return Err(StoreError::InvalidConfig(
+                "integrity metadata page size must be between 1 and 1,000",
+            ));
+        }
+        let mut category = after.map_or(0, |cursor| cursor.category);
+        let mut first_key = after.map_or(-1, |cursor| cursor.first_key);
+        let mut second_key = after.map_or(-1, |cursor| cursor.second_key);
+        let mut records = Vec::with_capacity(limit as usize);
+
+        while records.len() < limit as usize && category <= 4 {
+            let remaining = i64::from(limit) - records.len() as i64;
+            let before = records.len();
+            match category {
+                0 => {
+                    let mut statement = self.connection.prepare(
+                        "SELECT revision.wiki_id, revision.revision_id,
+                                EXISTS (
+                                    SELECT 1 FROM pages
+                                    WHERE pages.wiki_id = revision.wiki_id
+                                      AND pages.page_id = revision.page_id
+                                ),
+                                EXISTS (
+                                    SELECT 1 FROM content_objects
+                                    WHERE content_objects.object_id = revision.content_object_id
+                                ),
+                                revision.parent_revision_id IS NULL OR NOT EXISTS (
+                                    SELECT 1 FROM revisions AS parent
+                                    WHERE parent.wiki_id = revision.wiki_id
+                                      AND parent.revision_id = revision.parent_revision_id
+                                ) OR EXISTS (
+                                    SELECT 1 FROM revisions AS parent
+                                    WHERE parent.wiki_id = revision.wiki_id
+                                      AND parent.revision_id = revision.parent_revision_id
+                                      AND parent.page_id = revision.page_id
+                                ),
+                                revision.parent_revision_id IS NOT revision.revision_id
+                         FROM revisions AS revision
+                         WHERE revision.wiki_id > ?1
+                            OR (revision.wiki_id = ?1 AND revision.revision_id > ?2)
+                         ORDER BY revision.wiki_id, revision.revision_id LIMIT ?3",
+                    )?;
+                    let rows =
+                        statement.query_map(params![first_key, second_key, remaining], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, bool>(2)?,
+                                row.get::<_, bool>(3)?,
+                                row.get::<_, bool>(4)?,
+                                row.get::<_, bool>(5)?,
+                            ))
+                        })?;
+                    for row in rows {
+                        let (wiki_id, revision_id, page, object, parent_page, parent_self) = row?;
+                        let mut issues = Vec::new();
+                        if !page {
+                            issues.push(IntegrityMetadataIssue::RevisionPageMissing);
+                        }
+                        if !object {
+                            issues.push(IntegrityMetadataIssue::RevisionObjectMissing);
+                        }
+                        if !parent_page {
+                            issues.push(IntegrityMetadataIssue::RevisionParentWrongPage);
+                        }
+                        if !parent_self {
+                            issues.push(IntegrityMetadataIssue::RevisionParentSelfReference);
+                        }
+                        records.push(IntegrityMetadataRecord {
+                            subject: IntegrityMetadataSubject::Revision {
+                                wiki_id: sql_u64(wiki_id, "invalid revision wiki ID")?,
+                                revision_id: sql_u64(revision_id, "invalid revision ID")?,
+                            },
+                            issues,
+                            search_transformer_version: None,
+                        });
+                    }
+                }
+                1 => {
+                    let mut statement = self.connection.prepare(
+                        "SELECT page.wiki_id, page.page_id,
+                                page.current_revision_id IS NULL OR EXISTS (
+                                    SELECT 1 FROM revisions AS revision
+                                    WHERE revision.wiki_id = page.wiki_id
+                                      AND revision.revision_id = page.current_revision_id
+                                ),
+                                page.current_revision_id IS NULL OR EXISTS (
+                                    SELECT 1 FROM revisions AS revision
+                                    WHERE revision.wiki_id = page.wiki_id
+                                      AND revision.revision_id = page.current_revision_id
+                                      AND revision.page_id = page.page_id
+                                )
+                         FROM pages AS page
+                         WHERE page.wiki_id > ?1
+                            OR (page.wiki_id = ?1 AND page.page_id > ?2)
+                         ORDER BY page.wiki_id, page.page_id LIMIT ?3",
+                    )?;
+                    let rows =
+                        statement.query_map(params![first_key, second_key, remaining], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, bool>(2)?,
+                                row.get::<_, bool>(3)?,
+                            ))
+                        })?;
+                    for row in rows {
+                        let (wiki_id, page_id, revision, revision_page) = row?;
+                        let mut issues = Vec::new();
+                        if !revision {
+                            issues.push(IntegrityMetadataIssue::PageHeadRevisionMissing);
+                        } else if !revision_page {
+                            issues.push(IntegrityMetadataIssue::PageHeadRevisionWrongPage);
+                        }
+                        records.push(IntegrityMetadataRecord {
+                            subject: IntegrityMetadataSubject::Page {
+                                wiki_id: sql_u64(wiki_id, "invalid page wiki ID")?,
+                                page_id: sql_u64(page_id, "invalid page ID")?,
+                            },
+                            issues,
+                            search_transformer_version: None,
+                        });
+                    }
+                }
+                2 => {
+                    let mut statement = self.connection.prepare(
+                        "SELECT checkpoint.checkpoint_id,
+                                checkpoint.collection_id IS NULL OR EXISTS (
+                                    SELECT 1 FROM collections
+                                    WHERE collections.collection_id = checkpoint.collection_id
+                                      AND collections.wiki_id = checkpoint.wiki_id
+                                ),
+                                (checkpoint.last_run_id IS NULL
+                                    AND checkpoint.committed_through = 0) OR EXISTS (
+                                    SELECT 1 FROM sync_runs AS run
+                                    WHERE run.run_id = checkpoint.last_run_id
+                                ),
+                                checkpoint.last_run_id IS NULL OR EXISTS (
+                                    SELECT 1 FROM sync_runs AS run
+                                    WHERE run.run_id = checkpoint.last_run_id
+                                      AND run.state = 'succeeded'
+                                ),
+                                checkpoint.last_run_id IS NULL OR EXISTS (
+                                    SELECT 1 FROM sync_runs AS run
+                                    WHERE run.run_id = checkpoint.last_run_id
+                                      AND run.wiki_id = checkpoint.wiki_id
+                                      AND run.collection_id IS checkpoint.collection_id
+                                ),
+                                checkpoint.last_run_id IS NULL OR EXISTS (
+                                    SELECT 1 FROM sync_runs AS run
+                                    WHERE run.run_id = checkpoint.last_run_id
+                                      AND run.checkpoint_candidate = checkpoint.committed_through
+                                )
+                         FROM sync_checkpoints AS checkpoint
+                         WHERE checkpoint.checkpoint_id > ?1
+                         ORDER BY checkpoint.checkpoint_id LIMIT ?2",
+                    )?;
+                    let rows = statement.query_map(params![first_key, remaining], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, bool>(1)?,
+                            row.get::<_, bool>(2)?,
+                            row.get::<_, bool>(3)?,
+                            row.get::<_, bool>(4)?,
+                            row.get::<_, bool>(5)?,
+                        ))
+                    })?;
+                    for row in rows {
+                        let (id, collection, run, succeeded, scope, boundary) = row?;
+                        let mut issues = Vec::new();
+                        if !collection {
+                            issues.push(IntegrityMetadataIssue::CheckpointCollectionWikiMismatch);
+                        }
+                        if !run {
+                            issues.push(IntegrityMetadataIssue::CheckpointRunMissing);
+                        } else {
+                            if !succeeded {
+                                issues.push(IntegrityMetadataIssue::CheckpointRunNotSucceeded);
+                            }
+                            if !scope {
+                                issues.push(IntegrityMetadataIssue::CheckpointRunScopeMismatch);
+                            }
+                            if !boundary {
+                                issues.push(IntegrityMetadataIssue::CheckpointBoundaryMismatch);
+                            }
+                        }
+                        records.push(IntegrityMetadataRecord {
+                            subject: IntegrityMetadataSubject::Checkpoint {
+                                checkpoint_id: sql_u64(id, "invalid checkpoint ID")?,
+                            },
+                            issues,
+                            search_transformer_version: None,
+                        });
+                    }
+                }
+                3 => {
+                    let mut statement = self.connection.prepare(
+                        "SELECT document.search_id, document.transformer_version,
+                                EXISTS (
+                                    SELECT 1 FROM pages AS page
+                                    WHERE page.wiki_id = document.wiki_id
+                                      AND page.page_id = document.page_id
+                                ),
+                                EXISTS (
+                                    SELECT 1 FROM revisions AS revision
+                                    WHERE revision.wiki_id = document.wiki_id
+                                      AND revision.revision_id = document.revision_id
+                                ),
+                                EXISTS (
+                                    SELECT 1 FROM revisions AS revision
+                                    WHERE revision.wiki_id = document.wiki_id
+                                      AND revision.revision_id = document.revision_id
+                                      AND revision.page_id = document.page_id
+                                ),
+                                EXISTS (
+                                    SELECT 1 FROM pages AS page
+                                    WHERE page.wiki_id = document.wiki_id
+                                      AND page.page_id = document.page_id
+                                      AND page.current_revision_id = document.revision_id
+                                ),
+                                EXISTS (
+                                    SELECT 1 FROM search_fts
+                                    WHERE search_fts.rowid = document.search_id
+                                )
+                         FROM search_documents AS document
+                         WHERE document.search_id > ?1
+                         ORDER BY document.search_id LIMIT ?2",
+                    )?;
+                    let rows = statement.query_map(params![first_key, remaining], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, bool>(2)?,
+                            row.get::<_, bool>(3)?,
+                            row.get::<_, bool>(4)?,
+                            row.get::<_, bool>(5)?,
+                            row.get::<_, bool>(6)?,
+                        ))
+                    })?;
+                    for row in rows {
+                        let (id, version, page, revision, revision_page, current, fts) = row?;
+                        let mut issues = Vec::new();
+                        if !page {
+                            issues.push(IntegrityMetadataIssue::SearchPageMissing);
+                        }
+                        if !revision {
+                            issues.push(IntegrityMetadataIssue::SearchRevisionMissing);
+                        } else if !revision_page {
+                            issues.push(IntegrityMetadataIssue::SearchRevisionWrongPage);
+                        }
+                        if page && revision && revision_page && !current {
+                            issues.push(IntegrityMetadataIssue::SearchRevisionNotCurrent);
+                        }
+                        if !fts {
+                            issues.push(IntegrityMetadataIssue::SearchFtsRowMissing);
+                        }
+                        records.push(IntegrityMetadataRecord {
+                            subject: IntegrityMetadataSubject::SearchDocument {
+                                search_id: sql_u64(id, "invalid search document ID")?,
+                            },
+                            issues,
+                            search_transformer_version: Some(version),
+                        });
+                    }
+                }
+                4 => {
+                    let mut statement = self.connection.prepare(
+                        "SELECT search_fts.rowid,
+                                EXISTS (
+                                    SELECT 1 FROM search_documents AS document
+                                    WHERE document.search_id = search_fts.rowid
+                                )
+                         FROM search_fts WHERE search_fts.rowid > ?1
+                         ORDER BY search_fts.rowid LIMIT ?2",
+                    )?;
+                    let rows = statement.query_map(params![first_key, remaining], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+                    })?;
+                    for row in rows {
+                        let (row_id, document) = row?;
+                        records.push(IntegrityMetadataRecord {
+                            subject: IntegrityMetadataSubject::SearchFtsRow { row_id },
+                            issues: if document {
+                                Vec::new()
+                            } else {
+                                vec![IntegrityMetadataIssue::SearchFtsRowOrphan]
+                            },
+                            search_transformer_version: None,
+                        });
+                    }
+                }
+                _ => break,
+            }
+
+            if records.len() == before + remaining as usize {
+                break;
+            }
+            category += 1;
+            first_key = -1;
+            second_key = -1;
+        }
+        Ok(records)
+    }
+
     /// Reads, bounds, decompresses, and verifies a canonical object.
     pub fn read_object(&self, id: ObjectId) -> Result<Vec<u8>, StoreError> {
         let (kind, expected_length, locations) = self.object_locations(id)?;
@@ -4859,6 +5384,48 @@ fn validate_sync_text(value: &str, label: &'static str) -> Result<(), StoreError
         return Err(StoreError::InvalidSyncText(label));
     }
     Ok(())
+}
+
+fn validate_mediawiki_timestamp(value: &str) -> Result<(), StoreError> {
+    const ERROR: StoreError = StoreError::InvalidConfig(
+        "MediaWiki timestamp must be a valid UTC value in YYYY-MM-DDTHH:MM:SSZ form",
+    );
+    let bytes = value.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return Err(ERROR);
+    }
+    let year = ascii_decimal(&bytes[0..4]).ok_or(ERROR)?;
+    let month = ascii_decimal(&bytes[5..7]).ok_or(ERROR)?;
+    let day = ascii_decimal(&bytes[8..10]).ok_or(ERROR)?;
+    let hour = ascii_decimal(&bytes[11..13]).ok_or(ERROR)?;
+    let minute = ascii_decimal(&bytes[14..16]).ok_or(ERROR)?;
+    let second = ascii_decimal(&bytes[17..19]).ok_or(ERROR)?;
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let maximum_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return Err(ERROR),
+    };
+    if year == 0 || !(1..=maximum_day).contains(&day) || hour > 23 || minute > 59 || second > 59 {
+        return Err(ERROR);
+    }
+    Ok(())
+}
+
+fn ascii_decimal(bytes: &[u8]) -> Option<u32> {
+    bytes.iter().try_fold(0_u32, |value, byte| {
+        byte.is_ascii_digit()
+            .then(|| value * 10 + u32::from(byte - b'0'))
+    })
 }
 
 fn insert_revision(
@@ -6362,6 +6929,21 @@ pub enum StoreError {
     },
     /// A source identity is not registered in this library.
     WikiNotFound(WikiId),
+    /// A source registration still owns configuration or retained evidence.
+    WikiInUse {
+        /// Source that cannot safely be removed.
+        wiki_id: WikiId,
+        /// Collections still configured for this source.
+        collections: u64,
+        /// Captured pages whose history depends on this source identity.
+        captured_pages: u64,
+        /// Synchronization-run evidence for this source.
+        sync_runs: u64,
+        /// Durable source or collection checkpoints.
+        checkpoints: u64,
+        /// Immutable manifests naming this source.
+        manifests: u64,
+    },
     /// Historical content was supplied for a page not yet present in the library.
     PageNotFound {
         /// Source wiki identity.
@@ -6498,6 +7080,17 @@ impl fmt::Display for StoreError {
                 "collection {resource} estimate {estimated} exceeds hard limit {limit}"
             ),
             Self::WikiNotFound(wiki_id) => write!(formatter, "wiki {wiki_id} was not found"),
+            Self::WikiInUse {
+                wiki_id,
+                collections,
+                captured_pages,
+                sync_runs,
+                checkpoints,
+                manifests,
+            } => write!(
+                formatter,
+                "wiki {wiki_id} is still in use ({collections} collections, {captured_pages} captured pages, {sync_runs} sync runs, {checkpoints} checkpoints, {manifests} manifests)"
+            ),
             Self::PageNotFound { wiki_id, page_id } => {
                 write!(
                     formatter,
@@ -6614,6 +7207,39 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary library");
         let library = Library::open(directory.path()).expect("open library");
         (directory, library)
+    }
+
+    fn capture_test_page(
+        library: &mut Library,
+        wiki_id: WikiId,
+        collection_id: CollectionId,
+        page_id: u64,
+        revision_id: u64,
+        timestamp: &str,
+        title: &str,
+    ) {
+        let title = PageTitle::new(title).expect("fixture title");
+        library
+            .capture_current_revision(
+                wiki_id,
+                collection_id,
+                &CurrentRevisionCapture {
+                    page_id: PageId::new(page_id).expect("fixture page ID"),
+                    namespace: 0,
+                    title: &title,
+                    revision_id: RevisionId::new(revision_id).expect("fixture revision ID"),
+                    parent_id: None,
+                    timestamp,
+                    author: None,
+                    author_id: None,
+                    comment: None,
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: title.as_str().as_bytes(),
+                },
+            )
+            .expect("capture fixture page");
     }
 
     fn filesystem_snapshot(root: &Path) -> Vec<(PathBuf, bool, u32, [u8; 32])> {
@@ -7477,6 +8103,77 @@ mod tests {
     }
 
     #[test]
+    fn used_source_removal_fails_while_empty_source_removal_succeeds() {
+        let (_directory, mut library) = test_library();
+        let used_wiki = library
+            .register_wiki("https://used.example/w/api.php", "used")
+            .expect("used wiki");
+        let empty_wiki = library
+            .register_wiki("https://empty.example/w/api.php", "empty")
+            .expect("empty wiki");
+        let collection_id = library
+            .create_explicit_collection(used_wiki, "Retained evidence")
+            .expect("collection");
+        capture_test_page(
+            &mut library,
+            used_wiki,
+            collection_id,
+            10,
+            20,
+            "2026-08-21T10:00:00Z",
+            "Retained page",
+        );
+        let run_id = library
+            .start_or_resume_sync_run(used_wiki, Some(collection_id), SyncRunKind::Bootstrap, 100)
+            .expect("start run")
+            .status
+            .run_id;
+        library
+            .complete_sync_run(run_id, None)
+            .expect("complete run");
+        library.append_sync_manifest(run_id).expect("manifest");
+
+        assert!(matches!(
+            library.remove_wiki(used_wiki),
+            Err(StoreError::WikiInUse {
+                wiki_id,
+                collections: 1,
+                captured_pages: 1,
+                sync_runs: 1,
+                checkpoints: 1,
+                manifests: 1,
+            }) if wiki_id == used_wiki
+        ));
+        assert!(
+            library
+                .wiki(used_wiki)
+                .expect("used source query")
+                .is_some()
+        );
+        assert!(
+            library
+                .revision(used_wiki, RevisionId::new(20).expect("revision ID"))
+                .expect("retained revision")
+                .is_some()
+        );
+        assert_eq!(library.manifest_count().expect("retained manifest"), 1);
+
+        library
+            .remove_wiki(empty_wiki)
+            .expect("remove empty source");
+        assert!(
+            library
+                .wiki(empty_wiki)
+                .expect("removed source query")
+                .is_none()
+        );
+        assert!(matches!(
+            library.remove_wiki(empty_wiki),
+            Err(StoreError::WikiNotFound(wiki_id)) if wiki_id == empty_wiki
+        ));
+    }
+
+    #[test]
     fn title_list_rules_and_logical_object_pagination_are_durable_and_bounded() {
         let (_directory, mut library) = test_library();
         let wiki_id = library
@@ -8032,6 +8729,169 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn newest_revision_at_or_before_uses_an_inclusive_cutoff() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Historical cutoff")
+            .expect("create collection");
+        let page_id = PageId::new(10).expect("page ID");
+        capture_test_page(
+            &mut library,
+            wiki_id,
+            collection_id,
+            page_id.get(),
+            102,
+            "2026-08-19T12:00:00Z",
+            "Cutoff page",
+        );
+        library
+            .capture_revision(
+                wiki_id,
+                page_id,
+                &RevisionCapture {
+                    revision_id: RevisionId::new(101).expect("revision ID"),
+                    parent_id: None,
+                    timestamp: "2026-08-19T11:00:00Z",
+                    author: None,
+                    author_id: None,
+                    comment: None,
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: b"Older source",
+                },
+            )
+            .expect("capture history");
+
+        let selected = library
+            .newest_revision_for_page_at_or_before(wiki_id, page_id, "2026-08-19T11:00:00Z")
+            .expect("bounded historical query")
+            .expect("revision at inclusive cutoff");
+        assert_eq!(selected.revision_id.get(), 101);
+        assert!(
+            library
+                .newest_revision_for_page_at_or_before(wiki_id, page_id, "2026-08-19T10:59:59Z",)
+                .expect("query before local history")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn newest_revision_at_or_before_isolates_wikis_and_pages() {
+        let (_directory, mut library) = test_library();
+        let first_wiki = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register first wiki");
+        let second_wiki = library
+            .register_wiki("https://de.wikipedia.org/w/api.php", "de")
+            .expect("register second wiki");
+        let first_collection = library
+            .create_explicit_collection(first_wiki, "First wiki")
+            .expect("first collection");
+        let second_collection = library
+            .create_explicit_collection(second_wiki, "Second wiki")
+            .expect("second collection");
+        capture_test_page(
+            &mut library,
+            first_wiki,
+            first_collection,
+            10,
+            100,
+            "2026-08-19T10:00:00Z",
+            "Selected page",
+        );
+        capture_test_page(
+            &mut library,
+            first_wiki,
+            first_collection,
+            20,
+            200,
+            "2026-08-19T12:00:00Z",
+            "Other page",
+        );
+        capture_test_page(
+            &mut library,
+            second_wiki,
+            second_collection,
+            10,
+            300,
+            "2026-08-19T13:00:00Z",
+            "Other wiki page",
+        );
+
+        let selected = library
+            .newest_revision_for_page_at_or_before(
+                first_wiki,
+                PageId::new(10).expect("page ID"),
+                "2026-08-20T00:00:00Z",
+            )
+            .expect("bounded historical query")
+            .expect("selected revision");
+        assert_eq!(selected.revision_id.get(), 100);
+    }
+
+    #[test]
+    fn newest_revision_at_or_before_breaks_equal_timestamps_by_revision_id() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Equal timestamps")
+            .expect("create collection");
+        let page_id = PageId::new(10).expect("page ID");
+        capture_test_page(
+            &mut library,
+            wiki_id,
+            collection_id,
+            page_id.get(),
+            100,
+            "2026-08-19T12:00:00Z",
+            "Tied page",
+        );
+        library
+            .capture_revision(
+                wiki_id,
+                page_id,
+                &RevisionCapture {
+                    revision_id: RevisionId::new(101).expect("revision ID"),
+                    parent_id: Some(RevisionId::new(100).expect("parent ID")),
+                    timestamp: "2026-08-19T12:00:00Z",
+                    author: None,
+                    author_id: None,
+                    comment: None,
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: b"Equal timestamp source",
+                },
+            )
+            .expect("capture tied revision");
+
+        let selected = library
+            .newest_revision_for_page_at_or_before(wiki_id, page_id, "2026-08-19T12:00:00Z")
+            .expect("bounded historical query")
+            .expect("selected revision");
+        assert_eq!(selected.revision_id.get(), 101);
+    }
+
+    #[test]
+    fn newest_revision_at_or_before_rejects_noncanonical_cutoffs() {
+        let (_directory, library) = test_library();
+        let error = library
+            .newest_revision_for_page_at_or_before(
+                WikiId::new(1).expect("wiki ID"),
+                PageId::new(1).expect("page ID"),
+                "2026-08-19T14:00:00+02:00",
+            )
+            .expect_err("offset timestamp must be normalized before querying");
+        assert!(matches!(error, StoreError::InvalidConfig(_)));
     }
 
     #[test]

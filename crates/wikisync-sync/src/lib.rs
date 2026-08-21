@@ -299,6 +299,94 @@ pub fn commit_collection_preview(
     library.commit_resolved_membership(collection_id, &preview.members)
 }
 
+/// Outcome of periodically re-resolving a collection's dynamic membership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DynamicMembershipReconciliation {
+    /// Fixed-title rules are not dynamic and were left completely unchanged.
+    StaticRule,
+    /// A category rule was completely re-resolved and atomically committed.
+    Category {
+        /// Number of bounded category-member responses consumed by the preview.
+        category_batches: usize,
+        /// Active and newly removed membership counts from the atomic commit.
+        membership: MembershipCommit,
+    },
+}
+
+/// Re-resolves a configured category rule before synchronizing its active members.
+///
+/// The bounded category preview completes without mutating the library. Only a
+/// successful complete preview that fits the collection's configured budget reaches
+/// the store's atomic membership commit, where the configured removal policy is
+/// applied. Explicit-title and title-list collections are stable selections and are
+/// returned as a no-op without contacting MediaWiki.
+pub async fn reconcile_dynamic_collection_membership(
+    client: &MediaWikiClient,
+    library: &mut Library,
+    collection_id: CollectionId,
+    limits: CategoryPreviewLimits,
+) -> Result<DynamicMembershipReconciliation, DynamicMembershipReconciliationError> {
+    let configuration = library
+        .collection_configuration(collection_id)?
+        .ok_or(StoreError::CollectionNotConfigured(collection_id))?;
+    if !matches!(&configuration.rule, CollectionRule::Category { .. }) {
+        return Ok(DynamicMembershipReconciliation::StaticRule);
+    }
+
+    let preview = preview_collection_rule(client, &configuration.rule, limits).await?;
+    let page_count = u64::try_from(preview.members.len())
+        .map_err(|_| StoreError::InvalidConfig("collection preview is too large"))?;
+    library.record_collection_estimate(
+        collection_id,
+        page_count,
+        preview.predicted_canonical_bytes,
+    )?;
+    let membership = library.commit_resolved_membership(collection_id, &preview.members)?;
+    Ok(DynamicMembershipReconciliation::Category {
+        category_batches: preview.category_batches,
+        membership,
+    })
+}
+
+/// A store or non-mutating preview failure during dynamic membership reconciliation.
+#[derive(Debug)]
+pub enum DynamicMembershipReconciliationError {
+    /// Reading configuration, enforcing budgets, or committing membership failed.
+    Store(StoreError),
+    /// The bounded category preview did not complete successfully.
+    Preview(CollectionPreviewError),
+}
+
+impl fmt::Display for DynamicMembershipReconciliationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(error) => error.fmt(formatter),
+            Self::Preview(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for DynamicMembershipReconciliationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Store(error) => Some(error),
+            Self::Preview(error) => Some(error),
+        }
+    }
+}
+
+impl From<StoreError> for DynamicMembershipReconciliationError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<CollectionPreviewError> for DynamicMembershipReconciliationError {
+    fn from(error: CollectionPreviewError) -> Self {
+        Self::Preview(error)
+    }
+}
+
 /// A source or category-preview failure while resolving a collection rule.
 #[derive(Debug)]
 pub enum CollectionPreviewError {

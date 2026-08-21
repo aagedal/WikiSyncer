@@ -8,12 +8,14 @@
 
 use std::error::Error;
 use std::fmt;
-use std::net::IpAddr;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{StatusCode, Url, redirect};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -29,6 +31,7 @@ const DEFAULT_REVISIONS_PER_REQUEST: usize = 500;
 const DEFAULT_CATEGORY_MEMBERS_PER_REQUEST: usize = 500;
 const DEFAULT_RETRY_ATTEMPTS: usize = 4;
 const DEFAULT_CIRCUIT_FAILURE_THRESHOLD: usize = 3;
+const MAX_RESOLVED_DESTINATIONS: usize = 32;
 
 static NEXT_JITTER_SEED: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
 
@@ -122,6 +125,7 @@ impl Default for RetryPolicy {
 pub struct ClientConfig {
     endpoint: Url,
     allowed_source_hosts: Vec<String>,
+    destination_policy: DestinationPolicy,
     user_agent: String,
     request_timeout: Duration,
     connect_timeout: Duration,
@@ -160,6 +164,7 @@ impl ClientConfig {
                     .expect("validated endpoint has a host")
                     .to_ascii_lowercase(),
             ],
+            destination_policy: DestinationPolicy::for_endpoint(&endpoint),
             endpoint,
             user_agent,
             request_timeout: Duration::from_secs(30),
@@ -318,19 +323,230 @@ fn validate_endpoint(endpoint: &Url) -> Result<(), ConfigError> {
     }
 
     match endpoint.scheme() {
+        "https" if endpoint_host_is_statically_unsafe(endpoint) => {
+            Err(ConfigError::UnsafeDestination)
+        }
         "https" => Ok(()),
         "http" if is_loopback(endpoint) => Ok(()),
         _ => Err(ConfigError::HttpsRequired),
     }
 }
 
+fn endpoint_host_is_statically_unsafe(endpoint: &Url) -> bool {
+    endpoint.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || parse_endpoint_ip(host).is_some_and(|address| !is_public_destination(address))
+    })
+}
+
+fn parse_endpoint_ip(host: &str) -> Option<IpAddr> {
+    host.parse().ok().or_else(|| {
+        host.strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .and_then(|host| host.parse().ok())
+    })
+}
+
 fn is_loopback(endpoint: &Url) -> bool {
     endpoint.host_str().is_some_and(|host| {
         host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
+            || parse_endpoint_ip(host).is_some_and(|address| address.is_loopback())
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DestinationPolicy {
+    PublicOnly,
+    LoopbackFixture,
+}
+
+impl DestinationPolicy {
+    fn for_endpoint(endpoint: &Url) -> Self {
+        if endpoint.scheme() == "http" && is_loopback(endpoint) {
+            Self::LoopbackFixture
+        } else {
+            Self::PublicOnly
+        }
+    }
+
+    fn permits(self, address: IpAddr) -> bool {
+        match self {
+            Self::PublicOnly => is_public_destination(address),
+            Self::LoopbackFixture => is_loopback_address(address),
+        }
+    }
+}
+
+fn is_loopback_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => address.is_loopback(),
+        IpAddr::V6(address) => {
+            address.is_loopback()
+                || address
+                    .to_ipv4_mapped()
+                    .is_some_and(|address| address.is_loopback())
+        }
+    }
+}
+
+fn is_public_destination(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_ipv4(address),
+        IpAddr::V6(address) => is_public_ipv6(address),
+    }
+}
+
+fn is_public_ipv4(address: Ipv4Addr) -> bool {
+    let value = u32::from(address);
+    ![
+        (0x0000_0000, 0xff00_0000), // current host / unspecified
+        (0x0a00_0000, 0xff00_0000), // private
+        (0x6440_0000, 0xffc0_0000), // shared address space
+        (0x7f00_0000, 0xff00_0000), // loopback
+        (0xa9fe_0000, 0xffff_0000), // link-local
+        (0xac10_0000, 0xfff0_0000), // private
+        (0xc000_0000, 0xffff_ff00), // IETF protocol assignments
+        (0xc000_0200, 0xffff_ff00), // documentation
+        (0xc058_6300, 0xffff_ff00), // deprecated 6to4 relay anycast
+        (0xc0a8_0000, 0xffff_0000), // private
+        (0xc612_0000, 0xfffe_0000), // benchmarking
+        (0xc633_6400, 0xffff_ff00), // documentation
+        (0xcb00_7100, 0xffff_ff00), // documentation
+        (0xe000_0000, 0xf000_0000), // multicast
+        (0xf000_0000, 0xf000_0000), // reserved and broadcast
+    ]
+    .iter()
+    .any(|(network, mask)| value & mask == *network)
+}
+
+fn is_public_ipv6(address: Ipv6Addr) -> bool {
+    let segments = address.segments();
+    if address.is_unspecified()
+        || address.is_loopback()
+        || segments[0] & 0xfe00 == 0xfc00 // unique-local
+        || segments[0] & 0xffc0 == 0xfe80 // link-local
+        || segments[0] & 0xffc0 == 0xfec0 // deprecated site-local
+        || segments[0] & 0xff00 == 0xff00 // multicast
+        || (segments[0] == 0x0100 && segments[1..4] == [0, 0, 0]) // discard-only
+        || segments[..4] == [0x0100, 0, 0, 1] // dummy IPv6 prefix
+        || (segments[0] == 0x2001 && segments[1] <= 0x01ff) // special-use /23
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8) // documentation
+        || segments[0] & 0xfff0 == 0x3ff0 // documentation
+        || (segments[0] == 0x5f00)
+    // segment-routing local-use block
+    {
+        return false;
+    }
+
+    // IPv4-mapped destinations and transition prefixes must not smuggle an unsafe
+    // IPv4 target through an otherwise syntactically IPv6 address.
+    if let Some(mapped) = address.to_ipv4_mapped() {
+        return is_public_ipv4(mapped);
+    }
+    if segments[..6] == [0, 0, 0, 0, 0, 0] {
+        return false;
+    }
+    if segments[0] == 0x2002 {
+        return is_public_ipv4(Ipv4Addr::new(
+            (segments[1] >> 8) as u8,
+            segments[1] as u8,
+            (segments[2] >> 8) as u8,
+            segments[2] as u8,
+        ));
+    }
+    if segments[..3] == [0x0064, 0xff9b, 0] {
+        return is_public_ipv4(Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        ));
+    }
+    if segments[..3] == [0x0064, 0xff9b, 1] {
+        return false;
+    }
+
+    true
+}
+
+struct SystemResolver;
+
+impl Resolve for SystemResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addresses = tokio::net::lookup_host((host, 0)).await?;
+            Ok(Box::new(addresses) as Addrs)
+        })
+    }
+}
+
+struct DestinationResolver {
+    source_host: String,
+    policy: DestinationPolicy,
+    inner: Arc<dyn Resolve>,
+}
+
+impl DestinationResolver {
+    fn system(source_host: String, policy: DestinationPolicy) -> Self {
+        Self {
+            source_host,
+            policy,
+            inner: Arc::new(SystemResolver),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_inner(
+        source_host: impl Into<String>,
+        policy: DestinationPolicy,
+        inner: Arc<dyn Resolve>,
+    ) -> Self {
+        Self {
+            source_host: source_host.into(),
+            policy,
+            inner,
+        }
+    }
+}
+
+impl Resolve for DestinationResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        if !name.as_str().eq_ignore_ascii_case(&self.source_host) {
+            return Box::pin(std::future::ready(Err(dns_policy_error(
+                "refused DNS resolution outside the configured source host",
+            ))));
+        }
+
+        let resolving = self.inner.resolve(name);
+        let policy = self.policy;
+        Box::pin(async move {
+            let mut approved = Vec::new();
+            for address in resolving.await? {
+                if approved.len() == MAX_RESOLVED_DESTINATIONS {
+                    return Err(dns_policy_error(
+                        "source DNS answer exceeded the destination-address limit",
+                    ));
+                }
+                if !policy.permits(address.ip()) {
+                    return Err(dns_policy_error(
+                        "source DNS answer contained a non-public destination",
+                    ));
+                }
+                approved.push(address);
+            }
+            if approved.is_empty() {
+                return Err(dns_policy_error(
+                    "source DNS answer contained no destinations",
+                ));
+            }
+            Ok(Box::new(approved.into_iter()) as Addrs)
+        })
+    }
+}
+
+fn dns_policy_error(message: &'static str) -> Box<dyn Error + Send + Sync> {
+    Box::new(io::Error::new(io::ErrorKind::PermissionDenied, message))
 }
 
 /// A client-configuration validation error.
@@ -340,6 +556,8 @@ pub enum ConfigError {
     InvalidEndpoint(String),
     /// The endpoint contained credentials, a query, a fragment, or no host.
     UnsafeEndpoint,
+    /// A literal endpoint host is not a globally routable destination.
+    UnsafeDestination,
     /// Remote Action API endpoints must use HTTPS.
     HttpsRequired,
     /// The User-Agent was empty or contained a control character.
@@ -371,6 +589,9 @@ impl fmt::Display for ConfigError {
             Self::InvalidEndpoint(error) => write!(formatter, "invalid API endpoint: {error}"),
             Self::UnsafeEndpoint => formatter.write_str(
                 "API endpoint must be an absolute URL without credentials, query, or fragment",
+            ),
+            Self::UnsafeDestination => formatter.write_str(
+                "API endpoint host must be globally routable (loopback HTTP is fixture-only)",
             ),
             Self::HttpsRequired => {
                 formatter.write_str("API endpoint must use HTTPS unless it is loopback-only")
@@ -612,10 +833,22 @@ impl MediaWikiClient {
         let redirect_endpoint = config.endpoint.clone();
         let redirect_allowed_hosts = config.allowed_source_hosts.clone();
         let max_redirects = config.max_redirects;
+        let resolver = DestinationResolver::system(
+            config
+                .endpoint
+                .host_str()
+                .expect("validated endpoint has a host")
+                .to_ascii_lowercase(),
+            config.destination_policy,
+        );
         let http = reqwest::Client::builder()
             .user_agent(&config.user_agent)
             .timeout(config.request_timeout)
             .connect_timeout(config.connect_timeout)
+            // A proxy would resolve/connect the source outside this client's
+            // destination policy and would introduce a second source trust boundary.
+            .no_proxy()
+            .dns_resolver(Arc::new(resolver))
             .redirect(redirect::Policy::custom(move |attempt| {
                 if attempt.previous().len() > max_redirects {
                     return attempt.error("MediaWiki redirect limit exceeded");
@@ -1611,7 +1844,36 @@ struct ApiErrorPayload {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::net::SocketAddr;
+
     use super::*;
+
+    struct ScriptedResolver {
+        answers: Mutex<VecDeque<Vec<SocketAddr>>>,
+    }
+
+    impl ScriptedResolver {
+        fn new(answers: Vec<Vec<SocketAddr>>) -> Self {
+            Self {
+                answers: Mutex::new(answers.into()),
+            }
+        }
+    }
+
+    impl Resolve for ScriptedResolver {
+        fn resolve(&self, _name: Name) -> Resolving {
+            let answer = self
+                .answers
+                .lock()
+                .expect("scripted DNS lock")
+                .pop_front()
+                .expect("scripted DNS answer");
+            Box::pin(std::future::ready(
+                Ok(Box::new(answer.into_iter()) as Addrs),
+            ))
+        }
+    }
 
     #[test]
     fn endpoint_policy_requires_https_except_on_loopback() {
@@ -1630,6 +1892,156 @@ mod tests {
             ClientConfig::new("https://user@example.com/api.php", "WikiSyncer/0.1"),
             Err(ConfigError::UnsafeEndpoint)
         ));
+        for endpoint in [
+            "https://127.0.0.1/api.php",
+            "https://10.0.0.1/api.php",
+            "https://[::1]/api.php",
+            "https://localhost/api.php",
+        ] {
+            assert!(matches!(
+                ClientConfig::new(endpoint, "WikiSyncer/0.1"),
+                Err(ConfigError::UnsafeDestination)
+            ));
+        }
+    }
+
+    #[test]
+    fn destination_policy_rejects_private_and_special_use_addresses() {
+        for address in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.16.0.1",
+            "192.0.2.1",
+            "192.168.1.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::ffff:127.0.0.1",
+            "64:ff9b::a00:1",
+            "100::1",
+            "2001:2::1",
+            "2001:db8::1",
+            "2002:ac10:1::",
+            "3fff::1",
+            "5f00::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            let address = address.parse::<IpAddr>().expect("test address");
+            assert!(!is_public_destination(address), "accepted {address}");
+        }
+        for address in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            let address = address.parse::<IpAddr>().expect("test address");
+            assert!(is_public_destination(address), "rejected {address}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_revalidates_rebinding_answers_and_rejects_the_unsafe_answer() {
+        let inner = Arc::new(ScriptedResolver::new(vec![
+            vec!["8.8.8.8:0".parse().expect("public address")],
+            vec!["127.0.0.1:0".parse().expect("loopback address")],
+        ]));
+        let resolver =
+            DestinationResolver::with_inner("source.example", DestinationPolicy::PublicOnly, inner);
+
+        let first = resolver
+            .resolve("source.example".parse().expect("DNS name"))
+            .await
+            .expect("first public DNS answer")
+            .collect::<Vec<_>>();
+        assert_eq!(first, ["8.8.8.8:0".parse::<SocketAddr>().expect("address")]);
+
+        let Err(error) = resolver
+            .resolve("source.example".parse().expect("DNS name"))
+            .await
+        else {
+            panic!("rebound loopback destination must fail closed");
+        };
+        assert!(error.to_string().contains("non-public destination"));
+    }
+
+    #[tokio::test]
+    async fn resolver_rejects_a_mixed_answer_instead_of_filtering_it() {
+        let inner = Arc::new(ScriptedResolver::new(vec![vec![
+            "8.8.8.8:0".parse().expect("public address"),
+            "192.168.1.1:0".parse().expect("private address"),
+        ]]));
+        let resolver =
+            DestinationResolver::with_inner("source.example", DestinationPolicy::PublicOnly, inner);
+
+        assert!(
+            resolver
+                .resolve("source.example".parse().expect("DNS name"))
+                .await
+                .is_err(),
+            "mixed DNS answer must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_rejects_unexpected_hosts_and_oversized_answers() {
+        let addresses = (0..=MAX_RESOLVED_DESTINATIONS)
+            .map(|index| SocketAddr::from(([8, 8, 8, (index + 1) as u8], 0)))
+            .collect();
+        let inner = Arc::new(ScriptedResolver::new(vec![addresses]));
+        let resolver =
+            DestinationResolver::with_inner("source.example", DestinationPolicy::PublicOnly, inner);
+
+        assert!(
+            resolver
+                .resolve("other.example".parse().expect("DNS name"))
+                .await
+                .is_err(),
+            "resolver must stay bound to the configured source host"
+        );
+        assert!(
+            resolver
+                .resolve("source.example".parse().expect("DNS name"))
+                .await
+                .is_err(),
+            "oversized DNS answer must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_rejects_an_empty_answer() {
+        let inner = Arc::new(ScriptedResolver::new(vec![Vec::new()]));
+        let resolver =
+            DestinationResolver::with_inner("source.example", DestinationPolicy::PublicOnly, inner);
+
+        assert!(
+            resolver
+                .resolve("source.example".parse().expect("DNS name"))
+                .await
+                .is_err(),
+            "empty DNS answer must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_fixture_policy_accepts_only_loopback_answers() {
+        let inner = Arc::new(ScriptedResolver::new(vec![vec![
+            "127.0.0.1:0".parse().expect("loopback address"),
+            "[::1]:0".parse().expect("loopback address"),
+        ]]));
+        let resolver =
+            DestinationResolver::with_inner("localhost", DestinationPolicy::LoopbackFixture, inner);
+
+        assert_eq!(
+            resolver
+                .resolve("localhost".parse().expect("DNS name"))
+                .await
+                .expect("loopback fixture DNS answer")
+                .count(),
+            2
+        );
     }
 
     #[test]

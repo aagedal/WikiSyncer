@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -15,7 +17,11 @@ use wikisync_core::{
     CollectionBudget, CollectionId, CollectionRemovalPolicy, CollectionRule, HistoryPolicy,
     PageTitle, UnixTimestamp,
 };
-use wikisync_integrity::{VerificationReport, VerificationScope, verify_library};
+use wikisync_integrity::{
+    MAX_TRUSTED_HEAD_BYTES, ManifestSigningKey, TrustedManifestHead, VerificationFindingKind,
+    VerificationOptions, VerificationReport, VerificationScope, sign_current_manifest_head,
+    verify_library, verify_library_against_trusted_head,
+};
 use wikisync_mediawiki::ClientConfig;
 use wikisync_store::{
     CollectionSchedule, Library, NetworkTransferPolicy, ScheduleCadence, StoredCollection,
@@ -34,6 +40,7 @@ use wikisyncd::{
 
 const DATABASE_NAME: &str = "library.sqlite3";
 const RECENT_REVISION_LIMIT: u32 = 12;
+const MAX_SIGNING_KEY_BYTES: u64 = 16 * 1024;
 
 fn main() -> iced::Result {
     iced::application("WikiSyncer", App::update, App::view)
@@ -59,6 +66,8 @@ struct App {
     network_policy_editor: NetworkPolicyEditor,
     selection_preview: Option<CollectionSelectionPreview>,
     verification: VerificationState,
+    signing_key_path: String,
+    trusted_head_path: String,
     reader: Option<Arc<ReaderHandle>>,
 }
 
@@ -85,6 +94,8 @@ impl App {
             network_policy_editor: NetworkPolicyEditor::default(),
             selection_preview: None,
             verification: VerificationState::NotRun,
+            signing_key_path: String::new(),
+            trusted_head_path: String::new(),
             reader: None,
         };
         (app, probe_task(probe_key))
@@ -511,14 +522,146 @@ impl App {
                     Err(error) => self.notice = Some(Notice::error(error)),
                 }
             }
+            Message::SigningKeyPathChanged(value) => {
+                if !self.is_busy() {
+                    self.signing_key_path = value;
+                }
+            }
+            Message::TrustedHeadPathChanged(value) => {
+                if !self.is_busy() {
+                    self.trusted_head_path = value;
+                }
+            }
+            Message::GenerateSigningKey => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let key_path = match explicit_artifact_path(
+                    &self.library_path,
+                    &self.signing_key_path,
+                    "Signing key",
+                ) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.notice = Some(Notice::error(error));
+                        return Task::none();
+                    }
+                };
+                self.notice = None;
+                let key = self.begin_request(PathBuf::from(&self.library_path));
+                return generate_signing_key_task(key, key_path);
+            }
+            Message::SigningKeyGenerated(completion) => {
+                if !self.finish_request(&completion.key) {
+                    return Task::none();
+                }
+                self.notice = Some(match completion.result {
+                    Ok(summary) => Notice::success(summary),
+                    Err(error) => Notice::error(error),
+                });
+            }
+            Message::ValidateSigningKey => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let key_path = match explicit_artifact_path(
+                    &self.library_path,
+                    &self.signing_key_path,
+                    "Signing key",
+                ) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.notice = Some(Notice::error(error));
+                        return Task::none();
+                    }
+                };
+                self.notice = None;
+                let key = self.begin_request(PathBuf::from(&self.library_path));
+                return validate_signing_key_task(key, key_path);
+            }
+            Message::SigningKeyValidated(completion) => {
+                if !self.finish_request(&completion.key) {
+                    return Task::none();
+                }
+                self.notice = Some(match completion.result {
+                    Ok(summary) => Notice::success(summary),
+                    Err(error) => Notice::error(error),
+                });
+            }
+            Message::RefreshTrustedHead => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let key_path = match explicit_artifact_path(
+                    &self.library_path,
+                    &self.signing_key_path,
+                    "Signing key",
+                ) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.notice = Some(Notice::error(error));
+                        return Task::none();
+                    }
+                };
+                let trusted_head_path = match explicit_artifact_path(
+                    &self.library_path,
+                    &self.trusted_head_path,
+                    "Trusted-head anchor",
+                ) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.notice = Some(Notice::error(error));
+                        return Task::none();
+                    }
+                };
+                self.verification = VerificationState::Running(VerificationKind::AnchorRefresh);
+                self.notice = None;
+                let key = self.begin_request(PathBuf::from(&self.library_path));
+                return refresh_trusted_head_task(key, key_path, trusted_head_path);
+            }
+            Message::TrustedHeadRefreshed(completion) => {
+                if !self.finish_request(&completion.key) {
+                    return Task::none();
+                }
+                self.notice = Some(match completion.result {
+                    Ok(result) => {
+                        self.verification = VerificationState::Complete(result.report);
+                        Notice::success(result.summary)
+                    }
+                    Err(error) => {
+                        self.verification = VerificationState::Failed(error.clone());
+                        Notice::error(error)
+                    }
+                });
+            }
             Message::VerifyFull => {
                 if self.is_busy() {
                     return Task::none();
                 }
-                self.verification = VerificationState::Running;
+                self.verification = VerificationState::Running(VerificationKind::Local);
                 self.notice = None;
                 let key = self.begin_request(PathBuf::from(&self.library_path));
                 return verification_task(key);
+            }
+            Message::VerifyTrustedHead => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let trusted_head_path = match explicit_artifact_path(
+                    &self.library_path,
+                    &self.trusted_head_path,
+                    "Trusted-head anchor",
+                ) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.notice = Some(Notice::error(error));
+                        return Task::none();
+                    }
+                };
+                self.verification = VerificationState::Running(VerificationKind::TrustedHead);
+                self.notice = None;
+                let key = self.begin_request(PathBuf::from(&self.library_path));
+                return trusted_verification_task(key, trusted_head_path);
             }
             Message::VerificationFinished(completion) => {
                 if !self.finish_request(&completion.key) {
@@ -1096,36 +1239,35 @@ impl App {
         content.into()
     }
 
-    fn integrity_view<'a>(&self, snapshot: &'a DashboardSnapshot) -> Element<'a, Message> {
+    fn integrity_view<'a>(&'a self, snapshot: &'a DashboardSnapshot) -> Element<'a, Message> {
         let result: Element<'_, Message> = match &self.verification {
             VerificationState::NotRun => {
                 text("No read verification has run in this session.").into()
             }
-            VerificationState::Running => {
-                text("Reading and hash-verifying every logical content object…").into()
-            }
-            VerificationState::Complete(report) => column![
-                text(format!(
-                    "Verified {} of {} logical objects ({} canonical bytes).",
-                    report.objects_verified, report.objects_at_start, report.canonical_bytes_verified
-                )),
-                text(if report.is_verified_since_capture() {
-                    "Complete: every captured canonical object in the stable catalog was verified since capture. This does not establish that its statements are true."
-                } else {
-                    "Verification did not establish complete clean coverage. Review the finding count and local diagnostics."
-                }),
-                text(format!("{} finding(s); {} detailed finding(s) retained.", report.finding_count, report.findings.len())),
-            ]
-            .spacing(6)
+            VerificationState::Running(kind) => text(match kind {
+                VerificationKind::Local => {
+                    "Reading and hash-verifying the full library, manifest chain, and metadata references…"
+                }
+                VerificationKind::TrustedHead => {
+                    "Running full verification and comparing the manifest-chain head with the external Ed25519 anchor…"
+                }
+                VerificationKind::AnchorRefresh => {
+                    "Signing the observed head in memory, then running full authenticated verification before publishing the external anchor…"
+                }
+            })
             .into(),
+            VerificationState::Complete(report) => verification_report_view(report),
             VerificationState::Failed(error) => {
                 text(format!("Verification stopped: {error}")).into()
             }
         };
 
+        let controls_enabled =
+            !self.is_busy() && !matches!(self.verification, VerificationState::Running(_));
+
         column![
             text("Integrity").size(30),
-            text("WikiSyncer content objects have content-derived identities. Shared store reads decompress, bound, and hash-check canonical bytes before returning them."),
+            text("WikiSyncer can prove that captured canonical bytes, manifests, and internal references remain consistent with their recorded identities. It cannot prove that an upstream statement was true, unbiased, complete, or still available."),
             row![
                 metric("Schema version", snapshot.schema_version.to_string()),
                 metric(
@@ -1135,13 +1277,44 @@ impl App {
                 metric("Files on disk", storage_files_label(&snapshot.storage_usage)),
             ]
             .spacing(12),
-            button("Verify full library").on_press_maybe(
-                (!self.is_busy()
-                    && !matches!(self.verification, VerificationState::Running))
-                    .then_some(Message::VerifyFull),
-            ),
+            row![
+                button("Verify full library")
+                    .on_press_maybe(controls_enabled.then_some(Message::VerifyFull)),
+                button("Verify against external anchor")
+                    .on_press_maybe(controls_enabled.then_some(Message::VerifyTrustedHead)),
+            ]
+            .spacing(8),
             result,
-            text("Full verification covers logical canonical objects, including packed reconstruction and hashes. Manifest-chain and search-pointer verification remain separately tracked hardening work.").size(13),
+            horizontal_rule(1),
+            text("External Ed25519 trust anchor").size(23),
+            text("Choose explicit paths outside the library. WikiSyncer never silently stores the only trusted-head anchor beside the library it is meant to detect replacement or rollback of."),
+            text("Private signing key (PKCS#8)").size(14),
+            text_input("/separate/private/location/wikisync-signing-key.pk8", &self.signing_key_path)
+                .on_input(Message::SigningKeyPathChanged)
+                .padding(10),
+            row![
+                button("Generate new key")
+                    .on_press_maybe(controls_enabled.then_some(Message::GenerateSigningKey)),
+                button("Validate existing key")
+                    .on_press_maybe(controls_enabled.then_some(Message::ValidateSigningKey)),
+            ]
+            .spacing(8),
+            text("Generation never overwrites an existing file and creates a private 0600 file on Unix. Import/use is explicit: enter an existing protected PKCS#8 path, validate it, then refresh the anchor. Back up the key separately; the anchor contains only its public key.").size(13),
+            text("Trusted-head anchor (canonical JSON)").size(14),
+            text_input("/separate/trusted/location/wikisync-trusted-head.json", &self.trusted_head_path)
+                .on_input(Message::TrustedHeadPathChanged)
+                .padding(10),
+            button("Full verify, sign, and refresh anchor")
+                .on_press_maybe(controls_enabled.then_some(Message::RefreshTrustedHead)),
+            text("Refresh after the library advances. Keep independent copies or history for the anchor: replacing both the library and its only anchor defeats comparison. A valid older anchor is intentionally reported as a mismatch, not silently accepted.").size(13),
+            container(
+                column![
+                    text("Rotation and recovery").size(18),
+                    text("To rotate, generate a key at a new path, retain the previous anchor for audit/recovery, then refresh the anchor with the new key. If the key or anchor is lost, first establish the expected library state from an independent backup or other trusted evidence; only then create a replacement. A fresh self-signed anchor alone cannot turn an uncertain library into trusted truth."),
+                ]
+                .spacing(7),
+            )
+            .padding(12),
         ]
         .spacing(14)
         .into()
@@ -1205,7 +1378,16 @@ enum Message {
     AvoidMeteredNetworksChanged(bool),
     SaveNetworkPolicy,
     NetworkPolicySaved(ScopedResult<DashboardSnapshot>),
+    SigningKeyPathChanged(String),
+    TrustedHeadPathChanged(String),
+    GenerateSigningKey,
+    SigningKeyGenerated(ScopedResult<String>),
+    ValidateSigningKey,
+    SigningKeyValidated(ScopedResult<String>),
+    RefreshTrustedHead,
+    TrustedHeadRefreshed(ScopedResult<AnchorRefreshResult>),
     VerifyFull,
+    VerifyTrustedHead,
     VerificationFinished(ScopedResult<VerificationReport>),
     OpenReader,
     ReaderStarted(ScopedResult<Arc<ReaderHandle>>),
@@ -1526,9 +1708,22 @@ struct CreateCollectionRequest {
 #[derive(Clone, Debug)]
 enum VerificationState {
     NotRun,
-    Running,
+    Running(VerificationKind),
     Complete(VerificationReport),
     Failed(String),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum VerificationKind {
+    Local,
+    TrustedHead,
+    AnchorRefresh,
+}
+
+#[derive(Clone, Debug)]
+struct AnchorRefreshResult {
+    report: VerificationReport,
+    summary: String,
 }
 
 #[derive(Debug)]
@@ -1649,6 +1844,56 @@ fn verification_task(key: RequestKey) -> Task<Message> {
             ScopedResult { key, result }
         },
         Message::VerificationFinished,
+    )
+}
+
+fn trusted_verification_task(key: RequestKey, trusted_head_path: PathBuf) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = verify_against_trusted_head(key.path.clone(), &trusted_head_path).await;
+            ScopedResult { key, result }
+        },
+        Message::VerificationFinished,
+    )
+}
+
+fn generate_signing_key_task(key: RequestKey, signing_key_path: PathBuf) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = generate_signing_key(&signing_key_path);
+            ScopedResult { key, result }
+        },
+        Message::SigningKeyGenerated,
+    )
+}
+
+fn validate_signing_key_task(key: RequestKey, signing_key_path: PathBuf) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = load_signing_key(&signing_key_path).map(|_| {
+                format!(
+                    "Validated the protected Ed25519 signing key at {}.",
+                    signing_key_path.display()
+                )
+            });
+            ScopedResult { key, result }
+        },
+        Message::SigningKeyValidated,
+    )
+}
+
+fn refresh_trusted_head_task(
+    key: RequestKey,
+    signing_key_path: PathBuf,
+    trusted_head_path: PathBuf,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result =
+                refresh_trusted_head(key.path.clone(), &signing_key_path, &trusted_head_path).await;
+            ScopedResult { key, result }
+        },
+        Message::TrustedHeadRefreshed,
     )
 }
 
@@ -1943,8 +2188,280 @@ fn unix_time_seconds() -> Result<u64, String> {
 }
 
 async fn verify_all_objects(path: PathBuf) -> Result<VerificationReport, String> {
-    let library = Library::open(path).map_err(|error| error.to_string())?;
+    let library = Library::open_read_only(path).map_err(|error| error.to_string())?;
     verify_library(&library, VerificationScope::Full).map_err(|error| error.to_string())
+}
+
+async fn verify_against_trusted_head(
+    library_path: PathBuf,
+    trusted_head_path: &Path,
+) -> Result<VerificationReport, String> {
+    let trusted_head = load_trusted_head(trusted_head_path)?;
+    let library = Library::open_read_only(library_path).map_err(|error| error.to_string())?;
+    verify_library_against_trusted_head(
+        &library,
+        VerificationOptions::new(VerificationScope::Full),
+        &trusted_head,
+    )
+    .map_err(|error| error.to_string())
+}
+
+async fn refresh_trusted_head(
+    library_path: PathBuf,
+    signing_key_path: &Path,
+    trusted_head_path: &Path,
+) -> Result<AnchorRefreshResult, String> {
+    let signing_key = load_signing_key(signing_key_path)?;
+    let library = Library::open_read_only(library_path).map_err(|error| error.to_string())?;
+    let trusted_head = sign_current_manifest_head(&library, &signing_key)
+        .map_err(|error| format!("Could not sign the current manifest head: {error}"))?;
+    let report = verify_library_against_trusted_head(
+        &library,
+        VerificationOptions::new(VerificationScope::Full),
+        &trusted_head,
+    )
+    .map_err(|error| format!("Pre-publication full verification failed: {error}"))?;
+    if !report.is_authenticated_against_trusted_head() {
+        return Err(format!(
+            "Refusing to publish the trusted head because full authenticated verification retained {} finding(s) or incomplete coverage. The library may have changed during verification; investigate it without replacing the external anchor.",
+            report.finding_count
+        ));
+    }
+    let canonical = trusted_head
+        .to_canonical_json()
+        .map_err(|error| error.to_string())?;
+    let retained = write_trusted_head(trusted_head_path, &canonical)?;
+    let retained = retained.map_or_else(String::new, |path| {
+        format!(" The previous anchor was retained at {}.", path.display())
+    });
+    Ok(AnchorRefreshResult {
+        report,
+        summary: format!(
+            "Full verification passed and trusted manifest head {} was signed to {} (public-key ID {}).{} Keep the anchor separate from every library copy.",
+            trusted_head.sequence,
+            trusted_head_path.display(),
+            public_key_id(trusted_head.public_key()),
+            retained,
+        ),
+    })
+}
+
+fn explicit_artifact_path(
+    library_path: &str,
+    artifact_path: &str,
+    label: &str,
+) -> Result<PathBuf, String> {
+    let artifact = PathBuf::from(artifact_path.trim());
+    if artifact.as_os_str().is_empty() {
+        return Err(format!("{label} path is required."));
+    }
+    if !artifact.is_absolute() {
+        return Err(format!(
+            "{label} path must be absolute so its external location is unambiguous."
+        ));
+    }
+    let file_name = artifact
+        .file_name()
+        .ok_or_else(|| format!("{label} path must name a file."))?;
+    let parent = artifact
+        .parent()
+        .ok_or_else(|| format!("{label} path must have a parent directory."))?;
+    let canonical_parent = parent.canonicalize().map_err(|error| {
+        format!(
+            "Cannot access the parent directory for {label} at {}: {error}",
+            parent.display()
+        )
+    })?;
+    let resolved = canonical_parent.join(file_name);
+    let library = Path::new(library_path.trim())
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve the library directory: {error}"))?;
+    if resolved.starts_with(&library) {
+        return Err(format!(
+            "{label} must be stored outside the library directory; choose a separately retained location."
+        ));
+    }
+    match fs::symlink_metadata(&resolved) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(format!("{label} path must not be a symbolic link."))
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            Err(format!("{label} path must name a regular file."))
+        }
+        Ok(_) => Ok(resolved),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(resolved),
+        Err(error) => Err(format!("Cannot inspect {label} path: {error}")),
+    }
+}
+
+fn generate_signing_key(path: &Path) -> Result<String, String> {
+    let signing_key = ManifestSigningKey::generate().map_err(|error| error.to_string())?;
+    let bytes = signing_key.to_pkcs8_bytes();
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        format!(
+            "Could not create signing key {} without overwriting an existing file: {error}",
+            path.display()
+        )
+    })?;
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(format!("Could not durably write the signing key: {error}"));
+    }
+    Ok(format!(
+        "Generated a protected Ed25519 signing key at {}. Back it up separately; WikiSyncer will not copy it into the library.",
+        path.display()
+    ))
+}
+
+fn load_signing_key(path: &Path) -> Result<ManifestSigningKey, String> {
+    ensure_regular_file(path, "Signing key")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)
+            .map_err(|error| format!("Cannot inspect signing-key permissions: {error}"))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "Signing key {} is accessible to group or other users; change its permissions to 0600 before use.",
+                path.display()
+            ));
+        }
+    }
+    let bytes = read_bounded_file(path, MAX_SIGNING_KEY_BYTES, "Signing key")?;
+    ManifestSigningKey::from_pkcs8(&bytes).map_err(|error| error.to_string())
+}
+
+fn load_trusted_head(path: &Path) -> Result<TrustedManifestHead, String> {
+    ensure_regular_file(path, "Trusted-head anchor")?;
+    let bytes = read_bounded_file(path, MAX_TRUSTED_HEAD_BYTES as u64, "Trusted-head anchor")?;
+    TrustedManifestHead::from_canonical_json(&bytes).map_err(|error| error.to_string())
+}
+
+fn ensure_regular_file(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("Cannot inspect {label} {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{label} path must not be a symbolic link."));
+    }
+    if !metadata.is_file() {
+        return Err(format!("{label} path must name a regular file."));
+    }
+    Ok(())
+}
+
+fn read_bounded_file(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, String> {
+    let length = fs::metadata(path)
+        .map_err(|error| format!("Cannot inspect {label}: {error}"))?
+        .len();
+    if length > maximum {
+        return Err(format!("{label} exceeds its {maximum}-byte input limit."));
+    }
+    fs::read(path).map_err(|error| format!("Cannot read {label} {}: {error}", path.display()))
+}
+
+fn write_trusted_head(path: &Path, canonical: &[u8]) -> Result<Option<PathBuf>, String> {
+    let retained = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(
+                    "Trusted-head destination must be a regular file, not a symlink or directory."
+                        .to_owned(),
+                );
+            }
+            let previous = load_trusted_head(path)?;
+            let previous_bytes = fs::read(path)
+                .map_err(|error| format!("Cannot retain the previous trusted head: {error}"))?;
+            if previous_bytes == canonical {
+                None
+            } else {
+                let backup = previous_anchor_path(path, previous.sequence, previous.public_key())?;
+                retain_previous_anchor(&backup, &previous_bytes)?;
+                Some(backup)
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("Cannot inspect trusted-head destination: {error}")),
+    };
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Trusted-head destination must have a UTF-8 file name.".to_owned())?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "System clock is before the Unix epoch.".to_owned())?
+        .as_nanos();
+    let temporary = path.with_file_name(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
+    write_new_private_file(&temporary, canonical, "temporary trusted head")?;
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "Could not atomically install the trusted head: {error}"
+        ));
+    }
+    Ok(retained)
+}
+
+fn previous_anchor_path(path: &Path, sequence: u64, public_key: &[u8]) -> Result<PathBuf, String> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Trusted-head destination must have a UTF-8 file name.".to_owned())?;
+    Ok(path.with_file_name(format!(
+        "{file_name}.sequence-{sequence}.key-{}.previous",
+        public_key_id(public_key)
+    )))
+}
+
+fn retain_previous_anchor(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    match fs::read(path) {
+        Ok(existing) if existing == bytes => Ok(()),
+        Ok(_) => Err(format!(
+            "Refusing to overwrite a different retained anchor at {}.",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_new_private_file(path, bytes, "previous trusted head")
+        }
+        Err(error) => Err(format!("Cannot inspect retained anchor: {error}")),
+    }
+}
+
+fn write_new_private_file(path: &Path, bytes: &[u8], label: &str) -> Result<(), String> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("Could not create {label} {}: {error}", path.display()))?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(format!("Could not durably write {label}: {error}"));
+    }
+    Ok(())
+}
+
+fn public_key_id(public_key: &[u8]) -> String {
+    public_key
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn open_system_browser(url: &str) -> Result<(), String> {
@@ -2189,6 +2706,52 @@ fn metric<'a>(label: &'a str, value: String) -> Element<'a, Message> {
         .into()
 }
 
+fn verification_report_view(report: &VerificationReport) -> Element<'_, Message> {
+    let mut content = column![
+        text(format!(
+            "Verified {} of {} logical objects ({} canonical bytes), {} of {} manifests, and {} metadata references.",
+            report.objects_verified,
+            report.objects_at_start,
+            report.canonical_bytes_verified,
+            report.manifests_identity_verified,
+            report.manifests_at_start,
+            report.metadata_records_examined,
+        )),
+        text(if report.is_verified_since_capture() {
+            "Complete: the stable captured library is internally verified since capture. This is an integrity result, not proof that its content is true."
+        } else {
+            "Full verification did not establish complete clean coverage. Review the findings below before trusting or refreshing an anchor."
+        }),
+        text(format!(
+            "{} finding(s); {} detailed finding(s) retained; {} omitted.",
+            report.finding_count,
+            report.findings.len(),
+            report.omitted_findings
+        )),
+    ]
+    .spacing(6);
+
+    let anchor_was_compared = report.trusted_head_authenticated
+        || report.findings.iter().any(|finding| {
+            matches!(
+                finding.kind,
+                VerificationFindingKind::TrustedHeadSignatureInvalid
+                    | VerificationFindingKind::TrustedHeadMismatch
+            )
+        });
+    if anchor_was_compared {
+        content = content.push(text(if report.is_authenticated_against_trusted_head() {
+            "External anchor authenticated: its Ed25519 signature is valid and its exact manifest head matches this fully verified library."
+        } else {
+            "External anchor did not authenticate this library. Do not replace or refresh it until the mismatch or invalid signature is understood."
+        }));
+    }
+    for finding in report.findings.iter().take(8) {
+        content = content.push(text(format!("• {:?}: {}", finding.kind, finding.message)).size(13));
+    }
+    content.into()
+}
+
 fn collection_row<'a>(
     collection: &'a StoredCollection,
     schedule: Option<&CollectionSchedule>,
@@ -2315,7 +2878,7 @@ mod tests {
     use std::sync::{Arc as Shared, Mutex};
     use std::thread;
     use wikisync_core::{PageId, PageTitle, RevisionId};
-    use wikisync_store::CurrentRevisionCapture;
+    use wikisync_store::{CurrentRevisionCapture, SyncRunKind};
 
     const TITLE_RESOLUTION: &str =
         include_str!("../../../fixtures/mediawiki/title-resolution.json");
@@ -2581,6 +3144,134 @@ mod tests {
         let unavailable = Err("permission denied".to_owned());
         assert_eq!(storage_bytes_label(&unavailable), "Unavailable");
         assert_eq!(storage_files_label(&unavailable), "Unavailable");
+    }
+
+    #[test]
+    fn trust_artifact_paths_must_be_absolute_and_outside_the_library() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let library_path = temporary.path().join("library");
+        let trust_path = temporary.path().join("trust");
+        fs::create_dir_all(&library_path).expect("library directory");
+        fs::create_dir_all(&trust_path).expect("trust directory");
+
+        assert!(
+            explicit_artifact_path(
+                library_path.to_str().unwrap(),
+                "relative-key.pk8",
+                "Signing key"
+            )
+            .is_err()
+        );
+        assert!(
+            explicit_artifact_path(
+                library_path.to_str().unwrap(),
+                library_path.join("key.pk8").to_str().unwrap(),
+                "Signing key"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            explicit_artifact_path(
+                library_path.to_str().unwrap(),
+                trust_path.join("key.pk8").to_str().unwrap(),
+                "Signing key"
+            )
+            .unwrap(),
+            trust_path.canonicalize().unwrap().join("key.pk8")
+        );
+    }
+
+    #[test]
+    fn signing_key_generation_is_private_validated_and_non_overwriting() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let path = temporary.path().join("signing-key.pk8");
+
+        generate_signing_key(&path).expect("generate signing key");
+        load_signing_key(&path).expect("validate signing key");
+        let original = fs::read(&path).expect("read signing key");
+        assert!(generate_signing_key(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_anchor_refresh_and_full_comparison_round_trip() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let library_path = temporary.path().join("library");
+        let trust_path = temporary.path().join("trust");
+        fs::create_dir(&trust_path).expect("trust directory");
+        let mut library = Library::open(&library_path).expect("library");
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("wiki");
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Bootstrap, 100)
+            .expect("start run")
+            .status
+            .run_id;
+        library
+            .complete_sync_run(run_id, None)
+            .expect("complete run");
+        library.append_sync_manifest(run_id).expect("manifest");
+        drop(library);
+
+        let signing_key_path = trust_path.join("signing-key.pk8");
+        let trusted_head_path = trust_path.join("trusted-head.json");
+        generate_signing_key(&signing_key_path).expect("signing key");
+        let refreshed =
+            refresh_trusted_head(library_path.clone(), &signing_key_path, &trusted_head_path)
+                .await
+                .expect("refresh trusted head");
+        assert!(refreshed.report.is_verified_since_capture());
+        assert!(trusted_head_path.is_file());
+
+        let first_anchor = load_trusted_head(&trusted_head_path).expect("first anchor");
+        let previous_path = previous_anchor_path(
+            &trusted_head_path,
+            first_anchor.sequence,
+            first_anchor.public_key(),
+        )
+        .expect("previous path");
+        let mut library = Library::open(&library_path).expect("advanced library");
+        let second_run = library
+            .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Update, 200)
+            .expect("start second run")
+            .status
+            .run_id;
+        library
+            .complete_sync_run(second_run, None)
+            .expect("complete second run");
+        library
+            .append_sync_manifest(second_run)
+            .expect("second manifest");
+        drop(library);
+        refresh_trusted_head(library_path.clone(), &signing_key_path, &trusted_head_path)
+            .await
+            .expect("refresh advanced trusted head");
+        assert!(previous_path.is_file());
+
+        let older_comparison = verify_against_trusted_head(library_path.clone(), &previous_path)
+            .await
+            .expect("compare retained older head");
+        assert!(
+            older_comparison
+                .findings
+                .iter()
+                .any(|finding| finding.kind == VerificationFindingKind::TrustedHeadMismatch)
+        );
+
+        let compared = verify_against_trusted_head(library_path, &trusted_head_path)
+            .await
+            .expect("compare trusted head");
+        assert!(compared.is_authenticated_against_trusted_head());
     }
 
     #[tokio::test(flavor = "multi_thread")]

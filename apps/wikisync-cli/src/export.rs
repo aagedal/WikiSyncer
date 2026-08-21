@@ -10,7 +10,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use serde_json::{Value, json};
 use wikisync_content::{OutputKind, transform};
-use wikisync_core::{CollectionId, PageId, WikiId};
+use wikisync_core::{CollectionId, PageId, RevisionId, WikiId};
 use wikisync_mediawiki::ClientConfig;
 use wikisync_store::{Library, StoreError, StoredPage, StoredRevision, StoredWiki};
 
@@ -19,12 +19,41 @@ const MAX_EXPORT_CANONICAL_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXPORT_OUTPUT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_EXISTING_OUTPUT_ENTRIES: usize = MAX_EXPORT_ARTICLES + 8;
 const EXPORT_SCHEMA: &str = "wikisync-current-export-v1";
+const HISTORICAL_EXPORT_SCHEMA: &str = "wikisync-historical-export-v1";
 const CONTENT_HASH_ALGORITHM: &str = "wikisync-object-v1/domain-separated-blake3";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExportFormat {
     Markdown,
     Text,
+}
+
+/// A durable archive point used to generate a historical time-slice export.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ExportAt {
+    /// An RFC 3339 instant. The original spelling is retained in the manifest.
+    Timestamp(String),
+    /// A captured revision whose timestamp anchors the time slice.
+    Revision(RevisionId),
+}
+
+impl ExportAt {
+    pub(crate) fn parse(value: &str) -> Result<Self, ExportError> {
+        if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+            let raw = value.parse::<u64>().map_err(|_| {
+                ExportError::message("--at revision ID must be a positive 64-bit integer")
+            })?;
+            return RevisionId::new(raw).map(Self::Revision).map_err(|error| {
+                ExportError::message(format!("invalid --at revision ID: {error}"))
+            });
+        }
+        parse_rfc3339(value).map_err(|error| {
+            ExportError::message(format!(
+                "--at must be a positive revision ID or RFC 3339 timestamp: {error}"
+            ))
+        })?;
+        Ok(Self::Timestamp(value.to_owned()))
+    }
 }
 
 impl ExportFormat {
@@ -105,12 +134,82 @@ struct ExportSelection {
     scope: Value,
 }
 
+#[derive(Clone, Copy)]
+struct ExportTotals {
+    uncaptured_page_count: usize,
+    canonical_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ExportTarget<'a> {
+    output_name: &'a str,
+    schema: &'static str,
+    selector: Option<&'a Value>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ParsedTimestamp {
+    unix_seconds: i64,
+    nanosecond: u32,
+}
+
 pub(crate) fn run(
     library: &Library,
     format: ExportFormat,
     selected_collection: Option<CollectionId>,
 ) -> Result<ExportSummary, ExportError> {
     let selection = selected_pages(library, selected_collection)?;
+    run_selected(
+        library,
+        format,
+        selection,
+        RevisionSelection::Current,
+        "current".to_owned(),
+        EXPORT_SCHEMA,
+        None,
+    )
+}
+
+/// Generates a historical slice without replacing the maintained current export.
+pub(crate) fn run_at(
+    library: &Library,
+    format: ExportFormat,
+    selected_collection: Option<CollectionId>,
+    at: &ExportAt,
+) -> Result<ExportSummary, ExportError> {
+    let scope_name = selected_collection.map_or_else(
+        || "library".to_owned(),
+        |collection_id| format!("collection-{}", collection_id.get()),
+    );
+    let selection = selected_pages(library, selected_collection)?;
+    let (cutoff, point_name, selector) = resolve_historical_cutoff(library, &selection, at)?;
+    let output_name = format!("{point_name}-{}-{scope_name}", format.as_str());
+    run_selected(
+        library,
+        format,
+        selection,
+        RevisionSelection::At(cutoff),
+        output_name,
+        HISTORICAL_EXPORT_SCHEMA,
+        Some(selector),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum RevisionSelection {
+    Current,
+    At(ParsedTimestamp),
+}
+
+fn run_selected(
+    library: &Library,
+    format: ExportFormat,
+    selection: ExportSelection,
+    revision_selection: RevisionSelection,
+    output_name: String,
+    schema: &'static str,
+    selector: Option<Value>,
+) -> Result<ExportSummary, ExportError> {
     let pages = selection.pages;
     if pages.len() > MAX_EXPORT_ARTICLES {
         return Err(ExportError::message(format!(
@@ -130,22 +229,18 @@ pub(crate) fn run(
     let mut used_paths = BTreeSet::new();
 
     for page in pages.into_values() {
-        let Some(revision_id) = page.current_revision_id else {
+        let revision = match revision_selection {
+            RevisionSelection::Current => current_revision(library, &page)?,
+            RevisionSelection::At(cutoff) => revision_at(library, &page, cutoff)?,
+        };
+        let Some(revision) = revision else {
             uncaptured_page_count += 1;
             continue;
         };
-        let revision = library
-            .revision(page.wiki_id, revision_id)?
-            .ok_or_else(|| {
-                ExportError::message(format!(
-                    "corrupt library: page {} points to missing revision {revision_id}",
-                    page.page_id
-                ))
-            })?;
         if revision.page_id != page.page_id {
             return Err(ExportError::message(format!(
-                "corrupt library: revision {revision_id} belongs to page {}, not page {}",
-                revision.page_id, page.page_id
+                "corrupt library: revision {} belongs to page {}, not page {}",
+                revision.revision_id, revision.page_id, page.page_id
             )));
         }
         canonical_bytes = canonical_bytes
@@ -192,20 +287,80 @@ pub(crate) fn run(
         });
     }
 
-    write_export(
-        library,
-        format,
-        &selection.scope,
-        &articles,
+    let totals = ExportTotals {
         uncaptured_page_count,
         canonical_bytes,
-    )?;
+    };
+    let target = ExportTarget {
+        output_name: &output_name,
+        schema,
+        selector: selector.as_ref(),
+    };
+    write_export(library, format, &selection.scope, &articles, totals, target)?;
     Ok(ExportSummary {
-        output: library.root().join("exports/current"),
+        output: library.root().join("exports").join(output_name),
         article_count: articles.len(),
         uncaptured_page_count,
         canonical_bytes,
     })
+}
+
+fn current_revision(
+    library: &Library,
+    page: &StoredPage,
+) -> Result<Option<StoredRevision>, ExportError> {
+    let Some(revision_id) = page.current_revision_id else {
+        return Ok(None);
+    };
+    library
+        .revision(page.wiki_id, revision_id)?
+        .ok_or_else(|| {
+            ExportError::message(format!(
+                "corrupt library: page {} points to missing revision {revision_id}",
+                page.page_id
+            ))
+        })
+        .map(Some)
+}
+
+fn revision_at(
+    library: &Library,
+    page: &StoredPage,
+    cutoff: ParsedTimestamp,
+) -> Result<Option<StoredRevision>, ExportError> {
+    let canonical_cutoff = canonical_mediawiki_timestamp(cutoff.unix_seconds)?;
+    library
+        .newest_revision_for_page_at_or_before(page.wiki_id, page.page_id, &canonical_cutoff)
+        .map_err(Into::into)
+}
+
+fn canonical_mediawiki_timestamp(unix_seconds: i64) -> Result<String, ExportError> {
+    let days = unix_seconds.div_euclid(86_400);
+    let seconds_of_day = unix_seconds.rem_euclid(86_400);
+    let shifted_days = days.checked_add(719_468).ok_or_else(|| {
+        ExportError::message("historical export timestamp is outside the supported calendar")
+    })?;
+    let era = shifted_days.div_euclid(146_097);
+    let day_of_era = shifted_days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = shifted_month + if shifted_month < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    if !(1..=9_999).contains(&year) {
+        return Err(ExportError::message(
+            "historical export timestamp is outside years 0001 through 9999",
+        ));
+    }
+    let hour = seconds_of_day / 3_600;
+    let minute = seconds_of_day % 3_600 / 60;
+    let second = seconds_of_day % 60;
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
+    ))
 }
 
 fn selected_pages(
@@ -242,33 +397,100 @@ fn selected_pages(
     Ok(ExportSelection { pages, scope })
 }
 
+fn resolve_historical_cutoff(
+    library: &Library,
+    selection: &ExportSelection,
+    at: &ExportAt,
+) -> Result<(ParsedTimestamp, String, Value), ExportError> {
+    match at {
+        ExportAt::Timestamp(value) => {
+            let cutoff = parse_rfc3339(value).map_err(|error| {
+                ExportError::message(format!("invalid historical export timestamp: {error}"))
+            })?;
+            let output_name = timestamp_output_name(cutoff);
+            Ok((
+                cutoff,
+                output_name,
+                json!({
+                    "kind": "timestamp",
+                    "requested": value,
+                    "unix_seconds": cutoff.unix_seconds,
+                    "nanosecond": cutoff.nanosecond,
+                }),
+            ))
+        }
+        ExportAt::Revision(revision_id) => {
+            let matches = library
+                .revisions_by_id(*revision_id)?
+                .into_iter()
+                .filter(|(wiki_id, revision)| {
+                    selection.pages.contains_key(&(*wiki_id, revision.page_id))
+                })
+                .collect::<Vec<_>>();
+            let [(wiki_id, revision)] = matches.as_slice() else {
+                return if matches.is_empty() {
+                    Err(ExportError::message(format!(
+                        "revision {revision_id} was not found among the selected pages"
+                    )))
+                } else {
+                    Err(ExportError::message(format!(
+                        "revision {revision_id} is ambiguous across the selected wikis; select a single collection"
+                    )))
+                };
+            };
+            let cutoff = parse_rfc3339(&revision.timestamp).map_err(|error| {
+                ExportError::message(format!(
+                    "corrupt library: revision {revision_id} has invalid timestamp {:?}: {error}",
+                    revision.timestamp
+                ))
+            })?;
+            Ok((
+                cutoff,
+                format!("at-revision-{}-{revision_id}", wiki_id.get()),
+                json!({
+                    "kind": "revision",
+                    "revision_id": revision_id.get(),
+                    "wiki_id": wiki_id.get(),
+                    "revision_time": revision.timestamp,
+                    "unix_seconds": cutoff.unix_seconds,
+                    "nanosecond": cutoff.nanosecond,
+                }),
+            ))
+        }
+    }
+}
+
+fn timestamp_output_name(timestamp: ParsedTimestamp) -> String {
+    if timestamp.nanosecond == 0 {
+        format!("at-time-unix-{}", timestamp.unix_seconds)
+    } else {
+        format!(
+            "at-time-unix-{}-{:09}",
+            timestamp.unix_seconds, timestamp.nanosecond
+        )
+    }
+}
+
 fn write_export(
     library: &Library,
     format: ExportFormat,
     scope: &Value,
     articles: &[Article],
-    uncaptured_page_count: usize,
-    canonical_bytes: u64,
+    totals: ExportTotals,
+    target: ExportTarget<'_>,
 ) -> Result<(), ExportError> {
     let exports = library.root().join("exports");
     prepare_exports_directory(&exports)?;
-    let current = exports.join("current");
-    validate_replaceable_output(&current)?;
-    let staging = create_staging_directory(&exports)?;
-    let build_result = build_staged_export(
-        library,
-        &staging,
-        format,
-        scope,
-        articles,
-        uncaptured_page_count,
-        canonical_bytes,
-    );
+    let output = exports.join(target.output_name);
+    validate_replaceable_output(&output, target.output_name)?;
+    let staging = create_staging_directory(&exports, target.output_name)?;
+    let build_result =
+        build_staged_export(library, &staging, format, scope, articles, totals, target);
     if let Err(error) = build_result {
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }
-    if let Err(error) = install_staged_export(&exports, &staging, &current) {
+    if let Err(error) = install_staged_export(&exports, &staging, &output, target.output_name) {
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }
@@ -281,8 +503,8 @@ fn build_staged_export(
     format: ExportFormat,
     scope: &Value,
     articles: &[Article],
-    uncaptured_page_count: usize,
-    canonical_bytes: u64,
+    totals: ExportTotals,
+    target: ExportTarget<'_>,
 ) -> Result<(), ExportError> {
     let article_directory = staging.join("articles");
     create_private_directory(&article_directory)?;
@@ -330,17 +552,20 @@ fn build_staged_export(
     }
     index.sync_all()?;
 
-    let manifest = json!({
+    let mut manifest = json!({
         "article_count": articles.len(),
-        "canonical_source_bytes": canonical_bytes,
+        "canonical_source_bytes": totals.canonical_bytes,
         "content_hash_algorithm": CONTENT_HASH_ALGORITHM,
         "format": format.as_str(),
         "maximum_capture_time_unix": maximum_capture_time,
-        "schema": EXPORT_SCHEMA,
+        "schema": target.schema,
         "scope": scope,
         "transformer_version": format.output_kind().transformer_version().as_str(),
-        "uncaptured_page_count": uncaptured_page_count,
+        "uncaptured_page_count": totals.uncaptured_page_count,
     });
+    if let Some(selector) = target.selector {
+        manifest["at"] = selector.clone();
+    }
     let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     manifest_bytes.push(b'\n');
     write_private_file(&staging.join("manifest.json"), &manifest_bytes)?;
@@ -510,6 +735,127 @@ fn markdown_text(value: &str) -> String {
         .replace(']', "\\]")
 }
 
+fn parse_rfc3339(value: &str) -> Result<ParsedTimestamp, &'static str> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return Err("expected YYYY-MM-DDTHH:MM:SSZ or an equivalent numeric offset");
+    }
+    let year = decimal(bytes, 0, 4)? as i64;
+    let month = decimal(bytes, 5, 7)?;
+    let day = decimal(bytes, 8, 10)?;
+    let hour = decimal(bytes, 11, 13)?;
+    let minute = decimal(bytes, 14, 16)?;
+    let second = decimal(bytes, 17, 19)?;
+    if !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return Err("date or time component is out of range");
+    }
+
+    let mut cursor = 19;
+    let mut nanosecond = 0_u32;
+    if bytes.get(cursor) == Some(&b'.') {
+        cursor += 1;
+        let fraction_start = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        let digits = cursor - fraction_start;
+        if digits == 0 {
+            return Err("fractional seconds must contain at least one digit");
+        }
+        let retained = digits.min(9);
+        nanosecond = decimal(bytes, fraction_start, fraction_start + retained)?;
+        for _ in retained..9 {
+            nanosecond *= 10;
+        }
+        if bytes[fraction_start + retained..cursor]
+            .iter()
+            .any(|byte| *byte != b'0')
+        {
+            return Err("fractional seconds finer than nanoseconds are not supported");
+        }
+    }
+
+    let offset_seconds = match bytes.get(cursor) {
+        Some(b'Z') if cursor + 1 == bytes.len() => 0_i64,
+        Some(sign @ (b'+' | b'-'))
+            if cursor + 6 == bytes.len() && bytes.get(cursor + 3) == Some(&b':') =>
+        {
+            let offset_hour = decimal(bytes, cursor + 1, cursor + 3)?;
+            let offset_minute = decimal(bytes, cursor + 4, cursor + 6)?;
+            if offset_hour > 23 || offset_minute > 59 {
+                return Err("UTC offset is out of range");
+            }
+            let offset = i64::from(offset_hour * 3_600 + offset_minute * 60);
+            if *sign == b'+' { offset } else { -offset }
+        }
+        _ => return Err("timestamp must end in Z or a numeric UTC offset"),
+    };
+
+    let days = days_from_civil(year, month, day);
+    let local_seconds = days
+        .checked_mul(86_400)
+        .and_then(|seconds| seconds.checked_add(i64::from(hour * 3_600)))
+        .and_then(|seconds| seconds.checked_add(i64::from(minute * 60)))
+        .and_then(|seconds| seconds.checked_add(i64::from(second)))
+        .ok_or("timestamp is outside the supported range")?;
+    let unix_seconds = local_seconds
+        .checked_sub(offset_seconds)
+        .ok_or("timestamp is outside the supported range")?;
+    Ok(ParsedTimestamp {
+        unix_seconds,
+        nanosecond,
+    })
+}
+
+fn decimal(bytes: &[u8], start: usize, end: usize) -> Result<u32, &'static str> {
+    let digits = bytes
+        .get(start..end)
+        .ok_or("timestamp ended before a required component")?;
+    if !digits.iter().all(u8::is_ascii_digit) {
+        return Err("timestamp contains a non-numeric component");
+    }
+    Ok(digits
+        .iter()
+        .fold(0_u32, |value, byte| value * 10 + u32::from(byte - b'0')))
+}
+
+const fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+// Howard Hinnant's civil-calendar conversion, shifted to the Unix epoch.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let adjusted_year = year - if month <= 2 { 1 } else { 0 };
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let adjusted_month = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * adjusted_month + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 fn prepare_exports_directory(exports: &Path) -> Result<(), ExportError> {
     match fs::symlink_metadata(exports) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(ExportError::message(
@@ -527,36 +873,36 @@ fn prepare_exports_directory(exports: &Path) -> Result<(), ExportError> {
     }
 }
 
-fn validate_replaceable_output(current: &Path) -> Result<(), ExportError> {
-    match fs::symlink_metadata(current) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(ExportError::message(
-            "refusing to replace symbolic link at exports/current",
-        )),
-        Ok(metadata) if !metadata.is_dir() => Err(ExportError::message(
-            "refusing to replace non-directory exports/current",
-        )),
-        Ok(_) => assert_no_symlinks(current),
+fn validate_replaceable_output(output: &Path, output_name: &str) -> Result<(), ExportError> {
+    match fs::symlink_metadata(output) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(ExportError::message(format!(
+            "refusing to replace symbolic link at exports/{output_name}"
+        ))),
+        Ok(metadata) if !metadata.is_dir() => Err(ExportError::message(format!(
+            "refusing to replace non-directory exports/{output_name}"
+        ))),
+        Ok(_) => assert_no_symlinks(output, output_name),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
 }
 
-fn assert_no_symlinks(root: &Path) -> Result<(), ExportError> {
+fn assert_no_symlinks(root: &Path, output_name: &str) -> Result<(), ExportError> {
     let mut pending = vec![root.to_path_buf()];
     let mut entries = 0_usize;
     while let Some(directory) = pending.pop() {
         for entry in fs::read_dir(directory)? {
             entries += 1;
             if entries > MAX_EXISTING_OUTPUT_ENTRIES {
-                return Err(ExportError::message(
-                    "existing exports/current contains too many entries to replace safely",
-                ));
+                return Err(ExportError::message(format!(
+                    "existing exports/{output_name} contains too many entries to replace safely"
+                )));
             }
             let entry = entry?;
             let metadata = fs::symlink_metadata(entry.path())?;
             if metadata.file_type().is_symlink() {
                 return Err(ExportError::message(format!(
-                    "refusing to replace exports/current containing symbolic link {}",
+                    "refusing to replace exports/{output_name} containing symbolic link {}",
                     entry.path().display()
                 )));
             }
@@ -568,9 +914,12 @@ fn assert_no_symlinks(root: &Path) -> Result<(), ExportError> {
     Ok(())
 }
 
-fn create_staging_directory(exports: &Path) -> Result<PathBuf, ExportError> {
+fn create_staging_directory(exports: &Path, output_name: &str) -> Result<PathBuf, ExportError> {
     for attempt in 0..100_u32 {
-        let path = exports.join(format!(".current-stage-{}-{attempt}", std::process::id()));
+        let path = exports.join(format!(
+            ".{output_name}-stage-{}-{attempt}",
+            std::process::id()
+        ));
         match fs::create_dir(&path) {
             Ok(()) => {
                 restrict_directory_permissions(&path)?;
@@ -588,23 +937,24 @@ fn create_staging_directory(exports: &Path) -> Result<PathBuf, ExportError> {
 fn install_staged_export(
     exports: &Path,
     staging: &Path,
-    current: &Path,
+    output: &Path,
+    output_name: &str,
 ) -> Result<(), ExportError> {
-    if !current.exists() {
-        fs::rename(staging, current)?;
+    if !output.exists() {
+        fs::rename(staging, output)?;
         sync_directory(exports)?;
         return Ok(());
     }
-    let backup = exports.join(format!(".current-backup-{}", std::process::id()));
+    let backup = exports.join(format!(".{output_name}-backup-{}", std::process::id()));
     if fs::symlink_metadata(&backup).is_ok() {
         return Err(ExportError::message(format!(
             "refusing to overwrite unexpected export backup {}",
             backup.display()
         )));
     }
-    fs::rename(current, &backup)?;
-    if let Err(error) = fs::rename(staging, current) {
-        let restore = fs::rename(&backup, current);
+    fs::rename(output, &backup)?;
+    if let Err(error) = fs::rename(staging, output) {
+        let restore = fs::rename(&backup, output);
         return match restore {
             Ok(()) => Err(error.into()),
             Err(restore_error) => Err(ExportError::message(format!(
@@ -669,5 +1019,50 @@ mod tests {
             ),
             "https://en.wikipedia.org/w/index.php?title=A%20title%2Fwith%3F%20punctuation&oldid=42"
         );
+    }
+
+    #[test]
+    fn rfc3339_parser_normalizes_offsets_and_honors_fractional_boundaries() {
+        assert_eq!(
+            parse_rfc3339("2026-08-19T12:00:00Z").unwrap(),
+            parse_rfc3339("2026-08-19T14:00:00+02:00").unwrap()
+        );
+        assert_eq!(
+            parse_rfc3339("1970-01-01T00:00:00Z").unwrap(),
+            ParsedTimestamp {
+                unix_seconds: 0,
+                nanosecond: 0
+            }
+        );
+        assert_eq!(
+            parse_rfc3339("2024-02-29T23:59:59.25Z").unwrap().nanosecond,
+            250_000_000
+        );
+        assert!(parse_rfc3339("2026-02-29T00:00:00Z").is_err());
+        assert!(parse_rfc3339("2026-08-19 12:00:00Z").is_err());
+        assert!(parse_rfc3339("2026-08-19T12:00:00").is_err());
+        let normalized = parse_rfc3339("2026-08-19T14:00:00.75+02:00").unwrap();
+        assert_eq!(
+            canonical_mediawiki_timestamp(normalized.unix_seconds).unwrap(),
+            "2026-08-19T12:00:00Z"
+        );
+        assert_eq!(
+            canonical_mediawiki_timestamp(0).unwrap(),
+            "1970-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn at_parser_distinguishes_revision_ids_from_timestamps() {
+        assert_eq!(
+            ExportAt::parse("42").unwrap(),
+            ExportAt::Revision(RevisionId::new(42).unwrap())
+        );
+        assert_eq!(
+            ExportAt::parse("2026-08-19T12:00:00Z").unwrap(),
+            ExportAt::Timestamp("2026-08-19T12:00:00Z".to_owned())
+        );
+        assert!(ExportAt::parse("0").is_err());
+        assert!(ExportAt::parse("yesterday").is_err());
     }
 }

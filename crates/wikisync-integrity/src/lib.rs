@@ -3,15 +3,36 @@
 //! Verification establishes that canonical bytes still match the content-derived
 //! identities recorded when they were captured. It does not establish that an
 //! upstream statement is true, unbiased, complete, or still publicly available.
+//! Full verification also checks reference consistency exposed by the current
+//! schema. Schema version 9 has no persistent derived-cache table, so no report from
+//! this version claims derived-cache inventory or cache-body verification.
 
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 use std::fs;
 
+use ring::rand::SystemRandom;
+use ring::signature::{self, Ed25519KeyPair, KeyPair};
+use serde::{Deserialize, Serialize};
+use wikisync_content::PLAIN_TEXT_TRANSFORMER_VERSION;
 use wikisync_store::{
-    Library, ManifestId, ObjectId, ObjectVerificationState, StoreError, SyncRunState,
+    IntegrityMetadataIssue, IntegrityMetadataSubject, Library, ManifestId, ObjectId,
+    ObjectVerificationState, StoreError, SyncRunState,
 };
+
+const TRUSTED_HEAD_SCHEMA_VERSION: u32 = 1;
+const TRUSTED_HEAD_ALGORITHM: &str = "Ed25519";
+const TRUSTED_HEAD_DOMAIN: &[u8] = b"wikisync-trusted-manifest-head-v1\0";
+
+/// Byte length of an Ed25519 public verification key.
+pub const ED25519_PUBLIC_KEY_BYTES: usize = 32;
+
+/// Byte length of an Ed25519 signature.
+pub const ED25519_SIGNATURE_BYTES: usize = 64;
+
+/// Maximum accepted canonical trusted-head document size.
+pub const MAX_TRUSTED_HEAD_BYTES: usize = 4 * 1024;
 
 /// Default number of logical-object records loaded in one bounded store query.
 pub const DEFAULT_PAGE_SIZE: u32 = 256;
@@ -76,7 +97,7 @@ pub enum VerificationCoverage {
 }
 
 /// Stable category for one verification finding.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum VerificationFindingKind {
     /// Persisted metadata did not describe the object as verified.
     MetadataNotVerified,
@@ -102,6 +123,48 @@ pub enum VerificationFindingKind {
     SuccessfulRunMissingManifest,
     /// Manifest directory membership changed during the scan.
     ManifestsChangedDuringVerification,
+    /// The external trusted-head signature did not verify with its embedded key.
+    TrustedHeadSignatureInvalid,
+    /// The authenticated external head did not match the current local manifest head.
+    TrustedHeadMismatch,
+    /// A revision pointed to an absent owning page.
+    RevisionPageUnreachable,
+    /// A revision pointed to an absent canonical content object.
+    RevisionObjectUnreachable,
+    /// A locally captured parent revision belonged to another page.
+    RevisionParentPageMismatch,
+    /// A revision directly identified itself as its parent.
+    RevisionParentSelfReference,
+    /// A page head pointed to an absent revision.
+    PageHeadRevisionUnreachable,
+    /// A page head revision belonged to another page.
+    PageHeadRevisionPageMismatch,
+    /// A checkpoint's collection belonged to another wiki or was absent.
+    CheckpointCollectionMismatch,
+    /// A committed checkpoint had no reachable advancing run.
+    CheckpointRunUnreachable,
+    /// A checkpoint referred to a run that had not succeeded.
+    CheckpointRunNotSucceeded,
+    /// A checkpoint and its advancing run had different wiki/collection scope.
+    CheckpointRunScopeMismatch,
+    /// A checkpoint boundary disagreed with its advancing run candidate.
+    CheckpointBoundaryMismatch,
+    /// A search document pointed to an absent page.
+    SearchPageUnreachable,
+    /// A search document pointed to an absent revision.
+    SearchRevisionUnreachable,
+    /// A search document's revision belonged to another page.
+    SearchRevisionPageMismatch,
+    /// A search document did not identify the page's current revision.
+    SearchRevisionNotCurrent,
+    /// A search metadata row had no corresponding contentless FTS row.
+    SearchFtsRowMissing,
+    /// A contentless FTS row had no corresponding search metadata row.
+    SearchFtsRowOrphan,
+    /// A search document was produced by a transformer other than the current one.
+    SearchTransformerVersionMismatch,
+    /// The metadata-reference catalog changed during the scan.
+    MetadataChangedDuringVerification,
 }
 
 /// One structured integrity finding.
@@ -113,6 +176,8 @@ pub struct VerificationFinding {
     pub object_id: Option<ObjectId>,
     /// Affected manifest sequence, or `None` when no valid sequence is available.
     pub manifest_sequence: Option<u64>,
+    /// Affected metadata record, or `None` for object/manifest/library findings.
+    pub metadata_subject: Option<IntegrityMetadataSubject>,
     /// Human-readable local diagnostic detail.
     pub message: String,
 }
@@ -142,6 +207,18 @@ pub struct VerificationReport {
     pub manifests_examined: u64,
     /// Manifest files whose embedded identity reproduced their canonical body.
     pub manifests_identity_verified: u64,
+    /// Revision, page, checkpoint, search-document, and FTS records present when a
+    /// full metadata-reference scan began. Quick verification leaves this zero.
+    pub metadata_records_at_start: u64,
+    /// Metadata-reference records present when a full scan ended.
+    pub metadata_records_at_end: u64,
+    /// Metadata-reference records examined through bounded keyset pages.
+    pub metadata_records_examined: u64,
+    /// Whether an externally supplied Ed25519 trusted head was signature-verified
+    /// and matched the current local manifest head.
+    ///
+    /// Unsigned verification leaves this false without adding a finding.
+    pub trusted_head_authenticated: bool,
     /// Total findings, including details omitted by the report bound.
     pub finding_count: u64,
     /// First bounded set of structured findings.
@@ -163,7 +240,237 @@ impl VerificationReport {
             && self.objects_examined == self.objects_at_start
             && self.objects_verified == self.objects_at_start
             && self.objects_at_start == self.objects_at_end
+            && (matches!(self.scope, VerificationScope::Quick)
+                || (self.metadata_records_examined == self.metadata_records_at_start
+                    && self.metadata_records_at_start == self.metadata_records_at_end))
     }
+
+    /// Returns whether complete local integrity checks also matched an externally
+    /// supplied, valid Ed25519 trusted head.
+    ///
+    /// This authenticates the observed manifest-chain head against the key embedded
+    /// in that separately retained anchor. It does not establish source truth, and
+    /// it cannot detect replacement of both the library and the external anchor.
+    #[must_use]
+    pub const fn is_authenticated_against_trusted_head(&self) -> bool {
+        self.is_verified_since_capture() && self.trusted_head_authenticated
+    }
+}
+
+/// Secret Ed25519 key material used only to sign exportable manifest-chain heads.
+///
+/// The PKCS#8 bytes are deliberately not exposed through `Debug`. Key persistence,
+/// backup, and user-presence policy remain caller responsibilities.
+pub struct ManifestSigningKey {
+    pkcs8: Vec<u8>,
+}
+
+impl ManifestSigningKey {
+    /// Generates a new Ed25519 signing key with the operating system random source.
+    pub fn generate() -> Result<Self, TrustedHeadError> {
+        let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+            .map_err(|_| TrustedHeadError::KeyGeneration)?;
+        Ok(Self {
+            pkcs8: document.as_ref().to_vec(),
+        })
+    }
+
+    /// Imports and validates an Ed25519 PKCS#8 v2 key document.
+    pub fn from_pkcs8(bytes: &[u8]) -> Result<Self, TrustedHeadError> {
+        Ed25519KeyPair::from_pkcs8(bytes).map_err(|_| TrustedHeadError::InvalidSigningKey)?;
+        Ok(Self {
+            pkcs8: bytes.to_vec(),
+        })
+    }
+
+    /// Returns the PKCS#8 key document for explicit caller-managed secret backup.
+    ///
+    /// Callers must store these bytes as sensitive key material; the trusted-head
+    /// JSON contains only the public key and is safe to disclose.
+    #[must_use]
+    pub fn to_pkcs8_bytes(&self) -> Vec<u8> {
+        self.pkcs8.clone()
+    }
+
+    fn key_pair(&self) -> Result<Ed25519KeyPair, TrustedHeadError> {
+        Ed25519KeyPair::from_pkcs8(&self.pkcs8).map_err(|_| TrustedHeadError::InvalidSigningKey)
+    }
+}
+
+impl fmt::Debug for ManifestSigningKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManifestSigningKey")
+            .field("pkcs8", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Separately retainable authentication anchor for one exact manifest-chain head.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedManifestHead {
+    /// Manifest sequence authenticated by the signature.
+    pub sequence: u64,
+    /// Content identity of that exact canonical manifest body.
+    pub manifest_id: ManifestId,
+    /// Ed25519 public verification key.
+    public_key: [u8; ED25519_PUBLIC_KEY_BYTES],
+    /// Signature over the domain-separated sequence and manifest identity.
+    signature: [u8; ED25519_SIGNATURE_BYTES],
+}
+
+impl TrustedManifestHead {
+    /// Returns the Ed25519 public key bytes embedded in this external anchor.
+    #[must_use]
+    pub const fn public_key(&self) -> &[u8; ED25519_PUBLIC_KEY_BYTES] {
+        &self.public_key
+    }
+
+    /// Returns the detached Ed25519 signature bytes.
+    #[must_use]
+    pub const fn signature(&self) -> &[u8; ED25519_SIGNATURE_BYTES] {
+        &self.signature
+    }
+
+    /// Encodes this anchor as bounded canonical schema-v1 JSON suitable for storage
+    /// outside the library directory.
+    pub fn to_canonical_json(&self) -> Result<Vec<u8>, TrustedHeadError> {
+        let wire = TrustedManifestHeadWire {
+            schema_version: TRUSTED_HEAD_SCHEMA_VERSION,
+            algorithm: TRUSTED_HEAD_ALGORITHM.to_owned(),
+            sequence: self.sequence,
+            manifest_id: self.manifest_id.to_string(),
+            public_key: encode_hex(&self.public_key),
+            signature: encode_hex(&self.signature),
+        };
+        let bytes = serde_json::to_vec(&wire).map_err(TrustedHeadError::Json)?;
+        if bytes.len() > MAX_TRUSTED_HEAD_BYTES {
+            return Err(TrustedHeadError::AnchorTooLarge);
+        }
+        Ok(bytes)
+    }
+
+    /// Parses a canonical schema-v1 trusted-head JSON document.
+    pub fn from_canonical_json(bytes: &[u8]) -> Result<Self, TrustedHeadError> {
+        if bytes.len() > MAX_TRUSTED_HEAD_BYTES {
+            return Err(TrustedHeadError::AnchorTooLarge);
+        }
+        let wire: TrustedManifestHeadWire =
+            serde_json::from_slice(bytes).map_err(TrustedHeadError::Json)?;
+        if wire.schema_version != TRUSTED_HEAD_SCHEMA_VERSION {
+            return Err(TrustedHeadError::UnsupportedSchema(wire.schema_version));
+        }
+        if wire.algorithm != TRUSTED_HEAD_ALGORITHM {
+            return Err(TrustedHeadError::UnsupportedAlgorithm(wire.algorithm));
+        }
+        if wire.sequence == 0 {
+            return Err(TrustedHeadError::InvalidAnchor(
+                "trusted manifest sequence must be positive",
+            ));
+        }
+        let anchor = Self {
+            sequence: wire.sequence,
+            manifest_id: wire
+                .manifest_id
+                .parse()
+                .map_err(|_| TrustedHeadError::InvalidAnchor("invalid manifest identity"))?,
+            public_key: decode_hex_array(&wire.public_key)
+                .map_err(|_| TrustedHeadError::InvalidAnchor("invalid Ed25519 public key"))?,
+            signature: decode_hex_array(&wire.signature)
+                .map_err(|_| TrustedHeadError::InvalidAnchor("invalid Ed25519 signature"))?,
+        };
+        let canonical = anchor.to_canonical_json()?;
+        if canonical != bytes {
+            return Err(TrustedHeadError::InvalidAnchor(
+                "trusted head is not in canonical JSON form",
+            ));
+        }
+        Ok(anchor)
+    }
+
+    fn signature_is_valid(&self) -> bool {
+        signature::UnparsedPublicKey::new(&signature::ED25519, self.public_key)
+            .verify(
+                &trusted_head_message(self.sequence, self.manifest_id),
+                &self.signature,
+            )
+            .is_ok()
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TrustedManifestHeadWire {
+    schema_version: u32,
+    algorithm: String,
+    sequence: u64,
+    manifest_id: String,
+    public_key: String,
+    signature: String,
+}
+
+/// Signs the current validated manifest head for export to separately retained
+/// storage. The returned anchor contains no secret key material.
+pub fn sign_current_manifest_head(
+    library: &Library,
+    signing_key: &ManifestSigningKey,
+) -> Result<TrustedManifestHead, TrustedHeadError> {
+    let stored = validated_manifest_head(library)?;
+    let sequence = stored.manifest.sequence;
+    let key_pair = signing_key.key_pair()?;
+    let signature = key_pair.sign(&trusted_head_message(sequence, stored.id));
+    let public_key = key_pair.public_key().as_ref().try_into().map_err(|_| {
+        TrustedHeadError::InvalidAnchor("Ed25519 public key has an unexpected length")
+    })?;
+    let signature = signature.as_ref().try_into().map_err(|_| {
+        TrustedHeadError::InvalidAnchor("Ed25519 signature has an unexpected length")
+    })?;
+    Ok(TrustedManifestHead {
+        sequence,
+        manifest_id: stored.id,
+        public_key,
+        signature,
+    })
+}
+
+fn validated_manifest_head(
+    library: &Library,
+) -> Result<wikisync_store::StoredManifest, TrustedHeadError> {
+    let mut cursor = None;
+    let mut expected_sequence = 1_u64;
+    let mut predecessor = None;
+    let mut run_ids = HashSet::new();
+    let mut head = None;
+    loop {
+        let page = library.manifests_after(cursor, 1_000)?;
+        if page.is_empty() {
+            break;
+        }
+        for stored in page {
+            if stored.manifest.sequence != expected_sequence {
+                return Err(TrustedHeadError::InvalidManifestHistory(
+                    "manifest append sequence has a gap",
+                ));
+            }
+            if stored.manifest.predecessor != predecessor {
+                return Err(TrustedHeadError::InvalidManifestHistory(
+                    "manifest predecessor chain is broken",
+                ));
+            }
+            if !run_ids.insert(stored.manifest.run_id) {
+                return Err(TrustedHeadError::InvalidManifestHistory(
+                    "sync run occurs more than once in manifest chain",
+                ));
+            }
+            predecessor = Some(stored.id);
+            cursor = Some(stored.manifest.sequence);
+            expected_sequence = expected_sequence.checked_add(1).ok_or(
+                TrustedHeadError::InvalidManifestHistory("manifest sequence overflowed"),
+            )?;
+            head = Some(stored);
+        }
+    }
+    head.ok_or(TrustedHeadError::EmptyManifestHistory)
 }
 
 /// Verifies a library with the default bounds for `scope`.
@@ -202,6 +509,10 @@ pub fn verify_library_with_options(
         manifests_at_end: 0,
         manifests_examined: 0,
         manifests_identity_verified: 0,
+        metadata_records_at_start: 0,
+        metadata_records_at_end: 0,
+        metadata_records_examined: 0,
+        trusted_head_authenticated: false,
         finding_count: 0,
         findings: Vec::new(),
         omitted_findings: 0,
@@ -237,6 +548,7 @@ pub fn verify_library_with_options(
                         kind: VerificationFindingKind::MetadataNotVerified,
                         object_id: Some(object_id),
                         manifest_sequence: None,
+                        metadata_subject: None,
                         message: format!(
                             "logical object metadata state is {:?}, not verified",
                             logical.verification_state
@@ -256,6 +568,7 @@ pub fn verify_library_with_options(
                                 kind: VerificationFindingKind::LengthMismatch,
                                 object_id: Some(object_id),
                                 manifest_sequence: None,
+                                metadata_subject: None,
                                 message: format!(
                                     "verified read returned {actual_length} bytes; metadata records {}",
                                     logical.object.uncompressed_length
@@ -279,6 +592,7 @@ pub fn verify_library_with_options(
                         kind: VerificationFindingKind::ObjectUnreadable,
                         object_id: Some(object_id),
                         manifest_sequence: None,
+                        metadata_subject: None,
                         message: error.to_string(),
                     },
                 ),
@@ -300,6 +614,7 @@ pub fn verify_library_with_options(
                 kind: VerificationFindingKind::LibraryChangedDuringVerification,
                 object_id: None,
                 manifest_sequence: None,
+                metadata_subject: None,
                 message,
             },
         );
@@ -309,9 +624,370 @@ pub fn verify_library_with_options(
     }
     if options.scope == VerificationScope::Full {
         verify_manifest_history(library, options.max_retained_findings, &mut report)?;
+        verify_metadata_references(library, options, &mut report)?;
     }
 
     Ok(report)
+}
+
+/// Performs full local verification and authenticates the resulting manifest-chain
+/// head against a separately supplied Ed25519 anchor.
+///
+/// A valid but older anchor is reported as a mismatch: callers should retain the
+/// newest exported anchor they trust rather than silently accepting rollback or a
+/// library that has advanced since export.
+pub fn verify_library_against_trusted_head(
+    library: &Library,
+    options: VerificationOptions,
+    trusted_head: &TrustedManifestHead,
+) -> Result<VerificationReport, VerificationError> {
+    if options.scope != VerificationScope::Full {
+        return Err(VerificationError::TrustedHeadRequiresFullVerification);
+    }
+    let maximum_findings = options.max_retained_findings;
+    let mut report = verify_library_with_options(library, options)?;
+    if !trusted_head.signature_is_valid() {
+        push_finding(
+            &mut report,
+            maximum_findings,
+            VerificationFinding {
+                kind: VerificationFindingKind::TrustedHeadSignatureInvalid,
+                object_id: None,
+                manifest_sequence: Some(trusted_head.sequence),
+                metadata_subject: None,
+                message: "external trusted-head Ed25519 signature is invalid".to_owned(),
+            },
+        );
+        return Ok(report);
+    }
+
+    let local_head = (report.manifests_at_start > 0)
+        .then_some(report.manifests_at_start)
+        .and_then(|sequence| library.read_manifest(sequence).ok());
+    let matches = local_head.as_ref().is_some_and(|stored| {
+        stored.manifest.sequence == trusted_head.sequence && stored.id == trusted_head.manifest_id
+    });
+    if matches && report.manifests_at_start == report.manifests_at_end {
+        report.trusted_head_authenticated = true;
+    } else {
+        let local_description = local_head.map_or_else(
+            || "no readable local manifest head".to_owned(),
+            |stored| {
+                format!(
+                    "local head sequence {} ({})",
+                    stored.manifest.sequence, stored.id
+                )
+            },
+        );
+        push_finding(
+            &mut report,
+            maximum_findings,
+            VerificationFinding {
+                kind: VerificationFindingKind::TrustedHeadMismatch,
+                object_id: None,
+                manifest_sequence: Some(trusted_head.sequence),
+                metadata_subject: None,
+                message: format!(
+                    "external trusted head sequence {} ({}) does not match {local_description}",
+                    trusted_head.sequence, trusted_head.manifest_id
+                ),
+            },
+        );
+    }
+    Ok(report)
+}
+
+fn trusted_head_message(sequence: u64, manifest_id: ManifestId) -> Vec<u8> {
+    let mut message = Vec::with_capacity(TRUSTED_HEAD_DOMAIN.len() + 8 + 32);
+    message.extend_from_slice(TRUSTED_HEAD_DOMAIN);
+    message.extend_from_slice(&sequence.to_le_bytes());
+    message.extend_from_slice(manifest_id.as_bytes());
+    message
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_hex_array<const N: usize>(encoded: &str) -> Result<[u8; N], ()> {
+    if encoded.len() != N * 2 || !encoded.is_ascii() {
+        return Err(());
+    }
+    let mut decoded = [0_u8; N];
+    for (index, byte) in decoded.iter_mut().enumerate() {
+        let offset = index * 2;
+        let high = decode_hex_nibble(encoded.as_bytes()[offset]).ok_or(())?;
+        let low = decode_hex_nibble(encoded.as_bytes()[offset + 1]).ok_or(())?;
+        *byte = (high << 4) | low;
+    }
+    Ok(decoded)
+}
+
+const fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn verify_metadata_references(
+    library: &Library,
+    options: VerificationOptions,
+    report: &mut VerificationReport,
+) -> Result<(), VerificationError> {
+    let change_counter_at_start = library.integrity_metadata_change_counter()?;
+    report.metadata_records_at_start = library.integrity_metadata_record_count()?;
+    report.metadata_records_at_end = report.metadata_records_at_start;
+    let mut cursor = None;
+    while report.metadata_records_examined < report.metadata_records_at_start {
+        let remaining = report.metadata_records_at_start - report.metadata_records_examined;
+        let limit = u32::try_from(u64::from(options.page_size).min(remaining))
+            .expect("metadata page limit is already bounded to u32");
+        let page = library.integrity_metadata_records_after(cursor, limit)?;
+        if page.is_empty() {
+            report.coverage = VerificationCoverage::Partial;
+            push_finding(
+                report,
+                options.max_retained_findings,
+                VerificationFinding {
+                    kind: VerificationFindingKind::MetadataChangedDuringVerification,
+                    object_id: None,
+                    manifest_sequence: None,
+                    metadata_subject: None,
+                    message:
+                        "metadata-reference enumeration ended before its starting record count"
+                            .to_owned(),
+                },
+            );
+            break;
+        }
+        for record in page {
+            let subject = record.subject.clone();
+            cursor = Some(record.cursor()?);
+            report.metadata_records_examined =
+                report.metadata_records_examined.checked_add(1).ok_or(
+                    VerificationError::CounterOverflow("metadata records examined"),
+                )?;
+            for issue in record.issues {
+                let (kind, detail) = metadata_finding(issue);
+                push_finding(
+                    report,
+                    options.max_retained_findings,
+                    VerificationFinding {
+                        kind,
+                        object_id: None,
+                        manifest_sequence: None,
+                        metadata_subject: Some(subject.clone()),
+                        message: format!("{subject:?}: {detail}"),
+                    },
+                );
+            }
+            if let Some(version) = record.search_transformer_version
+                && version != PLAIN_TEXT_TRANSFORMER_VERSION.as_str()
+            {
+                push_finding(
+                    report,
+                    options.max_retained_findings,
+                    VerificationFinding {
+                        kind: VerificationFindingKind::SearchTransformerVersionMismatch,
+                        object_id: None,
+                        manifest_sequence: None,
+                        metadata_subject: Some(subject.clone()),
+                        message: format!(
+                            "{subject:?}: search transformer version {version:?} is not current version {:?}",
+                            PLAIN_TEXT_TRANSFORMER_VERSION.as_str()
+                        ),
+                    },
+                );
+            }
+        }
+    }
+
+    report.metadata_records_at_end = library.integrity_metadata_record_count()?;
+    let change_counter_at_end = library.integrity_metadata_change_counter()?;
+    if report.metadata_records_at_end != report.metadata_records_at_start
+        || change_counter_at_end != change_counter_at_start
+    {
+        report.coverage = VerificationCoverage::Partial;
+        push_finding(
+            report,
+            options.max_retained_findings,
+            VerificationFinding {
+                kind: VerificationFindingKind::MetadataChangedDuringVerification,
+                object_id: None,
+                manifest_sequence: None,
+                metadata_subject: None,
+                message: format!(
+                    "metadata changed during verification (record count {} to {}, SQLite change counter {} to {})",
+                    report.metadata_records_at_start,
+                    report.metadata_records_at_end,
+                    change_counter_at_start,
+                    change_counter_at_end
+                ),
+            },
+        );
+    }
+    if report.metadata_records_examined != report.metadata_records_at_start {
+        report.coverage = VerificationCoverage::Partial;
+    }
+    Ok(())
+}
+
+const fn metadata_finding(
+    issue: IntegrityMetadataIssue,
+) -> (VerificationFindingKind, &'static str) {
+    match issue {
+        IntegrityMetadataIssue::RevisionPageMissing => (
+            VerificationFindingKind::RevisionPageUnreachable,
+            "revision's owning page is absent",
+        ),
+        IntegrityMetadataIssue::RevisionObjectMissing => (
+            VerificationFindingKind::RevisionObjectUnreachable,
+            "revision's canonical content object is absent",
+        ),
+        IntegrityMetadataIssue::RevisionParentWrongPage => (
+            VerificationFindingKind::RevisionParentPageMismatch,
+            "captured parent revision belongs to another page",
+        ),
+        IntegrityMetadataIssue::RevisionParentSelfReference => (
+            VerificationFindingKind::RevisionParentSelfReference,
+            "revision identifies itself as its parent",
+        ),
+        IntegrityMetadataIssue::PageHeadRevisionMissing => (
+            VerificationFindingKind::PageHeadRevisionUnreachable,
+            "page head revision is absent",
+        ),
+        IntegrityMetadataIssue::PageHeadRevisionWrongPage => (
+            VerificationFindingKind::PageHeadRevisionPageMismatch,
+            "page head revision belongs to another page",
+        ),
+        IntegrityMetadataIssue::CheckpointCollectionWikiMismatch => (
+            VerificationFindingKind::CheckpointCollectionMismatch,
+            "checkpoint collection is absent or belongs to another wiki",
+        ),
+        IntegrityMetadataIssue::CheckpointRunMissing => (
+            VerificationFindingKind::CheckpointRunUnreachable,
+            "committed checkpoint has no reachable advancing run",
+        ),
+        IntegrityMetadataIssue::CheckpointRunNotSucceeded => (
+            VerificationFindingKind::CheckpointRunNotSucceeded,
+            "checkpoint's advancing run has not succeeded",
+        ),
+        IntegrityMetadataIssue::CheckpointRunScopeMismatch => (
+            VerificationFindingKind::CheckpointRunScopeMismatch,
+            "checkpoint and advancing run have different scope",
+        ),
+        IntegrityMetadataIssue::CheckpointBoundaryMismatch => (
+            VerificationFindingKind::CheckpointBoundaryMismatch,
+            "checkpoint boundary differs from advancing run candidate",
+        ),
+        IntegrityMetadataIssue::SearchPageMissing => (
+            VerificationFindingKind::SearchPageUnreachable,
+            "search document page is absent",
+        ),
+        IntegrityMetadataIssue::SearchRevisionMissing => (
+            VerificationFindingKind::SearchRevisionUnreachable,
+            "search document revision is absent",
+        ),
+        IntegrityMetadataIssue::SearchRevisionWrongPage => (
+            VerificationFindingKind::SearchRevisionPageMismatch,
+            "search document revision belongs to another page",
+        ),
+        IntegrityMetadataIssue::SearchRevisionNotCurrent => (
+            VerificationFindingKind::SearchRevisionNotCurrent,
+            "search document does not point to the page's current revision",
+        ),
+        IntegrityMetadataIssue::SearchFtsRowMissing => (
+            VerificationFindingKind::SearchFtsRowMissing,
+            "search document has no FTS row",
+        ),
+        IntegrityMetadataIssue::SearchFtsRowOrphan => (
+            VerificationFindingKind::SearchFtsRowOrphan,
+            "FTS row has no search document",
+        ),
+    }
+}
+
+/// Failure to create, encode, parse, or sign an external trusted manifest head.
+#[derive(Debug)]
+pub enum TrustedHeadError {
+    /// Library metadata or the manifest file could not be read.
+    Store(StoreError),
+    /// The operating system random source could not generate a key.
+    KeyGeneration,
+    /// Imported PKCS#8 bytes were not a supported Ed25519 key document.
+    InvalidSigningKey,
+    /// No manifest exists to authenticate.
+    EmptyManifestHistory,
+    /// The local manifest inventory was readable but not one strict append chain.
+    InvalidManifestHistory(&'static str),
+    /// Trusted-head JSON encoding or decoding failed.
+    Json(serde_json::Error),
+    /// The trusted-head document exceeded its fixed input bound.
+    AnchorTooLarge,
+    /// The trusted-head schema version is not supported.
+    UnsupportedSchema(u32),
+    /// The trusted-head signature algorithm is not supported.
+    UnsupportedAlgorithm(String),
+    /// A trusted-head field or its canonical encoding was invalid.
+    InvalidAnchor(&'static str),
+}
+
+impl fmt::Display for TrustedHeadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(error) => write!(formatter, "trusted-head store read failed: {error}"),
+            Self::KeyGeneration => formatter.write_str("Ed25519 key generation failed"),
+            Self::InvalidSigningKey => formatter.write_str("invalid Ed25519 PKCS#8 signing key"),
+            Self::EmptyManifestHistory => {
+                formatter.write_str("cannot sign an empty manifest history")
+            }
+            Self::InvalidManifestHistory(message) => {
+                write!(formatter, "cannot sign invalid manifest history: {message}")
+            }
+            Self::Json(error) => write!(formatter, "trusted-head JSON failed: {error}"),
+            Self::AnchorTooLarge => write!(
+                formatter,
+                "trusted-head document exceeds the {MAX_TRUSTED_HEAD_BYTES}-byte bound"
+            ),
+            Self::UnsupportedSchema(version) => {
+                write!(
+                    formatter,
+                    "unsupported trusted-head schema version {version}"
+                )
+            }
+            Self::UnsupportedAlgorithm(algorithm) => {
+                write!(
+                    formatter,
+                    "unsupported trusted-head algorithm {algorithm:?}"
+                )
+            }
+            Self::InvalidAnchor(message) => write!(formatter, "invalid trusted head: {message}"),
+        }
+    }
+}
+
+impl Error for TrustedHeadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Store(error) => Some(error),
+            Self::Json(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<StoreError> for TrustedHeadError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
 }
 
 fn verify_manifest_history(
@@ -330,6 +1006,7 @@ fn verify_manifest_history(
                     kind: VerificationFindingKind::ManifestInventoryInvalid,
                     object_id: None,
                     manifest_sequence: None,
+                    metadata_subject: None,
                     message: error.to_string(),
                 },
             );
@@ -346,6 +1023,7 @@ fn verify_manifest_history(
                     kind: VerificationFindingKind::ManifestInventoryInvalid,
                     object_id: None,
                     manifest_sequence: None,
+                    metadata_subject: None,
                     message: "manifest filename is not UTF-8".to_owned(),
                 },
             );
@@ -360,6 +1038,7 @@ fn verify_manifest_history(
                     kind: VerificationFindingKind::ManifestInventoryInvalid,
                     object_id: None,
                     manifest_sequence: None,
+                    metadata_subject: None,
                     message: format!("unexpected manifest directory entry {name:?}"),
                 },
             ),
@@ -388,6 +1067,7 @@ fn verify_manifest_history(
                     kind: VerificationFindingKind::ManifestMissing,
                     object_id: None,
                     manifest_sequence: Some(expected_sequence),
+                    metadata_subject: None,
                     message,
                 },
             );
@@ -404,6 +1084,7 @@ fn verify_manifest_history(
                         kind: VerificationFindingKind::ManifestUnreadable,
                         object_id: None,
                         manifest_sequence: Some(sequence),
+                        metadata_subject: None,
                         message: error.to_string(),
                     },
                 );
@@ -433,6 +1114,7 @@ fn verify_manifest_history(
                     kind: VerificationFindingKind::ManifestPredecessorMismatch,
                     object_id: None,
                     manifest_sequence: Some(sequence),
+                    metadata_subject: None,
                     message: format!(
                         "manifest predecessor {:?} does not match prior verified identity {:?}",
                         stored.manifest.predecessor, expected_predecessor
@@ -450,6 +1132,7 @@ fn verify_manifest_history(
                     kind: VerificationFindingKind::DuplicateManifestRun,
                     object_id: None,
                     manifest_sequence: Some(sequence),
+                    metadata_subject: None,
                     message: format!(
                         "sync run {} is represented by more than one manifest",
                         stored.manifest.run_id
@@ -466,6 +1149,7 @@ fn verify_manifest_history(
                     kind: VerificationFindingKind::ManifestRunNotSucceeded,
                     object_id: None,
                     manifest_sequence: Some(sequence),
+                    metadata_subject: None,
                     message: format!(
                         "manifest refers to absent or unsuccessful sync run {}",
                         stored.manifest.run_id
@@ -490,6 +1174,7 @@ fn verify_manifest_history(
                         kind: VerificationFindingKind::SuccessfulRunMissingManifest,
                         object_id: None,
                         manifest_sequence: None,
+                        metadata_subject: None,
                         message: format!("successful sync run {run_id} has no manifest"),
                     },
                 );
@@ -516,6 +1201,7 @@ fn verify_manifest_history(
                         kind: VerificationFindingKind::ManifestsChangedDuringVerification,
                         object_id: None,
                         manifest_sequence: None,
+                        metadata_subject: None,
                         message: "manifest directory changed during verification".to_owned(),
                     },
                 );
@@ -530,6 +1216,7 @@ fn verify_manifest_history(
                     kind: VerificationFindingKind::ManifestsChangedDuringVerification,
                     object_id: None,
                     manifest_sequence: None,
+                    metadata_subject: None,
                     message: error.to_string(),
                 },
             );
@@ -591,6 +1278,8 @@ pub enum VerificationError {
     ZeroQuickObjectLimit,
     /// At least one detailed finding must be retained.
     ZeroFindingLimit,
+    /// An external trust anchor is only meaningful with a full manifest scan.
+    TrustedHeadRequiresFullVerification,
     /// Store pagination violated its strict object-ID ordering contract.
     NonAdvancingObjectPage {
         /// Previously returned object, absent only before the first result.
@@ -615,6 +1304,9 @@ impl fmt::Display for VerificationError {
             }
             Self::ZeroFindingLimit => {
                 formatter.write_str("verification finding limit must be greater than zero")
+            }
+            Self::TrustedHeadRequiresFullVerification => {
+                formatter.write_str("trusted-head authentication requires full verification scope")
             }
             Self::NonAdvancingObjectPage { previous, current } => write!(
                 formatter,
@@ -646,8 +1338,10 @@ impl From<StoreError> for VerificationError {
 mod tests {
     use std::fs;
 
+    use rusqlite::params;
     use tempfile::TempDir;
-    use wikisync_store::{Library, ObjectKind, SyncRunKind};
+    use wikisync_core::{PageId, PageTitle, RevisionId};
+    use wikisync_store::{CurrentRevisionCapture, Library, ObjectKind, SyncRunKind};
 
     use super::*;
 
@@ -692,6 +1386,73 @@ mod tests {
                 .expect("complete run");
             library.append_sync_manifest(run_id).expect("manifest run");
         }
+        (directory, library)
+    }
+
+    fn metadata_fixture() -> (TempDir, Library) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut library = Library::open(directory.path()).expect("library");
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "fixture")
+            .expect("collection");
+        let title = PageTitle::new("Fixture page").expect("title");
+        library
+            .capture_current_revision(
+                wiki_id,
+                collection_id,
+                &CurrentRevisionCapture {
+                    page_id: PageId::new(10).expect("page"),
+                    namespace: 0,
+                    title: &title,
+                    revision_id: RevisionId::new(20).expect("revision"),
+                    parent_id: Some(RevisionId::new(19).expect("uncaptured parent")),
+                    timestamp: "2026-08-21T00:00:00Z",
+                    author: Some("Fixture author"),
+                    author_id: Some(1),
+                    comment: Some("fixture"),
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: b"Fixture source",
+                },
+            )
+            .expect("capture");
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 100)
+            .expect("start run")
+            .status
+            .run_id;
+        library
+            .complete_sync_run(run_id, Some("fixture-cursor"))
+            .expect("complete run");
+        library.append_sync_manifest(run_id).expect("manifest");
+
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .execute(
+                "INSERT INTO search_documents (
+                    wiki_id, page_id, revision_id, transformer_version, indexed_at
+                 ) VALUES (?1, ?2, ?3, ?4, 100)",
+                params![
+                    wiki_id.get(),
+                    10_u64,
+                    20_u64,
+                    PLAIN_TEXT_TRANSFORMER_VERSION.as_str()
+                ],
+            )
+            .expect("search document");
+        let search_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO search_fts (
+                    rowid, title, aliases, headings, body, categories, captions
+                 ) VALUES (?1, 'Fixture page', '', '', 'Fixture source', '', '')",
+                [search_id],
+            )
+            .expect("FTS row");
         (directory, library)
     }
 
@@ -910,6 +1671,310 @@ mod tests {
         let after = verify_library(&library, VerificationScope::Full).expect("after repair");
         assert_eq!(after.finding_count, 0);
         assert_eq!(after.manifests_identity_verified, 1);
+    }
+
+    #[test]
+    fn ed25519_trusted_head_round_trips_and_authenticates_full_verification() {
+        let (_directory, library) = manifested_library(3);
+        let signing_key = ManifestSigningKey::generate().expect("signing key");
+        let trusted_head =
+            sign_current_manifest_head(&library, &signing_key).expect("trusted head");
+        let exported = trusted_head.to_canonical_json().expect("canonical JSON");
+        let imported =
+            TrustedManifestHead::from_canonical_json(&exported).expect("import trusted head");
+
+        assert_eq!(imported, trusted_head);
+        assert_eq!(imported.sequence, 3);
+        assert_eq!(imported.public_key().len(), ED25519_PUBLIC_KEY_BYTES);
+        assert_eq!(imported.signature().len(), ED25519_SIGNATURE_BYTES);
+        assert!(
+            !String::from_utf8(exported)
+                .expect("UTF-8 JSON")
+                .contains(&encode_hex(&signing_key.to_pkcs8_bytes()))
+        );
+
+        let report = verify_library_against_trusted_head(
+            &library,
+            VerificationOptions::new(VerificationScope::Full),
+            &imported,
+        )
+        .expect("authenticated verification");
+
+        assert_eq!(report.finding_count, 0);
+        assert!(report.trusted_head_authenticated);
+        assert!(report.is_authenticated_against_trusted_head());
+    }
+
+    #[test]
+    fn signature_tampering_is_distinct_from_local_manifest_integrity() {
+        let (_directory, library) = manifested_library(1);
+        let signing_key = ManifestSigningKey::generate().expect("signing key");
+        let mut trusted_head =
+            sign_current_manifest_head(&library, &signing_key).expect("trusted head");
+        trusted_head.signature[0] ^= 0x80;
+
+        let report = verify_library_against_trusted_head(
+            &library,
+            VerificationOptions::new(VerificationScope::Full),
+            &trusted_head,
+        )
+        .expect("verification report");
+
+        assert!(!report.is_verified_since_capture());
+        assert!(!report.trusted_head_authenticated);
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::TrustedHeadSignatureInvalid
+        }));
+    }
+
+    #[test]
+    fn a_valid_older_anchor_does_not_authenticate_an_advanced_library() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut library = Library::open(directory.path()).expect("library");
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("wiki");
+        let first_run = library
+            .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Bootstrap, 100)
+            .expect("start first")
+            .status
+            .run_id;
+        library
+            .complete_sync_run(first_run, None)
+            .expect("complete first");
+        library
+            .append_sync_manifest(first_run)
+            .expect("first manifest");
+        let signing_key = ManifestSigningKey::generate().expect("signing key");
+        let older_anchor =
+            sign_current_manifest_head(&library, &signing_key).expect("older anchor");
+
+        let second_run = library
+            .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Update, 200)
+            .expect("start second")
+            .status
+            .run_id;
+        library
+            .complete_sync_run(second_run, None)
+            .expect("complete second");
+        library
+            .append_sync_manifest(second_run)
+            .expect("second manifest");
+
+        let report = verify_library_against_trusted_head(
+            &library,
+            VerificationOptions::new(VerificationScope::Full),
+            &older_anchor,
+        )
+        .expect("verification report");
+
+        assert!(!report.trusted_head_authenticated);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == VerificationFindingKind::TrustedHeadMismatch)
+        );
+    }
+
+    #[test]
+    fn trusted_head_import_is_bounded_strict_and_canonical() {
+        let (_directory, library) = manifested_library(1);
+        let signing_key = ManifestSigningKey::generate().expect("signing key");
+        let trusted_head =
+            sign_current_manifest_head(&library, &signing_key).expect("trusted head");
+        let mut noncanonical = trusted_head.to_canonical_json().expect("JSON");
+        noncanonical.push(b'\n');
+
+        assert!(matches!(
+            TrustedManifestHead::from_canonical_json(&noncanonical),
+            Err(TrustedHeadError::InvalidAnchor(_))
+        ));
+        assert!(matches!(
+            TrustedManifestHead::from_canonical_json(&vec![b' '; MAX_TRUSTED_HEAD_BYTES + 1]),
+            Err(TrustedHeadError::AnchorTooLarge)
+        ));
+        assert!(matches!(
+            verify_library_against_trusted_head(
+                &library,
+                VerificationOptions::new(VerificationScope::Quick),
+                &trusted_head,
+            ),
+            Err(VerificationError::TrustedHeadRequiresFullVerification)
+        ));
+    }
+
+    #[test]
+    fn signing_key_pkcs8_round_trip_preserves_public_identity() {
+        let (_directory, library) = manifested_library(1);
+        let original = ManifestSigningKey::generate().expect("signing key");
+        let imported =
+            ManifestSigningKey::from_pkcs8(&original.to_pkcs8_bytes()).expect("import signing key");
+        let original_head = sign_current_manifest_head(&library, &original).expect("original head");
+        let imported_head = sign_current_manifest_head(&library, &imported).expect("imported head");
+
+        assert_eq!(original_head, imported_head);
+        assert!(format!("{original:?}").contains("REDACTED"));
+        assert!(!format!("{original:?}").contains(&encode_hex(&original.to_pkcs8_bytes())));
+    }
+
+    #[test]
+    fn signing_refuses_an_empty_or_gapped_manifest_history() {
+        let empty_directory = tempfile::tempdir().expect("empty temporary directory");
+        let empty = Library::open(empty_directory.path()).expect("empty library");
+        let signing_key = ManifestSigningKey::generate().expect("signing key");
+        assert!(matches!(
+            sign_current_manifest_head(&empty, &signing_key),
+            Err(TrustedHeadError::EmptyManifestHistory)
+        ));
+
+        let (directory, gapped) = manifested_library(3);
+        fs::remove_file(directory.path().join("manifests/000000000002.json"))
+            .expect("remove middle manifest");
+        assert!(matches!(
+            sign_current_manifest_head(&gapped, &signing_key),
+            Err(TrustedHeadError::InvalidManifestHistory(_))
+        ));
+    }
+
+    #[test]
+    fn full_verification_scans_every_current_metadata_kind_across_bounded_pages() {
+        let (_directory, library) = metadata_fixture();
+        let options = VerificationOptions {
+            page_size: 1,
+            ..VerificationOptions::new(VerificationScope::Full)
+        };
+
+        let report = verify_library_with_options(&library, options).expect("verification");
+
+        assert_eq!(report.metadata_records_at_start, 5);
+        assert_eq!(report.metadata_records_examined, 5);
+        assert_eq!(report.metadata_records_at_end, 5);
+        assert_eq!(report.finding_count, 0);
+        assert!(report.is_verified_since_capture());
+
+        let mut cursor = None;
+        let mut subjects = Vec::new();
+        loop {
+            let page = library
+                .integrity_metadata_records_after(cursor, 1)
+                .expect("metadata page");
+            let Some(record) = page.into_iter().next() else {
+                break;
+            };
+            cursor = Some(record.cursor().expect("cursor"));
+            subjects.push(record.subject);
+        }
+        assert!(matches!(
+            subjects.as_slice(),
+            [
+                IntegrityMetadataSubject::Revision { .. },
+                IntegrityMetadataSubject::Page { .. },
+                IntegrityMetadataSubject::Checkpoint { .. },
+                IntegrityMetadataSubject::SearchDocument { .. },
+                IntegrityMetadataSubject::SearchFtsRow { .. }
+            ]
+        ));
+    }
+
+    #[test]
+    fn full_verification_reports_reachability_and_search_version_findings() {
+        let (_directory, library) = metadata_fixture();
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .expect("disable fixture foreign keys");
+        let absent_object = format!("b3:{}", "00".repeat(32));
+        connection
+            .execute(
+                "UPDATE revisions SET content_object_id = ?1 WHERE revision_id = 20",
+                [absent_object],
+            )
+            .expect("break revision object pointer");
+        connection
+            .execute(
+                "UPDATE pages SET current_revision_id = 999 WHERE page_id = 10",
+                [],
+            )
+            .expect("break page head pointer");
+        connection
+            .execute("UPDATE sync_checkpoints SET last_run_id = 999", [])
+            .expect("break checkpoint run pointer");
+        connection
+            .execute(
+                "UPDATE search_documents SET transformer_version = 'wikitext-plain-v0'",
+                [],
+            )
+            .expect("stale search version");
+        connection
+            .execute("DELETE FROM search_fts", [])
+            .expect("remove FTS pointer target");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+        let kinds = report
+            .findings
+            .iter()
+            .map(|finding| finding.kind)
+            .collect::<HashSet<_>>();
+
+        assert!(kinds.contains(&VerificationFindingKind::RevisionObjectUnreachable));
+        assert!(kinds.contains(&VerificationFindingKind::PageHeadRevisionUnreachable));
+        assert!(kinds.contains(&VerificationFindingKind::CheckpointRunUnreachable));
+        assert!(kinds.contains(&VerificationFindingKind::SearchRevisionNotCurrent));
+        assert!(kinds.contains(&VerificationFindingKind::SearchFtsRowMissing));
+        assert!(kinds.contains(&VerificationFindingKind::SearchTransformerVersionMismatch));
+        assert!(
+            report
+                .findings
+                .iter()
+                .filter(|finding| finding.metadata_subject.is_some())
+                .all(|finding| finding.object_id.is_none())
+        );
+        assert!(!report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn full_verification_reports_orphan_fts_rows() {
+        let (_directory, library) = metadata_fixture();
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .execute(
+                "INSERT INTO search_fts (
+                    rowid, title, aliases, headings, body, categories, captions
+                 ) VALUES (999, 'Orphan', '', '', '', '', '')",
+                [],
+            )
+            .expect("orphan FTS row");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::SearchFtsRowOrphan
+                && finding.metadata_subject
+                    == Some(IntegrityMetadataSubject::SearchFtsRow { row_id: 999 })
+        }));
+    }
+
+    #[test]
+    fn quick_verification_does_not_scan_metadata_references() {
+        let (_directory, library) = metadata_fixture();
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .execute(
+                "UPDATE pages SET current_revision_id = 999 WHERE page_id = 10",
+                [],
+            )
+            .expect("break page head pointer");
+
+        let report = verify_library(&library, VerificationScope::Quick).expect("verification");
+
+        assert_eq!(report.metadata_records_at_start, 0);
+        assert_eq!(report.metadata_records_examined, 0);
+        assert_eq!(report.metadata_records_at_end, 0);
+        assert!(!report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::PageHeadRevisionUnreachable
+        }));
+        assert!(report.is_verified_since_capture());
     }
 
     #[test]

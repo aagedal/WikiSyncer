@@ -4,7 +4,7 @@ use std::process::{Command, Output};
 
 use serde_json::Value;
 use wikisync_core::{PageId, PageTitle, RevisionId};
-use wikisync_store::{CurrentRevisionCapture, Library};
+use wikisync_store::{CurrentRevisionCapture, Library, RevisionCapture};
 
 const ARTICLE_SOURCE: &str = include_str!("../../../fixtures/content/article.wiki");
 
@@ -99,10 +99,10 @@ fn exports_current_collection_offline_with_stable_provenance_files() {
 }
 
 #[test]
-fn historical_selection_fails_clearly_without_changing_output() {
+fn historical_time_slice_selects_each_pages_newest_eligible_revision() {
     let directory = tempfile::tempdir().expect("temporary library");
     let root = directory.path();
-    seed_library(root);
+    let collection_id = seed_library_with_history(root);
     let initial = run(root, &["export", "--format", "markdown"]);
     assert_success(&initial);
     let before = fs::read(root.join("exports/current/manifest.json")).unwrap();
@@ -113,19 +113,120 @@ fn historical_selection_fails_clearly_without_changing_output() {
             "export",
             "--format",
             "markdown",
+            "--collection",
+            &collection_id.to_string(),
             "--at",
-            "2026-01-01T00:00:00Z",
+            "2026-08-19T12:15:00Z",
         ],
     );
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("historical export selection with --at is not implemented")
-    );
+    assert_success(&output);
+    let historical = root.join("exports/at-time-unix-1787141700-markdown-collection-1");
+    let first = fs::read_to_string(historical.join("articles/10-first-page.md")).unwrap();
+    let second = fs::read_to_string(historical.join("articles/20-second-page.md")).unwrap();
+    assert!(first.contains("revision_id: 102"));
+    assert!(first.contains("First page at noon."));
+    assert!(second.contains("revision_id: 201"));
+    assert!(second.contains("Second page initial."));
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(historical.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["schema"], "wikisync-historical-export-v1");
+    assert_eq!(manifest["at"]["kind"], "timestamp");
+    assert_eq!(manifest["at"]["requested"], "2026-08-19T12:15:00Z");
+    assert_eq!(manifest["article_count"], 2);
     assert_eq!(
         fs::read(root.join("exports/current/manifest.json")).unwrap(),
         before
     );
+}
+
+#[test]
+fn historical_boundaries_offsets_and_revision_anchors_are_deterministic() {
+    let directory = tempfile::tempdir().expect("temporary library");
+    let root = directory.path();
+    seed_library_with_history(root);
+
+    let boundary = run(
+        root,
+        &["export", "--format", "text", "--at", "2026-08-19T12:00:00Z"],
+    );
+    assert_success(&boundary);
+    let time_output = root.join("exports/at-time-unix-1787140800-text-library");
+    let article = fs::read_to_string(time_output.join("articles/10-first-page.txt")).unwrap();
+    assert!(
+        article.contains("Revision ID: 102"),
+        "boundary is inclusive"
+    );
+    let second = fs::read_to_string(time_output.join("articles/20-second-page.txt")).unwrap();
+    assert!(second.contains("Revision ID: 201"));
+
+    let same_instant = run(
+        root,
+        &[
+            "export",
+            "--format",
+            "text",
+            "--at",
+            "2026-08-19T14:00:00+02:00",
+        ],
+    );
+    assert_success(&same_instant);
+    assert!(
+        time_output.is_dir(),
+        "equivalent offsets share one destination"
+    );
+
+    let other_format = run(
+        root,
+        &[
+            "export",
+            "--format",
+            "markdown",
+            "--at",
+            "2026-08-19T12:00:00Z",
+        ],
+    );
+    assert_success(&other_format);
+    assert!(time_output.is_dir(), "a different format must not collide");
+    assert!(
+        root.join("exports/at-time-unix-1787140800-markdown-library")
+            .is_dir()
+    );
+
+    let revision_anchor = run(root, &["export", "--format", "markdown", "--at", "202"]);
+    assert_success(&revision_anchor);
+    let anchored = root.join("exports/at-revision-1-202-markdown-library");
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(anchored.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["at"]["kind"], "revision");
+    assert_eq!(manifest["at"]["revision_id"], 202);
+    let first = fs::read_to_string(anchored.join("articles/10-first-page.md")).unwrap();
+    let second = fs::read_to_string(anchored.join("articles/20-second-page.md")).unwrap();
+    assert!(first.contains("revision_id: 102"));
+    assert!(second.contains("revision_id: 202"));
+
+    let invalid = run(
+        root,
+        &["export", "--format", "markdown", "--at", "not-a-time"],
+    );
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("RFC 3339"));
+
+    let before_history = run(
+        root,
+        &[
+            "export",
+            "--format",
+            "markdown",
+            "--at",
+            "2020-01-01T00:00:00Z",
+        ],
+    );
+    assert_success(&before_history);
+    let early = root.join("exports/at-time-unix-1577836800-markdown-library");
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(early.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["article_count"], 0);
+    assert_eq!(manifest["uncaptured_page_count"], 2);
 }
 
 #[test]
@@ -175,6 +276,46 @@ fn refuses_symlinked_export_paths_without_touching_the_target() {
     assert!(!outside.path().join("current").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn refuses_symlinked_historical_destination_without_touching_current_or_target() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("temporary library");
+    let root = directory.path();
+    seed_library_with_history(root);
+    assert_success(&run(root, &["export", "--format", "markdown"]));
+    let current_before = fs::read(root.join("exports/current/manifest.json")).unwrap();
+    let outside = tempfile::tempdir().expect("outside directory");
+    fs::write(outside.path().join("marker"), b"untouched").unwrap();
+    symlink(
+        outside.path(),
+        root.join("exports/at-time-unix-1787141700-markdown-library"),
+    )
+    .unwrap();
+
+    let output = run(
+        root,
+        &[
+            "export",
+            "--format",
+            "markdown",
+            "--at",
+            "2026-08-19T12:15:00Z",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("symbolic link"));
+    assert_eq!(
+        fs::read(outside.path().join("marker")).unwrap(),
+        b"untouched"
+    );
+    assert_eq!(
+        fs::read(root.join("exports/current/manifest.json")).unwrap(),
+        current_before
+    );
+}
+
 fn seed_library(root: &Path) -> u64 {
     let mut library = Library::open(root).expect("library");
     let wiki_id = library
@@ -206,6 +347,127 @@ fn seed_library(root: &Path) -> u64 {
         )
         .expect("capture");
     collection_id.get()
+}
+
+fn seed_library_with_history(root: &Path) -> u64 {
+    let mut library = Library::open(root).expect("library");
+    let wiki_id = library
+        .register_wiki("https://example.invalid/w/api.php", "en")
+        .expect("wiki");
+    let collection_id = library
+        .create_explicit_collection(wiki_id, "Historical export fixture")
+        .expect("collection");
+    let first_title = PageTitle::new("First Page").unwrap();
+    library
+        .capture_current_revision(
+            wiki_id,
+            collection_id,
+            &CurrentRevisionCapture {
+                page_id: PageId::new(10).unwrap(),
+                namespace: 0,
+                title: &first_title,
+                revision_id: RevisionId::new(103).unwrap(),
+                parent_id: Some(RevisionId::new(102).unwrap()),
+                timestamp: "2026-08-19T13:00:00Z",
+                author: Some("Current editor"),
+                author_id: None,
+                comment: None,
+                minor: false,
+                upstream_sha1: None,
+                content_model: "wikitext",
+                source: b"First page current.",
+            },
+        )
+        .unwrap();
+    capture_history(
+        &mut library,
+        wiki_id,
+        PageId::new(10).unwrap(),
+        102,
+        Some(101),
+        "2026-08-19T12:00:00Z",
+        b"First page at noon.",
+    );
+    capture_history(
+        &mut library,
+        wiki_id,
+        PageId::new(10).unwrap(),
+        101,
+        None,
+        "2026-08-19T11:00:00Z",
+        b"First page initial.",
+    );
+
+    let second_title = PageTitle::new("Second Page").unwrap();
+    library
+        .capture_current_revision(
+            wiki_id,
+            collection_id,
+            &CurrentRevisionCapture {
+                page_id: PageId::new(20).unwrap(),
+                namespace: 0,
+                title: &second_title,
+                revision_id: RevisionId::new(203).unwrap(),
+                parent_id: Some(RevisionId::new(202).unwrap()),
+                timestamp: "2026-08-19T14:00:00Z",
+                author: Some("Current editor"),
+                author_id: None,
+                comment: None,
+                minor: false,
+                upstream_sha1: None,
+                content_model: "wikitext",
+                source: b"Second page current.",
+            },
+        )
+        .unwrap();
+    capture_history(
+        &mut library,
+        wiki_id,
+        PageId::new(20).unwrap(),
+        202,
+        Some(201),
+        "2026-08-19T12:30:00Z",
+        b"Second page half past noon.",
+    );
+    capture_history(
+        &mut library,
+        wiki_id,
+        PageId::new(20).unwrap(),
+        201,
+        None,
+        "2026-08-19T10:00:00Z",
+        b"Second page initial.",
+    );
+    collection_id.get()
+}
+
+fn capture_history(
+    library: &mut Library,
+    wiki_id: wikisync_core::WikiId,
+    page_id: PageId,
+    revision_id: u64,
+    parent_id: Option<u64>,
+    timestamp: &str,
+    source: &[u8],
+) {
+    library
+        .capture_revision(
+            wiki_id,
+            page_id,
+            &RevisionCapture {
+                revision_id: RevisionId::new(revision_id).unwrap(),
+                parent_id: parent_id.map(|id| RevisionId::new(id).unwrap()),
+                timestamp,
+                author: Some("Historical editor"),
+                author_id: None,
+                comment: None,
+                minor: false,
+                upstream_sha1: None,
+                content_model: "wikitext",
+                source,
+            },
+        )
+        .unwrap();
 }
 
 fn run(root: &Path, arguments: &[&str]) -> Output {

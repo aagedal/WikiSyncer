@@ -1,3 +1,5 @@
+mod support;
+
 use std::fs;
 use std::io::ErrorKind;
 use std::net::TcpListener;
@@ -8,6 +10,8 @@ use std::process::{Command, Output};
 use serde_json::Value;
 use wikisync_core::{PageId, PageTitle, RevisionId};
 use wikisync_store::{CurrentRevisionCapture, Library, SyncRunKind};
+
+use support::{FixtureResponse, FixtureServer};
 
 const ENDPOINT_SECRET: &str = "SENTINEL_ENDPOINT_SECRET";
 const COLLECTION_SECRET: &str = "SENTINEL_COLLECTION_SECRET";
@@ -136,6 +140,10 @@ fn doctor_json_and_human_output_are_offline_redacted_and_bounded() {
         report.pointer("/recent_runs/data/recent_errors/0/code"),
         Some(&Value::from("source-timeout"))
     );
+    assert_eq!(
+        report.pointer("/source_reachability/data/requested"),
+        Some(&Value::from(false))
+    );
     assert_redacted(&report);
     assert_strict_keys(&report);
     let encoded = serde_json::to_string(&report).expect("encode report");
@@ -152,6 +160,98 @@ fn doctor_json_and_human_output_are_offline_redacted_and_bounded() {
     for secret in secrets() {
         assert!(!human.contains(secret), "human output leaked {secret}");
     }
+}
+
+#[test]
+fn online_reachability_is_explicit_bounded_and_aggregate_only() {
+    let server = FixtureServer::start(vec![FixtureResponse::json(r#"{"query":{"pages":[]}}"#)]);
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let root = temporary.path().join(PATH_SECRET);
+    let mut library = Library::open(&root).expect("initialize library");
+    let endpoint = server
+        .endpoint()
+        .replace("/w/api.php", &format!("/{ENDPOINT_SECRET}/w/api.php"));
+    library
+        .register_wiki(&endpoint, "en")
+        .expect("register fixture source");
+    drop(library);
+
+    let bundle = temporary.path().join("online-doctor.json");
+    let output = doctor_command(&root)
+        .args(["--online", "--json", "--bundle"])
+        .arg(&bundle)
+        .output()
+        .expect("run online doctor");
+    assert_success(&output);
+
+    let report: Value = serde_json::from_slice(&output.stdout).expect("valid online report");
+    assert_eq!(
+        report.pointer("/source_reachability/data/requested"),
+        Some(&Value::from(true))
+    );
+    assert_eq!(
+        report.pointer("/source_reachability/data/checked_count"),
+        Some(&Value::from(1))
+    );
+    assert_eq!(
+        report.pointer("/source_reachability/data/reachable_count"),
+        Some(&Value::from(1))
+    );
+    assert_eq!(
+        report.pointer("/source_reachability/data/bounds/maximum_requests_per_source"),
+        Some(&Value::from(1))
+    );
+    assert_redacted(&report);
+    assert_strict_keys(&report);
+
+    let bundle_bytes = fs::read(&bundle).expect("online bundle");
+    let bundle_text = String::from_utf8(bundle_bytes).expect("UTF-8 bundle");
+    for forbidden in ["127.0.0.1", "/w/api.php", "Main Page", "titles="] {
+        assert!(
+            !bundle_text.contains(forbidden),
+            "online bundle leaked {forbidden}"
+        );
+    }
+    let (_, requests) = server.finish();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("action=query"));
+    assert!(requests[0].contains("titles=Main+Page"));
+    assert!(requests[0].contains(ENDPOINT_SECRET));
+}
+
+#[test]
+fn online_reachability_redacts_raw_source_errors() {
+    let server = FixtureServer::start(vec![FixtureResponse::json(
+        r#"{"error":{"code":"fixture-failure","info":"SENTINEL_ERROR_MESSAGE_SECRET"}}"#,
+    )]);
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let root = temporary.path().join(PATH_SECRET);
+    let mut library = Library::open(&root).expect("initialize library");
+    library
+        .register_wiki(server.endpoint(), "en")
+        .expect("register fixture source");
+    drop(library);
+
+    let bundle = temporary.path().join("failed-online-doctor.json");
+    let output = doctor_command(&root)
+        .args(["--online", "--json", "--bundle"])
+        .arg(&bundle)
+        .output()
+        .expect("run failing online doctor");
+    assert_success(&output);
+    let report: Value = serde_json::from_slice(&output.stdout).expect("valid online report");
+    assert_eq!(
+        report.pointer("/source_reachability/data/unreachable_count"),
+        Some(&Value::from(1))
+    );
+    assert_redacted(&report);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture-failure"));
+    let bundle_text = fs::read_to_string(bundle).expect("failed online bundle");
+    assert!(!bundle_text.contains(ERROR_SECRET));
+    assert!(!bundle_text.contains("fixture-failure"));
+
+    let (_, requests) = server.finish();
+    assert_eq!(requests.len(), 1);
 }
 
 #[test]

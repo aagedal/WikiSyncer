@@ -1,5 +1,6 @@
 mod doctor;
 mod export;
+mod trust;
 
 use std::env;
 use std::error::Error;
@@ -10,7 +11,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str;
 
-use export::ExportFormat;
+use export::{ExportAt, ExportFormat};
 use serde_json::json;
 use wikisync_content::{
     ContentDiff, DiffLine, DiffMode, DiffTag, diff as content_diff, to_markdown, to_plain_text,
@@ -26,9 +27,22 @@ use wikisync_store::{
 use wikisync_sync::{CategoryPreviewLimits, preview_category_selection};
 use wikisyncd::{ApplicationHandler, Mutation, OperationControl, RequestHandler, WriterAccess};
 
+use trust::{AnchorComparison, AnchorWriteMode};
+
 const USAGE: &str = "WikiSyncer offline reader
 
 Usage:
+  wikisync --library <path> init
+  wikisync --library <path> source add --api-endpoint <url> --language <code> [--json]
+  wikisync --library <path> source remove --wiki <id> [--json]
+  wikisync --library <path> source list [--json]
+  wikisync --library <path> collection list [--json]
+  wikisync --library <path> trust key-generate --output <external-path>
+  wikisync --library <path> trust key-validate --key <external-path>
+  wikisync --library <path> trust key-import --source <external-path> --output <external-path>
+  wikisync --library <path> trust anchor-export --key <external-path> --anchor <external-path> [--refresh]
+  wikisync --library <path> trust anchor-inspect --anchor <external-path> [--json]
+  wikisync --library <path> trust rotate --anchor <external-path> --new-key <external-path> --recovery-anchor <external-path> [--json]
   wikisync category-preview --api-endpoint <url> [--depth <edges>] [--json] <Category:title>
   wikisync --library <path> search [--wiki <id>] [--limit <count>] [--json] <query>
   wikisync --library <path> show [--wiki <id>] [--revision <id>] [--json] [--source] <title>
@@ -38,8 +52,8 @@ Usage:
   wikisync --library <path> verify [--full]
   wikisync --library <path> compact
   wikisync --library <path> status [--json]
-  wikisync --library <path> export --format <markdown|text> [--collection <id>]
-  wikisync --library <path> doctor [--json] [--bundle <new-file>]
+  wikisync --library <path> export --format <markdown|text> [--collection <id>] [--at <revision-or-time>]
+  wikisync --library <path> doctor [--json] [--bundle <new-file>] [--online]
   wikisync --library <path> serve [--port <port>]
   wikisync --help
   wikisync --version
@@ -76,6 +90,19 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
             depth,
             json,
         } => category_preview(&api_endpoint, &category, depth, json),
+        Action::Initialize { library } => {
+            let database = library.join("library.sqlite3");
+            if database.exists() {
+                return Err(CliError::message(format!(
+                    "refusing to initialize over existing path {}",
+                    database.display()
+                )));
+            }
+            let initialized = Library::open(&library)?;
+            drop(initialized);
+            println!("Initialized WikiSyncer library at {}.", library.display());
+            Ok(())
+        }
         Action::Command { library, command } => {
             if !library.join("library.sqlite3").is_file() {
                 return Err(CliError::message(format!(
@@ -84,10 +111,151 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                 )));
             }
             let library_root = library;
-            if let Command::Doctor { json, bundle } = &command {
-                return doctor::run(&library_root, *json, bundle.as_deref()).map_err(Into::into);
+            if let Command::Doctor {
+                json,
+                bundle,
+                online,
+            } = &command
+            {
+                return doctor::run(&library_root, *json, bundle.as_deref(), *online)
+                    .map_err(Into::into);
             }
             match command {
+                Command::TrustKeyGenerate { output } => {
+                    let summary = trust::generate_signing_key(&library_root, &output)?;
+                    println!(
+                        "Created a private Ed25519 signing key ({} bytes) at {}. Keep a protected backup separate from the library.",
+                        summary.byte_length,
+                        output.display()
+                    );
+                    return Ok(());
+                }
+                Command::TrustKeyValidate { key } => {
+                    drop(trust::validate_signing_key(&library_root, &key)?);
+                    println!(
+                        "The external Ed25519 signing key at {} is valid and private.",
+                        key.display()
+                    );
+                    return Ok(());
+                }
+                Command::TrustKeyImport { source, output } => {
+                    let summary = trust::import_signing_key(&library_root, &source, &output)?;
+                    println!(
+                        "Imported a validated private Ed25519 signing key ({} bytes) to {}. The source was retained.",
+                        summary.byte_length,
+                        output.display()
+                    );
+                    return Ok(());
+                }
+                Command::TrustAnchorExport {
+                    key,
+                    anchor,
+                    refresh,
+                } => {
+                    let library = Library::open(&library_root)?;
+                    let mode = if refresh {
+                        AnchorWriteMode::RefreshExisting
+                    } else {
+                        AnchorWriteMode::CreateNew
+                    };
+                    let summary =
+                        trust::export_current_trusted_head(&library, &key, &anchor, mode)?;
+                    print_trusted_head_summary("Exported trusted head", &summary);
+                    println!(
+                        "Store {} separately from the library; it authenticates captured bytes, not source truth.",
+                        anchor.display()
+                    );
+                    return Ok(());
+                }
+                Command::TrustAnchorInspect { anchor, json } => {
+                    let library = Library::open(&library_root)?;
+                    let inspection = trust::inspect_trusted_head(&library, &anchor)?;
+                    print_anchor_inspection(&inspection, json)?;
+                    return Ok(());
+                }
+                Command::TrustRotate {
+                    anchor,
+                    new_key,
+                    recovery_anchor,
+                    json,
+                } => {
+                    let library = Library::open(&library_root)?;
+                    let summary =
+                        trust::rotate_signing_key(&library, &anchor, &new_key, &recovery_anchor)
+                            .map_err(|error| CliError::message(error.to_string()))?;
+                    if json {
+                        write_json(&json!({
+                            "previous": trusted_head_json(&summary.previous),
+                            "current": trusted_head_json(&summary.current),
+                            "recovery_anchor_created": true,
+                        }))?;
+                    } else {
+                        print_trusted_head_summary(
+                            "Previous trusted head retained",
+                            &summary.previous,
+                        );
+                        print_trusted_head_summary("Rotated trusted head", &summary.current);
+                        println!(
+                            "Recovery anchor: {}. Neither signing key was deleted.",
+                            recovery_anchor.display()
+                        );
+                    }
+                    return Ok(());
+                }
+                Command::SourceRemove { wiki_id, json } => {
+                    let WriterAccess::Direct(_lease) = WriterAccess::discover(&library_root)?
+                    else {
+                        return Err(CliError::message(
+                            "the daemon owns this library; source administration is not yet available through daemon protocol version 1",
+                        ));
+                    };
+                    let mut library = Library::open(&library_root)?;
+                    library.remove_wiki(wiki_id)?;
+                    if json {
+                        write_json(&json!({
+                            "wiki_id": wiki_id.get(),
+                            "removed": true,
+                        }))?;
+                    } else {
+                        println!("Removed unused source wiki {wiki_id}.");
+                    }
+                    return Ok(());
+                }
+                Command::SourceAdd {
+                    api_endpoint,
+                    language_code,
+                    json,
+                } => {
+                    let _validated = ClientConfig::new(
+                        &api_endpoint,
+                        format!(
+                            "WikiSyncer/{} ({})",
+                            env!("CARGO_PKG_VERSION"),
+                            env!("CARGO_PKG_REPOSITORY")
+                        ),
+                    )?;
+                    let WriterAccess::Direct(_lease) = WriterAccess::discover(&library_root)?
+                    else {
+                        return Err(CliError::message(
+                            "the daemon owns this library; source administration is not yet available through daemon protocol version 1",
+                        ));
+                    };
+                    let mut library = Library::open(&library_root)?;
+                    let wiki_id = library.register_wiki(&api_endpoint, &language_code)?;
+                    if json {
+                        write_json(&json!({
+                            "wiki_id": wiki_id.get(),
+                            "api_endpoint": api_endpoint,
+                            "language_code": language_code,
+                        }))?;
+                    } else {
+                        println!(
+                            "Registered source {} ({}) as wiki {}.",
+                            api_endpoint, language_code, wiki_id
+                        );
+                    }
+                    return Ok(());
+                }
                 Command::Sync { collection_id } => {
                     let mutation = collection_id
                         .map_or(Mutation::SyncAll, |id| Mutation::SyncCollection(id.get()));
@@ -127,13 +295,19 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                     json,
                 } => revision_diff(&library, from, to, wiki_id, reading, json),
                 Command::Status { json } => status(&library, json),
+                Command::SourceList { json } => list_sources(&library, json),
+                Command::CollectionList { json } => list_collections(&library, json),
                 Command::Export {
                     format,
                     collection_id,
+                    at,
                 } => {
-                    let summary = export::run(&library, format, collection_id)?;
+                    let summary = match at {
+                        Some(at) => export::run_at(&library, format, collection_id, &at)?,
+                        None => export::run(&library, format, collection_id)?,
+                    };
                     println!(
-                        "Exported {} current article{} ({} canonical bytes) to {}.",
+                        "Exported {} article{} ({} canonical bytes) to {}.",
                         summary.article_count,
                         if summary.article_count == 1 { "" } else { "s" },
                         summary.canonical_bytes,
@@ -168,9 +342,143 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                 Command::Doctor { .. } => {
                     unreachable!("doctor returned before opening the normal reader")
                 }
+                Command::SourceAdd { .. } => {
+                    unreachable!("source add returned before opening the normal reader")
+                }
+                Command::SourceRemove { .. } => {
+                    unreachable!("source remove returned before opening the normal reader")
+                }
+                Command::TrustKeyGenerate { .. }
+                | Command::TrustKeyValidate { .. }
+                | Command::TrustKeyImport { .. }
+                | Command::TrustAnchorExport { .. }
+                | Command::TrustAnchorInspect { .. }
+                | Command::TrustRotate { .. } => {
+                    unreachable!("trust commands returned before opening the normal reader")
+                }
             }
         }
     }
+}
+
+fn trusted_head_json(summary: &trust::TrustedHeadSummary) -> serde_json::Value {
+    json!({
+        "sequence": summary.sequence,
+        "manifest_id": summary.manifest_id.to_string(),
+        "public_key": encode_hex(&summary.public_key),
+    })
+}
+
+fn print_trusted_head_summary(label: &str, summary: &trust::TrustedHeadSummary) {
+    println!(
+        "{label}: sequence {}, manifest {}, public key {}.",
+        summary.sequence,
+        summary.manifest_id,
+        encode_hex(&summary.public_key)
+    );
+}
+
+fn print_anchor_inspection(
+    inspection: &trust::AnchorInspection,
+    json_output: bool,
+) -> Result<(), CliError> {
+    let comparison = match inspection.comparison {
+        AnchorComparison::AuthenticatedCurrent => "authenticated-current",
+        AnchorComparison::InvalidSignature => "invalid-signature",
+        AnchorComparison::DifferentHead => "different-head",
+        AnchorComparison::LocalVerificationFailed => "local-verification-failed",
+    };
+    if json_output {
+        write_json(&json!({
+            "comparison": comparison,
+            "anchor": trusted_head_json(&inspection.anchor),
+            "verification": {
+                "verified_since_capture": inspection.report.is_verified_since_capture(),
+                "authenticated_against_trusted_head": inspection.report.is_authenticated_against_trusted_head(),
+                "objects_examined": inspection.report.objects_examined,
+                "objects_verified": inspection.report.objects_verified,
+                "manifests_examined": inspection.report.manifests_examined,
+                "finding_count": inspection.report.finding_count,
+                "omitted_findings": inspection.report.omitted_findings,
+            }
+        }))?;
+    } else {
+        print_trusted_head_summary("External trusted head", &inspection.anchor);
+        println!(
+            "Comparison: {comparison}; full verification findings: {}.",
+            inspection.report.finding_count
+        );
+        println!(
+            "This result authenticates captured bytes since capture only; it does not prove source truth or protect against replacing both the library and anchor."
+        );
+    }
+    Ok(())
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn list_sources(library: &Library, json_output: bool) -> Result<(), CliError> {
+    let sources = library.wikis()?;
+    if json_output {
+        write_json(&json!({
+            "sources": sources
+                .iter()
+                .map(|source| json!({
+                    "wiki_id": source.wiki_id.get(),
+                    "api_endpoint": source.api_endpoint,
+                    "language_code": source.language_code,
+                }))
+                .collect::<Vec<_>>()
+        }))?;
+    } else if sources.is_empty() {
+        println!("No sources configured.");
+    } else {
+        for source in sources {
+            println!(
+                "{}\t{}\t{}",
+                source.wiki_id, source.language_code, source.api_endpoint
+            );
+        }
+    }
+    Ok(())
+}
+
+fn list_collections(library: &Library, json_output: bool) -> Result<(), CliError> {
+    let collections = library.collections()?;
+    if json_output {
+        write_json(&json!({
+            "collections": collections
+                .iter()
+                .map(|collection| json!({
+                    "collection_id": collection.collection_id.get(),
+                    "wiki_id": collection.wiki_id.get(),
+                    "name": collection.name,
+                    "page_count": collection.page_count,
+                }))
+                .collect::<Vec<_>>()
+        }))?;
+    } else if collections.is_empty() {
+        println!("No collections configured.");
+    } else {
+        for collection in collections {
+            println!(
+                "{}\twiki {}\t{} pages\t{}",
+                collection.collection_id,
+                collection.wiki_id,
+                collection.page_count,
+                collection.name
+            );
+        }
+    }
+    Ok(())
 }
 
 fn mutate_library(library_root: &std::path::Path, mutation: Mutation) -> Result<(), CliError> {
@@ -728,6 +1036,9 @@ fn write_json(value: &serde_json::Value) -> Result<(), CliError> {
 enum Action {
     Help,
     Version,
+    Initialize {
+        library: PathBuf,
+    },
     CategoryPreview {
         api_endpoint: String,
         category: PageTitle,
@@ -742,6 +1053,46 @@ enum Action {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Command {
+    SourceAdd {
+        api_endpoint: String,
+        language_code: String,
+        json: bool,
+    },
+    SourceList {
+        json: bool,
+    },
+    SourceRemove {
+        wiki_id: WikiId,
+        json: bool,
+    },
+    CollectionList {
+        json: bool,
+    },
+    TrustKeyGenerate {
+        output: PathBuf,
+    },
+    TrustKeyValidate {
+        key: PathBuf,
+    },
+    TrustKeyImport {
+        source: PathBuf,
+        output: PathBuf,
+    },
+    TrustAnchorExport {
+        key: PathBuf,
+        anchor: PathBuf,
+        refresh: bool,
+    },
+    TrustAnchorInspect {
+        anchor: PathBuf,
+        json: bool,
+    },
+    TrustRotate {
+        anchor: PathBuf,
+        new_key: PathBuf,
+        recovery_anchor: PathBuf,
+        json: bool,
+    },
     Search {
         query: String,
         wiki_id: Option<WikiId>,
@@ -780,10 +1131,12 @@ enum Command {
     Export {
         format: ExportFormat,
         collection_id: Option<CollectionId>,
+        at: Option<ExportAt>,
     },
     Doctor {
         json: bool,
         bundle: Option<PathBuf>,
+        online: bool,
     },
     Serve {
         port: u16,
@@ -813,8 +1166,9 @@ fn parse(
             Some("--help" | "-h") => return Ok(Action::Help),
             Some("--version" | "-V") => return Ok(Action::Version),
             Some(
-                "category-preview" | "search" | "show" | "history" | "diff" | "sync" | "verify"
-                | "compact" | "status" | "export" | "doctor" | "serve",
+                "init" | "source" | "collection" | "trust" | "category-preview" | "search" | "show"
+                | "history" | "diff" | "sync" | "verify" | "compact" | "status" | "export"
+                | "doctor" | "serve",
             ) => break argument,
             Some(value) => return Err(CliError::usage(format!("unknown command {value:?}"))),
             None => return Err(CliError::usage("arguments must be valid UTF-8")),
@@ -833,7 +1187,16 @@ fn parse(
     let library = library.ok_or_else(|| {
         CliError::usage("--library <path> or WIKISYNC_LIBRARY is required for offline commands")
     })?;
+    if command.to_str() == Some("init") {
+        if let Some(value) = values.first() {
+            return Err(CliError::usage(format!("unknown init option {value:?}")));
+        }
+        return Ok(Action::Initialize { library });
+    }
     let command = match command.to_str() {
+        Some("source") => parse_source(values)?,
+        Some("collection") => parse_collection(values)?,
+        Some("trust") => parse_trust(values)?,
         Some("search") => parse_search(values)?,
         Some("show") => parse_show(values)?,
         Some("history") => parse_history(values)?,
@@ -848,6 +1211,290 @@ fn parse(
         _ => unreachable!("validated command"),
     };
     Ok(Action::Command { library, command })
+}
+
+fn parse_source(values: Vec<String>) -> Result<Command, CliError> {
+    let mut values = values.into_iter();
+    match values.next().as_deref() {
+        Some("list") => {
+            let mut json = false;
+            for value in values {
+                match value.as_str() {
+                    "--json" => json = true,
+                    _ => {
+                        return Err(CliError::usage(format!(
+                            "unknown source list option {value:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(Command::SourceList { json })
+        }
+        Some("add") => {
+            let mut api_endpoint = None;
+            let mut language_code = None;
+            let mut json = false;
+            while let Some(value) = values.next() {
+                match value.as_str() {
+                    "--api-endpoint" => {
+                        let parsed = required_value(&mut values, "--api-endpoint")?;
+                        if api_endpoint.replace(parsed).is_some() {
+                            return Err(CliError::usage(
+                                "--api-endpoint may only be supplied once",
+                            ));
+                        }
+                    }
+                    "--language" => {
+                        let parsed = required_value(&mut values, "--language")?;
+                        if language_code.replace(parsed).is_some() {
+                            return Err(CliError::usage("--language may only be supplied once"));
+                        }
+                    }
+                    "--json" => json = true,
+                    _ => {
+                        return Err(CliError::usage(format!(
+                            "unknown source add option {value:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(Command::SourceAdd {
+                api_endpoint: api_endpoint
+                    .ok_or_else(|| CliError::usage("source add requires --api-endpoint <url>"))?,
+                language_code: language_code
+                    .ok_or_else(|| CliError::usage("source add requires --language <code>"))?,
+                json,
+            })
+        }
+        Some("remove") => {
+            let mut wiki_id = None;
+            let mut json = false;
+            while let Some(value) = values.next() {
+                match value.as_str() {
+                    "--wiki" => {
+                        let parsed = parse_wiki(required_value(&mut values, "--wiki")?)?;
+                        if wiki_id.replace(parsed).is_some() {
+                            return Err(CliError::usage("--wiki may only be supplied once"));
+                        }
+                    }
+                    "--json" => json = true,
+                    _ => {
+                        return Err(CliError::usage(format!(
+                            "unknown source remove option {value:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(Command::SourceRemove {
+                wiki_id: wiki_id
+                    .ok_or_else(|| CliError::usage("source remove requires --wiki <id>"))?,
+                json,
+            })
+        }
+        Some(value) => Err(CliError::usage(format!(
+            "unknown source subcommand {value:?}"
+        ))),
+        None => Err(CliError::usage("source requires add, remove, or list")),
+    }
+}
+
+fn parse_collection(values: Vec<String>) -> Result<Command, CliError> {
+    let mut values = values.into_iter();
+    match values.next().as_deref() {
+        Some("list") => {
+            let mut json = false;
+            for value in values {
+                match value.as_str() {
+                    "--json" => json = true,
+                    _ => {
+                        return Err(CliError::usage(format!(
+                            "unknown collection list option {value:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(Command::CollectionList { json })
+        }
+        Some(value) => Err(CliError::usage(format!(
+            "unknown collection subcommand {value:?}"
+        ))),
+        None => Err(CliError::usage("collection requires list")),
+    }
+}
+
+fn parse_trust(values: Vec<String>) -> Result<Command, CliError> {
+    let mut values = values.into_iter();
+    let subcommand = values
+        .next()
+        .ok_or_else(|| CliError::usage("trust requires a subcommand"))?;
+    let mut key = None;
+    let mut source = None;
+    let mut output = None;
+    let mut anchor = None;
+    let mut new_key = None;
+    let mut recovery_anchor = None;
+    let mut refresh = false;
+    let mut json = false;
+    while let Some(value) = values.next() {
+        let target = match value.as_str() {
+            "--key" => &mut key,
+            "--source" => &mut source,
+            "--output" => &mut output,
+            "--anchor" => &mut anchor,
+            "--new-key" => &mut new_key,
+            "--recovery-anchor" => &mut recovery_anchor,
+            "--refresh" => {
+                refresh = true;
+                continue;
+            }
+            "--json" => {
+                json = true;
+                continue;
+            }
+            _ => {
+                return Err(CliError::usage(format!(
+                    "unknown trust {subcommand} option {value:?}"
+                )));
+            }
+        };
+        let path = PathBuf::from(required_value(&mut values, &value)?);
+        if target.replace(path).is_some() {
+            return Err(CliError::usage(format!(
+                "{value} may only be supplied once"
+            )));
+        }
+    }
+    let required = |value: Option<PathBuf>, option: &'static str| {
+        value.ok_or_else(|| CliError::usage(format!("trust {subcommand} requires {option} <path>")))
+    };
+    match subcommand.as_str() {
+        "key-generate" => {
+            reject_trust_flags(
+                &subcommand,
+                &key,
+                &source,
+                &anchor,
+                &new_key,
+                &recovery_anchor,
+                refresh,
+                json,
+            )?;
+            Ok(Command::TrustKeyGenerate {
+                output: required(output, "--output")?,
+            })
+        }
+        "key-validate" => {
+            reject_trust_flags(
+                &subcommand,
+                &source,
+                &output,
+                &anchor,
+                &new_key,
+                &recovery_anchor,
+                refresh,
+                json,
+            )?;
+            Ok(Command::TrustKeyValidate {
+                key: required(key, "--key")?,
+            })
+        }
+        "key-import" => {
+            reject_trust_flags(
+                &subcommand,
+                &key,
+                &anchor,
+                &new_key,
+                &recovery_anchor,
+                &None,
+                refresh,
+                json,
+            )?;
+            Ok(Command::TrustKeyImport {
+                source: required(source, "--source")?,
+                output: required(output, "--output")?,
+            })
+        }
+        "anchor-export" => {
+            reject_trust_flags(
+                &subcommand,
+                &source,
+                &output,
+                &new_key,
+                &recovery_anchor,
+                &None,
+                false,
+                json,
+            )?;
+            Ok(Command::TrustAnchorExport {
+                key: required(key, "--key")?,
+                anchor: required(anchor, "--anchor")?,
+                refresh,
+            })
+        }
+        "anchor-inspect" => {
+            reject_trust_flags(
+                &subcommand,
+                &key,
+                &source,
+                &output,
+                &new_key,
+                &recovery_anchor,
+                refresh,
+                false,
+            )?;
+            Ok(Command::TrustAnchorInspect {
+                anchor: required(anchor, "--anchor")?,
+                json,
+            })
+        }
+        "rotate" => {
+            reject_trust_flags(
+                &subcommand,
+                &key,
+                &source,
+                &output,
+                &None,
+                &None,
+                refresh,
+                false,
+            )?;
+            Ok(Command::TrustRotate {
+                anchor: required(anchor, "--anchor")?,
+                new_key: required(new_key, "--new-key")?,
+                recovery_anchor: required(recovery_anchor, "--recovery-anchor")?,
+                json,
+            })
+        }
+        _ => Err(CliError::usage(format!(
+            "unknown trust subcommand {subcommand:?}"
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reject_trust_flags(
+    subcommand: &str,
+    first: &Option<PathBuf>,
+    second: &Option<PathBuf>,
+    third: &Option<PathBuf>,
+    fourth: &Option<PathBuf>,
+    fifth: &Option<PathBuf>,
+    boolean: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    if first.is_some()
+        || second.is_some()
+        || third.is_some()
+        || fourth.is_some()
+        || fifth.is_some()
+        || boolean
+        || json
+    {
+        return Err(CliError::usage(format!(
+            "trust {subcommand} received an option that is not valid for that subcommand"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_category_preview(values: Vec<String>) -> Result<Action, CliError> {
@@ -923,6 +1570,7 @@ fn parse_status(values: Vec<String>) -> Result<Command, CliError> {
 fn parse_export(values: Vec<String>) -> Result<Command, CliError> {
     let mut format = None;
     let mut collection_id = None;
+    let mut at = None;
     let mut values = values.into_iter();
     while let Some(value) = values.next() {
         match value.as_str() {
@@ -949,10 +1597,10 @@ fn parse_export(values: Vec<String>) -> Result<Command, CliError> {
                 }
             }
             "--at" => {
-                let _ = required_value(&mut values, "--at")?;
-                return Err(CliError::usage(
-                    "historical export selection with --at is not implemented; omit --at to export current captured heads",
-                ));
+                let parsed = ExportAt::parse(&required_value(&mut values, "--at")?)?;
+                if at.replace(parsed).is_some() {
+                    return Err(CliError::usage("--at may only be supplied once"));
+                }
             }
             _ => return Err(CliError::usage(format!("unknown export option {value:?}"))),
         }
@@ -962,16 +1610,19 @@ fn parse_export(values: Vec<String>) -> Result<Command, CliError> {
     Ok(Command::Export {
         format,
         collection_id,
+        at,
     })
 }
 
 fn parse_doctor(values: Vec<String>) -> Result<Command, CliError> {
     let mut json = false;
     let mut bundle = None;
+    let mut online = false;
     let mut values = values.into_iter();
     while let Some(value) = values.next() {
         match value.as_str() {
             "--json" => json = true,
+            "--online" => online = true,
             "--bundle" => {
                 let path = PathBuf::from(required_value(&mut values, "--bundle")?);
                 if bundle.replace(path).is_some() {
@@ -981,7 +1632,11 @@ fn parse_doctor(values: Vec<String>) -> Result<Command, CliError> {
             _ => return Err(CliError::usage(format!("unknown doctor option {value:?}"))),
         }
     }
-    Ok(Command::Doctor { json, bundle })
+    Ok(Command::Doctor {
+        json,
+        bundle,
+        online,
+    })
 }
 
 fn parse_sync(values: Vec<String>) -> Result<Command, CliError> {
@@ -1261,6 +1916,12 @@ impl From<export::ExportError> for CliError {
     }
 }
 
+impl From<trust::TrustError> for CliError {
+    fn from(error: trust::TrustError) -> Self {
+        Self::message(error.to_string())
+    }
+}
+
 impl From<wikisync_mediawiki::ConfigError> for CliError {
     fn from(error: wikisync_mediawiki::ConfigError) -> Self {
         Self::message(error.to_string())
@@ -1332,6 +1993,152 @@ mod tests {
                 depth: 2,
                 json: true,
             }
+        );
+    }
+
+    #[test]
+    fn parses_initial_source_and_collection_administration() {
+        assert_eq!(
+            parse(["--library", "/tmp/wiki", "init"]).expect("init parse"),
+            Action::Initialize {
+                library: PathBuf::from("/tmp/wiki"),
+            }
+        );
+        assert_eq!(
+            parse([
+                "--library",
+                "/tmp/wiki",
+                "source",
+                "add",
+                "--api-endpoint",
+                "https://en.wikipedia.org/w/api.php",
+                "--language",
+                "en",
+                "--json",
+            ])
+            .expect("source add parse"),
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::SourceAdd {
+                    api_endpoint: "https://en.wikipedia.org/w/api.php".to_owned(),
+                    language_code: "en".to_owned(),
+                    json: true,
+                },
+            }
+        );
+        assert_eq!(
+            parse(["--library", "/tmp/wiki", "source", "list", "--json"])
+                .expect("source list parse"),
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::SourceList { json: true },
+            }
+        );
+        assert_eq!(
+            parse([
+                "--library",
+                "/tmp/wiki",
+                "source",
+                "remove",
+                "--wiki",
+                "2",
+                "--json",
+            ])
+            .expect("source remove parse"),
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::SourceRemove {
+                    wiki_id: WikiId::new(2).expect("wiki"),
+                    json: true,
+                },
+            }
+        );
+        assert_eq!(
+            parse(["--library", "/tmp/wiki", "collection", "list"]).expect("collection list parse"),
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::CollectionList { json: false },
+            }
+        );
+    }
+
+    #[test]
+    fn parses_external_trust_lifecycle_commands() {
+        assert_eq!(
+            parse([
+                "--library",
+                "/tmp/wiki",
+                "trust",
+                "key-generate",
+                "--output",
+                "/tmp/private/key.pk8",
+            ])
+            .expect("key generation parse"),
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::TrustKeyGenerate {
+                    output: PathBuf::from("/tmp/private/key.pk8"),
+                },
+            }
+        );
+        assert_eq!(
+            parse([
+                "--library",
+                "/tmp/wiki",
+                "trust",
+                "anchor-export",
+                "--key",
+                "/tmp/private/key.pk8",
+                "--anchor",
+                "/tmp/private/head.json",
+                "--refresh",
+            ])
+            .expect("anchor export parse"),
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::TrustAnchorExport {
+                    key: PathBuf::from("/tmp/private/key.pk8"),
+                    anchor: PathBuf::from("/tmp/private/head.json"),
+                    refresh: true,
+                },
+            }
+        );
+        assert_eq!(
+            parse([
+                "--library",
+                "/tmp/wiki",
+                "trust",
+                "rotate",
+                "--anchor",
+                "/tmp/private/head.json",
+                "--new-key",
+                "/tmp/private/key-2.pk8",
+                "--recovery-anchor",
+                "/tmp/private/head-1.json",
+                "--json",
+            ])
+            .expect("rotation parse"),
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::TrustRotate {
+                    anchor: PathBuf::from("/tmp/private/head.json"),
+                    new_key: PathBuf::from("/tmp/private/key-2.pk8"),
+                    recovery_anchor: PathBuf::from("/tmp/private/head-1.json"),
+                    json: true,
+                },
+            }
+        );
+        assert!(
+            parse([
+                "--library",
+                "/tmp/wiki",
+                "trust",
+                "key-generate",
+                "--output",
+                "/tmp/private/key.pk8",
+                "--refresh",
+            ])
+            .is_err()
         );
     }
 
@@ -1442,7 +2249,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_current_export_and_rejects_unimplemented_historical_selection() {
+    fn parses_current_and_historical_export_selection() {
         assert_eq!(
             parse([
                 "--library",
@@ -1459,20 +2266,30 @@ mod tests {
                 command: Command::Export {
                     format: ExportFormat::Markdown,
                     collection_id: Some(CollectionId::new(7).expect("collection")),
+                    at: None,
                 },
             }
         );
-        let error = parse([
-            "--library",
-            "/tmp/wiki",
-            "export",
-            "--format",
-            "text",
-            "--at",
-            "41",
-        ])
-        .expect_err("historical export remains explicit");
-        assert!(error.to_string().contains("--at is not implemented"));
+        assert_eq!(
+            parse([
+                "--library",
+                "/tmp/wiki",
+                "export",
+                "--format",
+                "text",
+                "--at",
+                "41",
+            ])
+            .expect("historical export parse"),
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::Export {
+                    format: ExportFormat::Text,
+                    collection_id: None,
+                    at: Some(ExportAt::Revision(RevisionId::new(41).expect("revision"))),
+                },
+            }
+        );
     }
 
     #[test]
@@ -1492,6 +2309,18 @@ mod tests {
                 command: Command::Doctor {
                     json: true,
                     bundle: Some(PathBuf::from("/tmp/doctor.json")),
+                    online: false,
+                },
+            }
+        );
+        assert_eq!(
+            parse(["--library", "/tmp/wiki", "doctor", "--online"]).expect("online doctor parse"),
+            Action::Command {
+                library: PathBuf::from("/tmp/wiki"),
+                command: Command::Doctor {
+                    json: false,
+                    bundle: None,
+                    online: true,
                 },
             }
         );

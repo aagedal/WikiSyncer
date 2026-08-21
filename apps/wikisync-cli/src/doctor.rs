@@ -7,23 +7,31 @@ use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use serde_json::{Value, json};
+use wikisync_core::PageTitle;
 use wikisync_integrity::{VerificationCoverage, VerificationScope, verify_library};
+use wikisync_mediawiki::{ClientConfig, MediaWikiClient, RetryPolicy};
 use wikisync_store::{Library, ScheduleCadence, SyncRunState};
 use wikisyncd::{Client, LocalSocketState, inspect_control_plane};
 
 const BUNDLE_FORMAT: &str = "wikisync-doctor";
 const BUNDLE_VERSION: u32 = 1;
 const RECENT_RUN_LIMIT: u32 = 20;
+const REACHABILITY_SOURCE_LIMIT: usize = 20;
+const REACHABILITY_RESPONSE_LIMIT: usize = 256 * 1024;
+const REACHABILITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const REACHABILITY_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Runs the offline doctor and optionally creates a private redacted bundle.
+/// Runs doctor and optionally performs explicit online checks or creates a bundle.
 pub(crate) fn run(
     library_root: &Path,
     json_output: bool,
     bundle: Option<&Path>,
+    online: bool,
 ) -> Result<(), DoctorError> {
-    let report = collect(library_root);
+    let report = collect(library_root, online);
     if let Some(bundle) = bundle {
         write_bundle(bundle, &report)?;
     }
@@ -41,20 +49,26 @@ pub(crate) fn run(
     Ok(())
 }
 
-fn collect(library_root: &Path) -> Value {
+fn collect(library_root: &Path, online: bool) -> Value {
     let storage = storage_section(library_root);
     let control_plane = control_plane_section(library_root);
     let library = Library::open_read_only(library_root);
-    let (catalog, recent_runs, verification) = match library {
+    let (catalog, recent_runs, verification, source_reachability) = match library {
         Ok(library) => (
             catalog_section(&library),
             recent_runs_section(&library),
             verification_section(&library),
+            source_reachability_section(&library, online),
         ),
         Err(_) => (
             section_error("library-unavailable"),
             section_error("library-unavailable"),
             section_error("library-unavailable"),
+            if online {
+                section_error("library-unavailable")
+            } else {
+                reachability_not_requested()
+            },
         ),
     };
 
@@ -76,7 +90,85 @@ fn collect(library_root: &Path) -> Value {
         "recent_runs": recent_runs,
         "control_plane": control_plane,
         "quick_logical_object_verification": verification,
+        "source_reachability": source_reachability,
     })
+}
+
+fn source_reachability_section(library: &Library, online: bool) -> Value {
+    if !online {
+        return reachability_not_requested();
+    }
+
+    let sources = match library.wikis() {
+        Ok(sources) => sources,
+        Err(_) => return section_error("query-failed"),
+    };
+    let source_count = sources.len();
+    let mut reachable = 0_usize;
+    let mut unreachable = 0_usize;
+    let mut configuration_rejected = 0_usize;
+    let retry_policy = RetryPolicy::new(1, Duration::from_millis(1), Duration::from_millis(1))
+        .expect("one-attempt reachability policy is valid");
+    let probe_title = PageTitle::new("Main Page").expect("static probe title is valid");
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => return section_error("runtime-unavailable"),
+    };
+
+    for source in sources.iter().take(REACHABILITY_SOURCE_LIMIT) {
+        let config = ClientConfig::new(
+            &source.api_endpoint,
+            format!(
+                "WikiSyncer/{} doctor-reachability",
+                env!("CARGO_PKG_VERSION")
+            ),
+        )
+        .and_then(|config| {
+            config
+                .with_timeouts(REACHABILITY_REQUEST_TIMEOUT, REACHABILITY_CONNECT_TIMEOUT)?
+                .with_max_response_bytes(REACHABILITY_RESPONSE_LIMIT)?
+                .with_max_downloaded_response_bytes_per_run(REACHABILITY_RESPONSE_LIMIT)?
+                .with_max_concurrent_requests(1)
+                .map(|config| config.with_retry_policy(retry_policy))
+        });
+        let Ok(config) = config else {
+            configuration_rejected += 1;
+            continue;
+        };
+        let Ok(client) = MediaWikiClient::new(config) else {
+            configuration_rejected += 1;
+            continue;
+        };
+        match runtime.block_on(client.resolve_titles(std::slice::from_ref(&probe_title))) {
+            Ok(_) => reachable += 1,
+            Err(_) => unreachable += 1,
+        }
+    }
+
+    let checked = source_count.min(REACHABILITY_SOURCE_LIMIT);
+    section_ok(json!({
+        "requested": true,
+        "source_count": source_count,
+        "checked_count": checked,
+        "omitted_count": source_count.saturating_sub(checked),
+        "reachable_count": reachable,
+        "unreachable_count": unreachable,
+        "configuration_rejected_count": configuration_rejected,
+        "bounds": {
+            "maximum_sources": REACHABILITY_SOURCE_LIMIT,
+            "maximum_requests_per_source": 1,
+            "request_timeout_seconds": REACHABILITY_REQUEST_TIMEOUT.as_secs(),
+            "connect_timeout_seconds": REACHABILITY_CONNECT_TIMEOUT.as_secs(),
+            "maximum_response_bytes_per_source": REACHABILITY_RESPONSE_LIMIT,
+        },
+    }))
+}
+
+fn reachability_not_requested() -> Value {
+    section_ok(json!({ "requested": false }))
 }
 
 fn storage_section(library_root: &Path) -> Value {
@@ -401,6 +493,40 @@ fn human_summary(report: &Value) -> String {
         "Verification reports bounded logical-object coverage only; it is not a whole-archive trust claim."
             .to_owned(),
     );
+    if report
+        .pointer("/source_reachability/data/requested")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        if let (Some(checked), Some(reachable), Some(unreachable), Some(rejected), Some(omitted)) = (
+            report
+                .pointer("/source_reachability/data/checked_count")
+                .and_then(Value::as_u64),
+            report
+                .pointer("/source_reachability/data/reachable_count")
+                .and_then(Value::as_u64),
+            report
+                .pointer("/source_reachability/data/unreachable_count")
+                .and_then(Value::as_u64),
+            report
+                .pointer("/source_reachability/data/configuration_rejected_count")
+                .and_then(Value::as_u64),
+            report
+                .pointer("/source_reachability/data/omitted_count")
+                .and_then(Value::as_u64),
+        ) {
+            lines.push(format!(
+                "Online source reachability: checked={checked}; reachable={reachable}; unreachable={unreachable}; configuration-rejected={rejected}; omitted={omitted}"
+            ));
+        } else {
+            lines.push(format!(
+                "Online source reachability: {}",
+                status("source_reachability")
+            ));
+        }
+    } else {
+        lines.push("Online source reachability: not requested (offline default).".to_owned());
+    }
     lines.join("\n")
 }
 

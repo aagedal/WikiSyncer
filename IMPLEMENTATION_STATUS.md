@@ -77,8 +77,8 @@ Updated: 2026-08-21
 Passed on 2026-08-21. A nontechnical user can create, preview, synchronize, browse,
 verify, and update a collection from Iced without using the CLI. Routine tests remain
 offline and fixture-backed. Scheduling and the remaining daemon hardening are
-Milestone 4 work; optional media and periodic dynamic-category reconciliation remain
-stable-v1 work as specified by the plan.
+Milestone 4 work; optional media remains stable-v1 work as specified by the plan.
+Periodic dynamic-category reconciliation was completed after this gate.
 
 ## Milestone 4 progress
 
@@ -137,13 +137,19 @@ Service durability and diagnostics now include:
 - `wikisync doctor` human/JSON output and create-new `0600` bundles using a strict
   aggregate allowlist, immutable read-only checkpointed database access, bounded
   canonical quick verification, redacted section failures, and tests proving no
-  MediaWiki connection or seeded sensitive-value disclosure.
+  MediaWiki connection or seeded sensitive-value disclosure by default; explicit
+  `doctor --online` adds a one-request, no-retry, time/size/source-bounded reachability
+  probe whose output remains aggregate-only and redacted.
 
-Transport policy, manifests, and current-head export now include:
+Transport policy, manifests, trust anchors, and export now include:
 
 - an endpoint-derived normalized source-host allowlist and fail-closed redirect policy
   that permits only the configured scheme/host/effective-port origin, including tests
   proving a cross-origin redirect is rejected before the destination is contacted;
+- a source-bound, whole-answer DNS policy that disables ambient proxies, rejects
+  unsafe literal, empty, mixed, private/special-use, and over-32-address resolutions,
+  revalidates every new connection, and reserves plain HTTP plus loopback answers for
+  the explicit fixture path;
 - clone-shared configurable request concurrency and aggregate response-body ceilings
   (defaults: four in-flight requests and 512 MiB per client/run), enforced across
   retries without weakening the existing per-response, retry, or circuit bounds;
@@ -158,12 +164,29 @@ Transport policy, manifests, and current-head export now include:
 - full verification of manifest inventory, canonical encoding/body identity,
   sequence/predecessor continuity, duplicate or unsuccessful run references, and
   manifest coverage of eligible successful runs, with structured findings for
-  deletion, tampering, swapping, and concurrent inventory changes; and
+  deletion, tampering, swapping, and concurrent inventory changes;
+- bounded stable full-verification scans for revision-to-page/object reachability,
+  locally present parent ownership/self-reference, page heads, checkpoint collection
+  and successful-run scope/boundary, search-document/FTS pointers, orphan FTS rows,
+  and the current search transformer version;
+- optional Ed25519 PKCS#8 key generation/import plus signing of a validated manifest-
+  chain head, bounded canonical public trusted-head export/import, and full
+  verification against a separately retained anchor with distinct invalid-signature
+  and stale/different-head findings;
+- explicit CLI and GUI lifecycle controls for absolute external key/anchor paths,
+  protected create-new key generation and validation, fail-before-publish full
+  verification, anchor inspection, atomic refresh, and recovery retention. The CLI
+  also supports copy-import and phased key rotation that deletes neither old key nor
+  recovery anchor;
 - CLI `export --format markdown|text [--collection <id>]` for deterministic current
   captured heads, producing bounded private `articles/`, `index.jsonl`, and
   `manifest.json` outputs with transformer versions, content IDs, capture/revision
-  provenance, source attribution, staged replacement, and symlink/path protections.
-  Historical `--at` export is explicitly rejected rather than silently approximated.
+  provenance, source attribution, staged replacement, and symlink/path protections;
+  and
+- historical `export --at <revision-or-time>` with distinct deterministic outputs,
+  an inclusive per-page captured-revision cutoff, revision-anchor provenance, and an
+  indexed `LIMIT 1` store query rather than full-history materialization. Historical
+  export never replaces `exports/current`.
 
 Durable network transfer policy now also includes:
 
@@ -183,33 +206,71 @@ Durable network transfer policy now also includes:
   fail-visible but do not pretend to prove that a connection is unmetered. macOS
   currently reports unsupported because no reliable safe integration is implemented.
 
+Additional stable-v1 application progress now includes:
+
+- periodic bounded category re-resolution in every daemon collection sync, with a
+  network-free no-op for static title rules, atomic membership replacement, retained
+  history for removed members, budget enforcement, and failure tests proving an
+  incomplete preview never changes membership;
+- initial administrative CLI commands for library initialization, validated source
+  add/list, safe removal of wholly unused sources, and collection listing, including
+  stable JSON inspection output and direct-writer exclusion while protocol version 1
+  lacks these mutations; and
+- refusal to physically remove a collection under the current schema because its
+  foreign key would null historical sync-run scope. Correct collection removal needs
+  a tombstone/status migration that preserves manifest and run evidence.
+
+Credential-free beta packaging readiness now includes:
+
+- deterministic, bounded macOS and Linux release-candidate archives containing the
+  CLI, daemon, GUI, license, operations documentation, and target service templates;
+- strict SHA-256 manifest creation/verification, canonical archive-layout validation,
+  and OpenSSH Ed25519 detached-checksum signing/verification hooks with private-key
+  type, ownership, permission, and symlink checks;
+- five packaging tests covering reproducibility, tampering, unsafe paths, symlinked
+  inputs, signing, and verification; and
+- a native macOS/Linux CI dry run with an immutable checkout action that builds and
+  verifies candidates but deliberately has no credentials, signing, publication, or
+  release-write authority.
+
 Workspace formatting, warning-denied Clippy, and all workspace tests pass. The
-`cargo-deny` subcommand is unavailable in this environment. This checkpoint adds no
-new package version; `serde` and `serde_json` became direct store dependencies and
-already match the repository's source/license policy. Milestone 4 delivery is still
-partial: private-address/DNS-rebinding review, signed packages/installers, and optional
-online reachability in `doctor` remain.
+`cargo-deny` subcommand is unavailable in this environment. All five packaging tests,
+release-workflow YAML parsing, and a real local archive/checksum/layout dry run also
+pass. This checkpoint adds no new package version; `ring`, `serde`, and `serde_json`
+became direct integrity dependencies, `wikisync-content` became a direct workspace
+dependency there, and Tokio enabled its existing `net` feature for MediaWiki DNS.
+These packages already match the repository's source/license policy. Milestone 4
+delivery is still partial: actual Apple signing/notarization, a defined Linux
+package/repository trust model, credentialed native release validation, protected
+release identities/trust distribution, and signed artifact publication remain.
 
 ## Plan audit notes
 
 The ordered first implementation backlog (items 1–13) is complete. The broader
-milestone delivery lists are not all closed: signatures/trusted rollback anchors,
-revision/page/checkpoint reachability and search/cache verification, historical
-export and the administrative CLI surface, and the remaining Milestone 4/5 release
-work are still outstanding. Full verification now covers a stable scan of every
-logical canonical object plus the internal unsigned manifest chain and eligible-run
-coverage; it must not be described as signature authentication, external rollback
-protection, or universal whole-archive verification.
+milestone delivery lists are not all closed: the administrative CLI surface is only
+partial, credentialed platform packages remain outstanding, and optional media, dump
+bootstrap, pack tuning, stable contracts, and release acceptance remain Milestone 5
+work. User-facing external signing/trusted-anchor workflows, historical export, and
+periodic dynamic-category membership reconciliation are now implemented.
+Full verification now covers stable scans of every logical canonical object, the
+manifest chain and eligible-run coverage, and the current-schema metadata pointers
+listed above. A separately retained signed trusted head can authenticate the observed
+chain through the library API. The schema has no `derived_cache` inventory, contentless
+FTS permits pointer rather than indexed-body comparison, absent parent revisions can
+be valid under retention policy, and missing search documents may be pending derived
+work. Verification must not be described as source truth, universal whole-archive
+verification, or external rollback protection when the anchor is kept with and can be
+replaced alongside the library.
 
 ## Next checkpoint
 
-Add optional Ed25519 manifest signing with an externally exportable trusted head,
-extend full verification to revision/page/checkpoint and search/cache reachability,
-and close signed beta packaging without weakening the offline fixture test policy.
-Private-address/DNS-rebinding review and optional online reachability in `doctor` also
-remain Milestone 4 hardening. Historical/time-slice export, administrative CLI work,
-optional media, periodic dynamic-category reconciliation, and dump bootstrap remain
-separately tracked milestone work.
+Add a collection tombstone/status migration, preserve historical run/manifest scope,
+and complete previewed collection add/edit/remove plus daemon-protocol administration.
+Complete credentialed Apple signing/notarization and define the Linux
+package/repository trust model before calling the candidate archives signed beta
+packages. Optional attributed thumbnail media, current-language dump bootstrap, pack
+tuning, stable configuration/database/JSON/export/backup contracts, and release
+acceptance on macOS/Ubuntu remain separately tracked Milestone 5 work.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening

@@ -9,7 +9,10 @@ use wikisync_core::CollectionId;
 use wikisync_integrity::{VerificationScope, verify_library};
 use wikisync_mediawiki::{ClientConfig, MediaWikiClient};
 use wikisync_store::{Library, NetworkTransferPolicy, ScheduleCadence};
-use wikisync_sync::{ReconciliationReport, reconcile_collection_heads_with_cancellation};
+use wikisync_sync::{
+    CategoryPreviewLimits, ReconciliationReport, reconcile_collection_heads_with_cancellation,
+    reconcile_dynamic_collection_membership,
+};
 
 use crate::{
     HandlerStatus, MeteredNetworkState, MeteredNetworkStatus, Mutation, MutationOutcome,
@@ -94,6 +97,24 @@ impl ApplicationHandler {
             .map_err(|error| OperationError::failed(error.to_string()))?;
         let client = MediaWikiClient::new(client_config)
             .map_err(|error| OperationError::failed(error.to_string()))?;
+        if control.is_shutdown_requested() {
+            return Err(OperationError::failed(
+                "synchronization cancelled by shutdown request",
+            ));
+        }
+        runtime
+            .block_on(reconcile_dynamic_collection_membership(
+                &client,
+                library,
+                collection_id,
+                CategoryPreviewLimits::default(),
+            ))
+            .map_err(|error| OperationError::failed(error.to_string()))?;
+        if control.is_shutdown_requested() {
+            return Err(OperationError::failed(
+                "synchronization cancelled by shutdown request",
+            ));
+        }
         runtime
             .block_on(reconcile_collection_heads_with_cancellation(
                 &client,

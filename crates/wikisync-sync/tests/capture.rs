@@ -9,11 +9,13 @@ use wikisync_mediawiki::{ClientConfig, MediaWikiClient};
 use wikisync_search::{SearchIndex, SearchQuery, SqliteSearchIndex};
 use wikisync_store::{Library, SyncRunKind, SyncRunState};
 use wikisync_sync::{
-    CaptureError, CategoryPreviewError, CategoryPreviewLimits, ReconciliationLimits,
+    CaptureError, CategoryPreviewError, CategoryPreviewLimits, CollectionPreviewError,
+    DynamicMembershipReconciliation, DynamicMembershipReconciliationError, ReconciliationLimits,
     capture_committed_collection, capture_explicit_titles, capture_revision_history,
     commit_collection_preview, parse_title_list, preview_category_selection,
     preview_collection_rule, reconcile_collection_heads,
     reconcile_collection_heads_with_cancellation, reconcile_collection_heads_with_limits,
+    reconcile_dynamic_collection_membership,
 };
 
 const TITLE_RESOLUTION: &str = include_str!("../../../fixtures/mediawiki/title-resolution.json");
@@ -30,6 +32,27 @@ const CATEGORY_MEMBERS_SUBCATEGORY: &str =
     include_str!("../../../fixtures/mediawiki/category-members-subcategory.json");
 const CATEGORY_MEMBERS_RUST: &str =
     include_str!("../../../fixtures/mediawiki/category-members-rust.json");
+const CATEGORY_MEMBERS_RUST_AND_ALPHA: &str = r#"
+{
+  "batchcomplete": true,
+  "query": {
+    "categorymembers": [
+      {"pageid": 25357340, "ns": 0, "title": "Rust (programming language)"},
+      {"pageid": 101, "ns": 0, "title": "Alpha"}
+    ]
+  }
+}
+"#;
+const CATEGORY_MEMBERS_ALPHA: &str = r#"
+{
+  "batchcomplete": true,
+  "query": {
+    "categorymembers": [
+      {"pageid": 101, "ns": 0, "title": "Alpha"}
+    ]
+  }
+}
+"#;
 const RECONCILIATION_TITLE_RESOLUTION: &str =
     include_str!("../../../fixtures/mediawiki/reconciliation-title-resolution.json");
 const RECONCILIATION_REVISIONS: &str =
@@ -384,6 +407,295 @@ async fn category_preview_commit_captures_members_with_category_reason() {
         1
     );
     server.finish();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamic_category_reconciliation_adds_members_and_removes_tracking_without_erasing_history()
+{
+    let server = FixtureServer::start(vec![
+        FixtureResponse::json(CATEGORY_MEMBERS_RUST),
+        FixtureResponse::json(RECONCILIATION_UNCHANGED_TITLE_RESOLUTION),
+        FixtureResponse::json(REVISION_CONTENT),
+        FixtureResponse::json(CATEGORY_MEMBERS_RUST_AND_ALPHA),
+        FixtureResponse::json(CATEGORY_MEMBERS_ALPHA),
+    ]);
+    let client = MediaWikiClient::new(
+        ClientConfig::new(server.endpoint(), "WikiSyncer/0.1 dynamic-category-test")
+            .expect("client configuration"),
+    )
+    .expect("client");
+    let directory = tempfile::tempdir().expect("temporary library");
+    let mut library = Library::open(directory.path()).expect("library");
+    let wiki_id = library
+        .register_wiki(server.endpoint(), "en")
+        .expect("wiki");
+    let rule = CollectionRule::Category {
+        title: PageTitle::new("Category:Systems programming languages").unwrap(),
+        recursion_depth: 0,
+    };
+    let preview = preview_collection_rule(&client, &rule, CategoryPreviewLimits::default())
+        .await
+        .expect("initial category preview");
+    let collection_id = library
+        .create_collection(
+            wiki_id,
+            "Dynamic systems languages",
+            &rule,
+            HistoryPolicy::CurrentAndFuture,
+            CollectionBudget::unlimited(),
+            CollectionRemovalPolicy::StopTrackingRetainHistory,
+        )
+        .expect("collection");
+    commit_collection_preview(
+        &mut library,
+        collection_id,
+        &preview,
+        HistoryPolicy::CurrentAndFuture,
+        CollectionBudget::unlimited(),
+        CollectionRemovalPolicy::StopTrackingRetainHistory,
+    )
+    .expect("initial membership");
+    let captured = capture_committed_collection(&client, &mut library, collection_id)
+        .await
+        .expect("capture initial member");
+    let rust_page_id = captured.pages[0].page_id;
+    let rust_revision_id = captured.pages[0].revision_id;
+    let rust_object_id = captured.pages[0].content_object_id;
+
+    let added = reconcile_dynamic_collection_membership(
+        &client,
+        &mut library,
+        collection_id,
+        CategoryPreviewLimits::default(),
+    )
+    .await
+    .expect("add newly resolved member");
+    assert_eq!(
+        added,
+        DynamicMembershipReconciliation::Category {
+            category_batches: 1,
+            membership: wikisync_store::MembershipCommit {
+                active_members: 2,
+                removed_members: 0,
+            },
+        }
+    );
+    assert_eq!(
+        library
+            .resolved_collection_members(collection_id)
+            .unwrap()
+            .iter()
+            .map(|member| member.page_id.get())
+            .collect::<Vec<_>>(),
+        [101, rust_page_id.get()]
+    );
+
+    let removed = reconcile_dynamic_collection_membership(
+        &client,
+        &mut library,
+        collection_id,
+        CategoryPreviewLimits::default(),
+    )
+    .await
+    .expect("remove no-longer-resolved member");
+    assert_eq!(
+        removed,
+        DynamicMembershipReconciliation::Category {
+            category_batches: 1,
+            membership: wikisync_store::MembershipCommit {
+                active_members: 1,
+                removed_members: 1,
+            },
+        }
+    );
+    assert_eq!(
+        library
+            .resolved_collection_members(collection_id)
+            .unwrap()
+            .iter()
+            .map(|member| member.page_id.get())
+            .collect::<Vec<_>>(),
+        [101]
+    );
+    assert!(
+        library
+            .collection_pages(wiki_id, collection_id)
+            .unwrap()
+            .is_empty(),
+        "the removed page is no longer synchronized and the added page is not captured yet"
+    );
+    assert!(library.page(wiki_id, rust_page_id).unwrap().is_some());
+    let retained_revision = library
+        .revision(wiki_id, rust_revision_id)
+        .unwrap()
+        .expect("captured revision remains available");
+    assert_eq!(retained_revision.content_object_id, rust_object_id);
+    assert_eq!(
+        library.read_object(rust_object_id).unwrap(),
+        b"== Rust ==\nA systems programming language."
+    );
+
+    assert_eq!(server.finish().len(), 5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamic_membership_reconciliation_is_a_network_free_no_op_for_static_rules() {
+    let server = FixtureServer::start(vec![]);
+    let endpoint = server.endpoint().to_owned();
+    let client = MediaWikiClient::new(
+        ClientConfig::new(&endpoint, "WikiSyncer/0.1 static-membership-test")
+            .expect("client configuration"),
+    )
+    .expect("client");
+    assert!(server.finish().is_empty());
+
+    let directory = tempfile::tempdir().expect("temporary library");
+    let mut library = Library::open(directory.path()).expect("library");
+    let wiki_id = library.register_wiki(&endpoint, "en").expect("wiki");
+    let selection = TitleSelection::new([PageTitle::new("Rust").unwrap()]).unwrap();
+    let collection_id = library
+        .create_collection(
+            wiki_id,
+            "Static titles",
+            &CollectionRule::ExplicitTitles(selection),
+            HistoryPolicy::CurrentAndFuture,
+            CollectionBudget::unlimited(),
+            CollectionRemovalPolicy::StopTrackingRetainHistory,
+        )
+        .expect("collection");
+    let configuration_before = library.collection_configuration(collection_id).unwrap();
+    let members_before = library.resolved_collection_members(collection_id).unwrap();
+
+    let result = reconcile_dynamic_collection_membership(
+        &client,
+        &mut library,
+        collection_id,
+        CategoryPreviewLimits::default(),
+    )
+    .await
+    .expect("static no-op");
+    assert_eq!(result, DynamicMembershipReconciliation::StaticRule);
+    assert_eq!(
+        library.collection_configuration(collection_id).unwrap(),
+        configuration_before
+    );
+    assert_eq!(
+        library.resolved_collection_members(collection_id).unwrap(),
+        members_before
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_dynamic_category_previews_leave_membership_unchanged() {
+    let server = FixtureServer::start(vec![
+        FixtureResponse::json(CATEGORY_MEMBERS_RUST),
+        FixtureResponse::json(CATEGORY_MEMBERS_RUST_AND_ALPHA),
+        FixtureResponse::json(CATEGORY_MEMBERS_RUST_AND_ALPHA),
+    ]);
+    let endpoint = server.endpoint().to_owned();
+    let client = MediaWikiClient::new(
+        ClientConfig::new(&endpoint, "WikiSyncer/0.1 category-atomicity-test")
+            .expect("client configuration"),
+    )
+    .expect("client");
+    let directory = tempfile::tempdir().expect("temporary library");
+    let mut library = Library::open(directory.path()).expect("library");
+    let wiki_id = library.register_wiki(&endpoint, "en").expect("wiki");
+    let rule = CollectionRule::Category {
+        title: PageTitle::new("Category:Systems programming languages").unwrap(),
+        recursion_depth: 0,
+    };
+    let budget = CollectionBudget::unlimited()
+        .with_maximum_pages(1)
+        .expect("page budget");
+    let preview = preview_collection_rule(&client, &rule, CategoryPreviewLimits::default())
+        .await
+        .expect("initial category preview");
+    let collection_id = library
+        .create_collection(
+            wiki_id,
+            "Budgeted category",
+            &rule,
+            HistoryPolicy::CurrentAndFuture,
+            budget,
+            CollectionRemovalPolicy::StopTrackingRetainHistory,
+        )
+        .expect("collection");
+    commit_collection_preview(
+        &mut library,
+        collection_id,
+        &preview,
+        HistoryPolicy::CurrentAndFuture,
+        budget,
+        CollectionRemovalPolicy::StopTrackingRetainHistory,
+    )
+    .expect("initial membership");
+    let members_before = library.resolved_collection_members(collection_id).unwrap();
+
+    let bounded = reconcile_dynamic_collection_membership(
+        &client,
+        &mut library,
+        collection_id,
+        CategoryPreviewLimits {
+            max_pages: 1,
+            ..CategoryPreviewLimits::default()
+        },
+    )
+    .await
+    .expect_err("bounded preview rejects oversized result");
+    assert!(matches!(
+        bounded,
+        DynamicMembershipReconciliationError::Preview(CollectionPreviewError::Category(
+            CategoryPreviewError::PageLimitExceeded { limit: 1 }
+        ))
+    ));
+    assert_eq!(
+        library.resolved_collection_members(collection_id).unwrap(),
+        members_before
+    );
+
+    let oversized = reconcile_dynamic_collection_membership(
+        &client,
+        &mut library,
+        collection_id,
+        CategoryPreviewLimits::default(),
+    )
+    .await
+    .expect_err("configured page budget rejects larger resolution");
+    assert!(matches!(
+        oversized,
+        DynamicMembershipReconciliationError::Store(
+            wikisync_store::StoreError::CollectionBudgetExceeded {
+                resource: "pages",
+                limit: 1,
+                estimated: 2,
+            }
+        )
+    ));
+    assert_eq!(
+        library.resolved_collection_members(collection_id).unwrap(),
+        members_before
+    );
+    assert_eq!(server.finish().len(), 3);
+
+    let network_failure = reconcile_dynamic_collection_membership(
+        &client,
+        &mut library,
+        collection_id,
+        CategoryPreviewLimits::default(),
+    )
+    .await
+    .expect_err("closed fixture source fails preview");
+    assert!(matches!(
+        network_failure,
+        DynamicMembershipReconciliationError::Preview(CollectionPreviewError::Category(
+            CategoryPreviewError::Source(_)
+        ))
+    ));
+    assert_eq!(
+        library.resolved_collection_members(collection_id).unwrap(),
+        members_before
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

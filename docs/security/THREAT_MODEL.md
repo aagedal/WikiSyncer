@@ -140,6 +140,18 @@ describe present behavior, not all controls required by the plan.
   request and connect timeouts, a three-redirect limit, a fixed non-empty User-Agent,
   `maxlag`, bounded request batch sizes, and an 8 MiB default response-body limit
   enforced both from `Content-Length` and while consuming chunks.
+- Each client disables ambient HTTP proxies and installs a source-bound DNS resolver.
+  Literal endpoint addresses are checked during configuration. For hostnames, every
+  resolution is limited to 32 addresses and the complete answer is rejected if it is
+  empty or contains a private, loopback, link-local, multicast, documentation,
+  reserved, or unsafe IPv4-transition destination. Only the vetted socket-address
+  iterator reaches `reqwest`'s connector. The explicit loopback-HTTP fixture policy
+  accepts only loopback answers and cannot be enabled for an HTTPS source.
+- Redirects must remain on the configured scheme, normalized host, and effective port.
+  A cross-origin redirect is rejected before destination resolution or contact. A
+  same-origin redirect remains behind the same DNS policy. A pooled connection may be
+  reused without a fresh lookup, but it stays connected to the address that was vetted
+  when that socket was created; every new connection resolves and validates again.
 - Pagination is explicit and one bounded response is processed at a time. Retry
   classification is conservative and exposes `Retry-After`; malformed identities and
   invalid responses are not classified as retryable.
@@ -150,10 +162,10 @@ describe present behavior, not all controls required by the plan.
   identity. Long-gap reconciliation checks parent continuity and bounds batches and
   revisions per page.
 
-These controls reduce corruption, confusion, and resource-exhaustion risk. They do
-not yet constitute the required explicit source allowlist: arbitrary HTTPS hosts are
-accepted, and redirect destinations are count/scheme constrained but not pinned to an
-approved host set.
+These controls reduce corruption, confusion, source-confusion, DNS-rebinding, SSRF,
+and resource-exhaustion risk for the direct configured-source transport. Configuring
+an arbitrary public HTTPS source is still an explicit user trust decision; the policy
+does not claim that a public destination or its content is benign.
 
 ### Local storage and integrity
 
@@ -180,10 +192,19 @@ approved host set.
 - Tests exercise tampered loose objects, pack payloads, indexes, and database location
   pointers.
 
-Current full verification covers the object catalog and unsigned predecessor-linked
-manifest history. It does not yet authenticate a signing identity or fully verify
-revision chains, cache transformer versions, search pointers, or an externally
-trusted library head.
+Current full verification covers the object catalog, predecessor-linked manifest
+history, and bounded metadata reachability for revisions, page heads, checkpoints,
+search documents, and contentless FTS rows. It also checks the persisted search
+transformer version. The CLI and GUI can generate or validate an external PKCS#8
+Ed25519 key, sign a validated manifest-chain head, publish a canonical external
+trusted-head document only after authenticated full verification, and compare that
+anchor with a later full verification. The CLI additionally supports create-new key
+import and a rotation flow that retains the previous anchor before replacing the
+current one. The CLI lifecycle enforces explicit absolute paths outside the library,
+private owned parent directories, bounded regular-file reads, create-new secret
+writes, and atomic anchor refresh. The current schema has no derived-cache inventory,
+and contentless FTS permits pointer checks rather than reconstruction of its indexed
+token stream.
 
 ### Derived content, HTML, and reader
 
@@ -222,10 +243,15 @@ are implemented and tested.
   have narrow documented exceptions in `deny.toml` because the advisories offer no
   safe compatible upgrade. Re-evaluate and remove them with the next Iced upgrade.
 - The HTTP stack uses Rustls rather than a platform OpenSSL dependency.
+- A credential-free native-runner workflow builds bounded, deterministic candidate
+  archives, verifies canonical layouts and SHA-256 manifests, and pins its checkout
+  action by commit. Local tooling can create and verify a detached OpenSSH Ed25519
+  signature over the checksum manifest without copying the private key into output.
 
 This is useful hygiene, not a complete software-supply-chain guarantee. Release
-signing, reproducible builds, action pinning, dependency review/audit response, an
-SBOM/provenance statement, and secured signing keys remain release work.
+platform signing/notarization, binary reproducibility, remaining action pinning,
+dependency review/audit response, an SBOM/provenance statement, protected signing
+identities, and trust-anchor distribution remain release work.
 
 ## Abuse cases and required treatment
 
@@ -258,9 +284,14 @@ redirects, explicit continuations, schema decoding, identity checks, UTF-8/conte
 model/size/SHA-1 validation, durable job state, history budgets, and long-gap limits
 fail closed for the implemented paths.
 
-**Residual risk and action.** Enforce an approved host/source policy across initial
-URLs, DNS resolution as appropriate, and every redirect. Add explicit compressed-byte
-and decompression-ratio tests if content encoding is enabled. Add total operation,
+**Residual risk and action.** The configured origin, direct-IP validation, bounded DNS
+answer, new-connection DNS revalidation, proxy exclusion, and every redirect now fail
+closed under one source policy. Scripted resolver tests cover mixed answers and a
+public-to-loopback rebinding sequence; loopback fixtures cover the real request path
+and same/cross-origin redirects. `reqwest` may reuse an already-vetted pooled socket
+without asking DNS again, which cannot retarget that established socket but should be
+re-reviewed if connector or proxy behavior changes. Add explicit compressed-byte and
+decompression-ratio tests if content encoding is enabled. Add total operation,
 parser-output, allocation, and disk-growth budgets independent of server metadata.
 Fuzz JSON/schema adapters, continuation handling, the wikitext transformer, pack
 decoding, and delta reconstruction. Exercise slow-loris, truncation, redirect, and
@@ -333,7 +364,9 @@ updater, or signing key supplies a malicious executable.
 
 **Present resistance.** Locked dependencies, constrained registries/sources and
 licenses, yanked dependency checks, warnings-as-errors, two-platform CI, Rustls, and
-forbidden workspace `unsafe` reduce accidental and some supply-chain risk.
+forbidden workspace `unsafe` reduce accidental and some supply-chain risk. Candidate
+archive/checksum/signature tooling is bounded and tested; its CI dry run has no
+publication or secret authority.
 
 **Residual risk and action.** Define vulnerability severity/response policy and run
 advisory checks on every release. Review new dependencies, minimize features, pin CI
@@ -351,17 +384,23 @@ older complete backup; or creates a new self-consistent object graph.
 **Present resistance.** Object and pack identities, verified reconstruction, database
 constraints, immutable metadata conflict checks, transactional checkpoints, durable
 jobs, canonical predecessor-linked manifests, completed-run coverage checks, and
-focused tamper tests catch many partial or accidental changes.
+focused tamper tests catch many partial or accidental changes. An external Ed25519
+anchor binds a public key to one exact sequence and manifest identity. CLI inspection
+distinguishes an invalid signature, a different (including stale) head, other local
+verification failure, and an authenticated current head. CLI rotation requires an
+authenticated current anchor, creates a new key and recovery copy at create-new paths,
+then atomically replaces the current anchor without deleting either key.
 
-**Residual risk and action.** Extend full verification from implemented manifest
-canonicalization, chain continuity, and completed-run coverage to revision/page
-linkage, object reachability, checkpoints, transformer/search pointers, and absence
-of unexpected database truncation. Optional Ed25519 signing must be domain separated
-and define key rotation/revocation.
-Export the trusted public key and latest manifest identity to separate storage. Without
-that external anchor, a complete rollback can only be reported as internally
-self-consistent, not current. Backup/restore must preserve and compare anchors and
-must never silently reset trust.
+**Residual risk and action.** The anchor embeds its verification key, so its trust
+comes from separately protected retention and an operator's recorded public-key,
+sequence, and manifest identity—not from a global PKI. Replacing both the library and
+its only anchor defeats rollback detection. Keep the private key backup and anchor
+history in separate failure domains, compare restores with the exact anchor retained
+for that backup, and never reset trust merely because an anchor is missing or stale.
+Key revocation and cross-device trust distribution remain policy work. Full
+revision-chain policy completeness, manifest-to-database snapshot reachability, and
+detection of database truncation beyond what an exact external-head mismatch exposes
+remain limited.
 
 ### Privacy retention and diagnostics
 
@@ -375,6 +414,10 @@ telemetry or external asset requests in its tested default mode, responses use
 a tested field allowlist, aggregate counts, bounded quick verification, create-new
 `0600` output, and redacted section error codes; sentinel tests reject endpoints,
 titles, names, paths, raw errors, content, object IDs, and environment values.
+Current and historical Markdown/plain-text exports are private derived directories
+with per-article source, revision, author, capture, transformer, and content-hash
+provenance. Historical slices use an inclusive revision-time cutoff and do not replace
+the maintained current export.
 
 **Residual risk and action.** Onboarding, export, backup, and restore documentation
 must warn about retained suppressed material and legal obligations. Diagnostic
@@ -389,20 +432,20 @@ recoverability from packs/backups.
 | Requirement | State at review | Evidence / remaining work |
 | --- | --- | --- |
 | No telemetry or external reader assets | **Present for tested reader path** | Bundled CSS, restrictive CSP, and in-process outbound-resource crawl; add release-level outbound test and audit diagnostics/updater behavior |
-| Explicit source allowlist | **Present for configured source origin** | Each client derives an explicit normalized host allowlist from its selected endpoint; redirects must remain on the exact scheme/host/effective-port origin and cross-origin destinations fail before contact. Private-address/DNS-rebinding policy remains to be reviewed |
+| Explicit source allowlist | **Present for direct configured source origin** | Each client derives an explicit normalized host allowlist from its selected endpoint, disables ambient proxies, rejects unsafe literal destinations and entire unsafe/mixed/empty/over-32 DNS answers, and gives only vetted addresses to the connector. New connections revalidate DNS; redirects must remain on the exact scheme/host/effective-port origin and cross-origin destinations fail before contact. Loopback HTTP enables a loopback-only fixture exception |
 | HTTPS through Rustls | **Present** | `wikisync-mediawiki` disables reqwest defaults and enables `rustls-tls`; loopback HTTP is fixture-only by validation |
 | Application User-Agent and operator contact | **Partial** | Non-empty controlled User-Agent and `maxlag` exist; configuration/UI contract for operator contact remains |
 | Response, timeout, parser, redirect, and decompression bounds | **Partial** | Request/connect timeout, per-response and aggregate run-byte limits, clone-shared concurrency and byte-rate shaping, redirect count/origin policy, object/pack and inline-depth limits exist; decompression-ratio coverage, broader parser/allocation budgets, and fuzzing remain |
 | Sanitized HTML and restrictive CSP | **Present for text reader** | Raw HTML events become text, links/images are rewritten, headers are tested; continue adversarial corpus testing |
 | User-restricted data-directory permissions | **Present on Unix core paths** | Directories including manifests/exports are `0700`; SQLite/WAL/SHM and created manifest/export files are `0600`; extend release auditing to logs, IPC, and backups |
 | BLAKE3 identities for canonical text/media | **Present for object abstraction** | Domain-separated text/media object kinds and verified reads exist; media ingestion is not implemented |
-| Predecessor-linked manifests | **Present, unsigned** | Bounded canonical JSON, BLAKE3 body identity, immutable run configuration snapshots, strict predecessor/sequence checks, atomic durable append, bounded crash-gap repair, catalog-difference revisions, resulting heads, and tamper tests are implemented |
-| Optional Ed25519 signatures and external trust anchor | **Pending** | No signing/key lifecycle or trusted-head export is present |
-| Full verify contract | **Partial** | Loose/pack/delta/object catalog plus unsigned manifest identity/chain/run coverage verification exists; revision/page/checkpoint reachability, search/cache pointers, database truncation, signatures, and trusted-head comparison remain |
+| Predecessor-linked manifests | **Present, optionally head-authenticated** | Bounded canonical JSON, BLAKE3 body identity, immutable run configuration snapshots, strict predecessor/sequence checks, atomic durable append, bounded crash-gap repair, catalog-difference revisions, resulting heads, and tamper tests are implemented. A signature covers a validated chain head rather than modifying every manifest file |
+| Optional Ed25519 signatures and external trust anchor | **Present for explicit external Unix paths** | CLI generation, validation, create-new import, verified anchor export/explicit refresh, comparison, and recovery-preserving rotation are tested. The GUI generates/validates keys, verifies against an anchor, and retains a changed previous anchor during refresh. Keys and anchors must use explicit paths outside the library in private operator-owned storage; revocation and broader trust distribution remain policy work |
+| Full verify contract | **Partial** | Loose/pack/delta objects, manifest identity/chain/run coverage, revision/page/object reachability, page heads, checkpoint run/scope/boundary, search/FTS pointers, and search transformer versions are checked with bounded stable scans. An exact external head comparison detects a different restored head. The current schema has no derived-cache table; contentless FTS bodies, full revision-chain policy completeness, manifest-to-database snapshot reachability, and broader database truncation detection remain limited |
 | Loopback-only read-only reader | **Present, confidentiality gap** | Non-loopback addresses are rejected and only GET routes exist; localhost is unauthenticated and not an OS-user boundary |
 | Daemon single-writer authorization | **Partial** | Versioned bounded Unix IPC, `0600` sockets inside the private library, cooperative writer leases, scheduling, signal cancellation, advisory-lock stale-socket recovery, GUI/CLI forwarding, and exclusion/recovery tests exist; peer-credential review and hostile same-UID analysis remain |
 | Locked/audited dependencies | **Partial** | Lockfile, cargo-deny policy, locked CI tests; formal audit response, immutable CI action pins, SBOM/provenance remain |
-| Signed beta packages | **Pending** | Packaging, platform signing, protected key flow, and artifact verification remain |
+| Signed beta packages | **Credential-free substrate present; credentialed release pending** | Deterministic bounded macOS/Linux candidate archives, strict checksum/layout verification, detached OpenSSH Ed25519 checksum-signing hooks, five packaging tests, and a no-publish native CI dry run are present. Apple Developer ID/notarization, protected release identities and trust-anchor distribution, a Linux package/repository trust model, credentialed validation, and publication remain |
 | Safe optional media | **Deferred / disabled** | Image placeholders only; do not enable capture until bounded validation, attribution, licensing, and safe serving land |
 | At-rest confidentiality | **External control** | Recommend full-disk encryption; application-managed encryption is intentionally deferred |
 
