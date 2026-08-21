@@ -157,9 +157,19 @@ old head/checkpoint, reuses the durable intermediate revision, and resumes the s
 run. Cooperative signal cancellation exits at bounded request/transaction boundaries
 and leaves the run resumable. Each synchronization client and its clones enforce a
 shared aggregate response-body budget (512 MiB by default) and at most four in-flight
-requests by default; both ceilings are explicitly configurable in the transport API.
-OS metered-network detection, bandwidth rate shaping, and durable GUI policy controls
-remain Milestone 4 work.
+requests by default. Migration 9 adds one durable library-wide transfer policy for
+request concurrency, an optional aggregate downloaded-byte rate, and metered-network
+avoidance. The GUI can edit that policy whether it owns the direct writer or forwards
+through the daemon, and every new synchronization client applies it across clones and
+retry responses. New sync runs snapshot the policy in their immutable configuration
+hash.
+
+On Linux, metered-network avoidance uses a bounded, local NetworkManager `nmcli`
+probe. A connection reported as metered prevents foreground synchronization and leaves
+an overdue scheduled occurrence unclaimed so it can run later. Conflicting, missing,
+timed-out, or malformed probe results are reported as unknown and do not silently
+claim that the connection is unmetered. macOS currently reports unsupported/unknown
+because WikiSyncer does not yet have a reliable safe system API integration there.
 
 Before shutting down the computer, moving the library, or taking a backup, request a
 cooperative stop and confirm both that the service manager has no daemon process and

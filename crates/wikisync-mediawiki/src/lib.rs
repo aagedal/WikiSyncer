@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use reqwest::{StatusCode, Url, redirect};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use wikisync_core::{PageId, PageTitle, RevisionId};
 
 const DEFAULT_RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
@@ -127,6 +127,7 @@ pub struct ClientConfig {
     connect_timeout: Duration,
     max_response_bytes: NonZeroUsize,
     max_downloaded_response_bytes_per_run: NonZeroUsize,
+    max_downloaded_response_bytes_per_second: Option<NonZeroUsize>,
     max_concurrent_requests: NonZeroUsize,
     max_redirects: usize,
     max_lag_seconds: u16,
@@ -165,6 +166,7 @@ impl ClientConfig {
             connect_timeout: Duration::from_secs(10),
             max_response_bytes: nonzero(DEFAULT_RESPONSE_LIMIT),
             max_downloaded_response_bytes_per_run: nonzero(DEFAULT_RUN_DOWNLOAD_LIMIT),
+            max_downloaded_response_bytes_per_second: None,
             max_concurrent_requests: nonzero(DEFAULT_MAX_CONCURRENT_REQUESTS),
             max_redirects: 3,
             max_lag_seconds: 5,
@@ -197,6 +199,33 @@ impl ClientConfig {
                 name: "max downloaded response bytes per run",
             })?;
         Ok(self)
+    }
+
+    /// Sets an optional aggregate response-body rate shared by this client's clones.
+    ///
+    /// The rate applies to every response-body chunk, including bodies received from
+    /// retry attempts. `None` leaves downloads unlimited. A configured limiter keeps
+    /// at most one second of unused capacity, so idle time cannot create an unbounded
+    /// later burst.
+    pub fn with_max_downloaded_response_bytes_per_second(
+        mut self,
+        bytes_per_second: Option<usize>,
+    ) -> Result<Self, ConfigError> {
+        self.max_downloaded_response_bytes_per_second = bytes_per_second
+            .map(|bytes_per_second| {
+                NonZeroUsize::new(bytes_per_second).ok_or(ConfigError::ZeroLimit {
+                    name: "max downloaded response bytes per second",
+                })
+            })
+            .transpose()?;
+        Ok(self)
+    }
+
+    /// Returns the aggregate response-body rate, or `None` when it is unlimited.
+    #[must_use]
+    pub fn max_downloaded_response_bytes_per_second(&self) -> Option<usize> {
+        self.max_downloaded_response_bytes_per_second
+            .map(NonZeroUsize::get)
     }
 
     /// Sets the maximum number of in-flight HTTP requests shared by client clones.
@@ -376,6 +405,7 @@ struct TransportLimits {
     request_slots: Semaphore,
     downloaded_response_bytes: AtomicUsize,
     max_downloaded_response_bytes: usize,
+    download_rate_limiter: Option<ByteRateLimiter>,
 }
 
 impl TransportLimits {
@@ -396,6 +426,79 @@ impl TransportLimits {
                 downloaded,
                 next_chunk: bytes,
             })
+    }
+}
+
+/// A clone-shared token bucket whose credit and sleeps are both explicitly bounded.
+///
+/// Credit is stored as byte-nanoseconds so refills use integer arithmetic. The
+/// bucket holds at most one second of capacity, and large chunks are consumed in
+/// at-most-one-second quanta. `Instant` keeps wall-clock adjustments from affecting
+/// download shaping.
+#[derive(Debug)]
+struct ByteRateLimiter {
+    bytes_per_second: usize,
+    state: AsyncMutex<ByteRateState>,
+}
+
+#[derive(Debug)]
+struct ByteRateState {
+    credit_byte_nanos: u128,
+    last_refill: Instant,
+}
+
+impl ByteRateLimiter {
+    const NANOS_PER_SECOND: u128 = 1_000_000_000;
+
+    fn new(bytes_per_second: NonZeroUsize) -> Self {
+        Self {
+            bytes_per_second: bytes_per_second.get(),
+            state: AsyncMutex::new(ByteRateState {
+                credit_byte_nanos: 0,
+                last_refill: Instant::now(),
+            }),
+        }
+    }
+
+    async fn consume(&self, bytes: usize) {
+        let mut remaining = bytes;
+        let rate = self.bytes_per_second as u128;
+        let capacity = rate.saturating_mul(Self::NANOS_PER_SECOND);
+
+        while remaining > 0 {
+            let quantum = remaining.min(self.bytes_per_second);
+            let cost = (quantum as u128).saturating_mul(Self::NANOS_PER_SECOND);
+            let mut state = self.state.lock().await;
+
+            loop {
+                state.refill(rate, capacity);
+                if state.credit_byte_nanos >= cost {
+                    state.credit_byte_nanos -= cost;
+                    break;
+                }
+
+                let missing = cost - state.credit_byte_nanos;
+                let wait_nanos = missing.div_ceil(rate);
+                let wait_nanos = u64::try_from(wait_nanos)
+                    .expect("one rate-limiter quantum waits no more than one second");
+                tokio::time::sleep(Duration::from_nanos(wait_nanos)).await;
+            }
+
+            drop(state);
+            remaining -= quantum;
+        }
+    }
+}
+
+impl ByteRateState {
+    fn refill(&mut self, rate: u128, capacity: u128) {
+        let now = Instant::now();
+        let elapsed_nanos = now.saturating_duration_since(self.last_refill).as_nanos();
+        self.last_refill = now;
+        self.credit_byte_nanos = self
+            .credit_byte_nanos
+            .saturating_add(elapsed_nanos.saturating_mul(rate))
+            .min(capacity);
     }
 }
 
@@ -535,6 +638,9 @@ impl MediaWikiClient {
             request_slots: Semaphore::new(config.max_concurrent_requests.get()),
             downloaded_response_bytes: AtomicUsize::new(0),
             max_downloaded_response_bytes: config.max_downloaded_response_bytes_per_run.get(),
+            download_rate_limiter: config
+                .max_downloaded_response_bytes_per_second
+                .map(ByteRateLimiter::new),
         });
 
         Ok(Self {
@@ -908,6 +1014,9 @@ impl MediaWikiClient {
                 return Err(ClientError::ResponseTooLarge {
                     limit: self.config.max_response_bytes.get(),
                 });
+            }
+            if let Some(limiter) = &self.transport_limits.download_rate_limiter {
+                limiter.consume(chunk.len()).await;
             }
             body.extend_from_slice(&chunk);
         }
@@ -1583,5 +1692,25 @@ mod tests {
             config.with_max_downloaded_response_bytes_per_run(0),
             Err(ConfigError::ZeroLimit { .. })
         ));
+        let config = ClientConfig::new("https://example.com/api.php", "WikiSyncer/0.1")
+            .expect("valid config");
+        assert_eq!(
+            config.max_downloaded_response_bytes_per_second(),
+            None,
+            "an absent byte-rate policy is unlimited"
+        );
+        assert!(matches!(
+            config
+                .clone()
+                .with_max_downloaded_response_bytes_per_second(Some(0)),
+            Err(ConfigError::ZeroLimit { .. })
+        ));
+        let configured = config
+            .with_max_downloaded_response_bytes_per_second(Some(1_024))
+            .expect("positive byte rate");
+        assert_eq!(
+            configured.max_downloaded_response_bytes_per_second(),
+            Some(1_024)
+        );
     }
 }

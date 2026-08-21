@@ -33,6 +33,7 @@ const MIGRATION_5: &str = include_str!("../migrations/0005_packs.sql");
 const MIGRATION_6: &str = include_str!("../migrations/0006_collections.sql");
 const MIGRATION_7: &str = include_str!("../migrations/0007_schedules.sql");
 const MIGRATION_8: &str = include_str!("../migrations/0008_manifest_configuration.sql");
+const MIGRATION_9: &str = include_str!("../migrations/0009_network_transfer_policy.sql");
 const OBJECT_DOMAIN: &[u8] = b"wikisync-object-v1\0";
 const DATABASE_NAME: &str = "library.sqlite3";
 const MANIFEST_DOMAIN: &[u8] = b"wikisync-manifest-v1\0";
@@ -83,6 +84,82 @@ pub const MAX_DUE_SCHEDULES: u32 = 10_000;
 
 /// Maximum manifest records returned by one bounded enumeration call.
 pub const MAX_MANIFEST_PAGE_SIZE: u32 = 1_000;
+
+/// Default maximum number of source requests in flight across one library process.
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: u32 = 4;
+
+/// Largest supported library-wide source-request concurrency.
+pub const MAX_CONCURRENT_REQUESTS: u32 = 256;
+
+/// Largest byte-per-second limit representable by the durable SQLite schema.
+pub const MAX_DOWNLOAD_BYTES_PER_SECOND: u64 = i64::MAX as u64;
+
+/// Durable library-wide policy for synchronization network transfers.
+///
+/// The default permits four concurrent requests, does not shape aggregate download
+/// throughput, and permits transfers on metered networks. Metered-network avoidance
+/// is only actionable where the caller can reliably identify that OS network state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetworkTransferPolicy {
+    max_concurrent_requests: u32,
+    max_download_bytes_per_second: Option<u64>,
+    avoid_metered_networks: bool,
+}
+
+impl NetworkTransferPolicy {
+    /// Builds a validated library-wide transfer policy.
+    pub fn new(
+        max_concurrent_requests: u32,
+        max_download_bytes_per_second: Option<u64>,
+        avoid_metered_networks: bool,
+    ) -> Result<Self, StoreError> {
+        if !(1..=MAX_CONCURRENT_REQUESTS).contains(&max_concurrent_requests) {
+            return Err(StoreError::InvalidConfig(
+                "maximum concurrent requests must be between 1 and 256",
+            ));
+        }
+        if max_download_bytes_per_second
+            .is_some_and(|bytes| bytes == 0 || bytes > MAX_DOWNLOAD_BYTES_PER_SECOND)
+        {
+            return Err(StoreError::InvalidConfig(
+                "maximum download rate must be between 1 and 9,223,372,036,854,775,807 bytes per second when set",
+            ));
+        }
+        Ok(Self {
+            max_concurrent_requests,
+            max_download_bytes_per_second,
+            avoid_metered_networks,
+        })
+    }
+
+    /// Returns the maximum number of concurrent source requests.
+    #[must_use]
+    pub const fn max_concurrent_requests(self) -> u32 {
+        self.max_concurrent_requests
+    }
+
+    /// Returns the aggregate download-rate ceiling, or `None` when unlimited.
+    #[must_use]
+    pub const fn max_download_bytes_per_second(self) -> Option<u64> {
+        self.max_download_bytes_per_second
+    }
+
+    /// Returns whether synchronization should wait while the OS reports metering.
+    #[must_use]
+    pub const fn avoid_metered_networks(self) -> bool {
+        self.avoid_metered_networks
+    }
+}
+
+impl Default for NetworkTransferPolicy {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+            max_download_bytes_per_second: None,
+            avoid_metered_networks: false,
+        }
+    }
+}
 
 /// Configuration for a [`Library`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1229,6 +1306,44 @@ impl Library {
     #[must_use]
     pub fn database_path(&self) -> PathBuf {
         self.root.join(DATABASE_NAME)
+    }
+
+    /// Returns the durable library-wide network transfer policy.
+    pub fn network_transfer_policy(&self) -> Result<NetworkTransferPolicy, StoreError> {
+        read_network_transfer_policy(&self.connection)
+    }
+
+    /// Atomically replaces the durable library-wide network transfer policy.
+    pub fn update_network_transfer_policy(
+        &mut self,
+        policy: NetworkTransferPolicy,
+    ) -> Result<(), StoreError> {
+        self.ensure_writable()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE network_transfer_policy
+             SET max_concurrent_requests = ?1,
+                 max_download_bytes_per_second = ?2,
+                 avoid_metered_networks = ?3
+             WHERE singleton = 1",
+            params![
+                i64::from(policy.max_concurrent_requests()),
+                policy
+                    .max_download_bytes_per_second()
+                    .map(to_sql_integer)
+                    .transpose()?,
+                policy.avoid_metered_networks(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::CorruptMetadata(
+                "network transfer policy row is missing",
+            ));
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Registers a MediaWiki source, returning the existing identity on repetition.
@@ -5625,6 +5740,53 @@ fn validate_schedule_configuration(
     }
 }
 
+fn read_network_transfer_policy(
+    connection: &Connection,
+) -> Result<NetworkTransferPolicy, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT max_concurrent_requests, max_download_bytes_per_second,
+                    avoid_metered_networks
+             FROM network_transfer_policy WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(StoreError::CorruptMetadata(
+            "network transfer policy row is missing",
+        ))?;
+    let max_concurrent_requests = u32::try_from(row.0)
+        .map_err(|_| StoreError::CorruptMetadata("invalid maximum concurrent request policy"))?;
+    let max_download_bytes_per_second = row
+        .1
+        .map(|value| {
+            u64::try_from(value)
+                .map_err(|_| StoreError::CorruptMetadata("invalid maximum download rate policy"))
+        })
+        .transpose()?;
+    let avoid_metered_networks = match row.2 {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(StoreError::CorruptMetadata(
+                "invalid metered-network avoidance policy",
+            ));
+        }
+    };
+    NetworkTransferPolicy::new(
+        max_concurrent_requests,
+        max_download_bytes_per_second,
+        avoid_metered_networks,
+    )
+    .map_err(|_| StoreError::CorruptMetadata("network transfer policy is out of range"))
+}
+
 fn migrate(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -5634,7 +5796,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
          ) STRICT;",
     )?;
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > 8 {
+    if version > 9 {
         return Err(StoreError::UnsupportedSchemaVersion(version));
     }
     if version == 0 {
@@ -5730,6 +5892,18 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
             [unix_time()?],
         )?;
         transaction.pragma_update(None, "user_version", 8)?;
+        transaction.commit()?;
+    }
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 8 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(MIGRATION_9)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (9, 'network-transfer-policy', ?1)",
+            [unix_time()?],
+        )?;
+        transaction.pragma_update(None, "user_version", 9)?;
         transaction.commit()?;
     }
     Ok(())
@@ -6030,7 +6204,7 @@ fn manifest_configuration_hash_for(
     collection_id: Option<CollectionId>,
 ) -> Result<String, StoreError> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"wikisync-manifest-configuration-v1\0");
+    hasher.update(b"wikisync-manifest-configuration-v2\0");
     hash_manifest_field(&mut hasher, &wiki_id.get().to_string());
     if let Some(collection_id) = collection_id {
         hash_manifest_field(&mut hasher, &collection_id.get().to_string());
@@ -6078,6 +6252,26 @@ fn manifest_configuration_hash_for(
     } else {
         hash_manifest_field(&mut hasher, "source-wide");
     }
+    let transfer_policy = read_network_transfer_policy(connection)?;
+    hash_manifest_field(
+        &mut hasher,
+        &transfer_policy.max_concurrent_requests().to_string(),
+    );
+    hash_manifest_optional_field(
+        &mut hasher,
+        transfer_policy
+            .max_download_bytes_per_second()
+            .map(|value| value.to_string())
+            .as_deref(),
+    );
+    hash_manifest_field(
+        &mut hasher,
+        if transfer_policy.avoid_metered_networks() {
+            "avoid-metered"
+        } else {
+            "permit-metered"
+        },
+    );
     Ok(format!("b3:{}", hasher.finalize().to_hex()))
 }
 
@@ -6547,7 +6741,7 @@ mod tests {
         let before = filesystem_snapshot(directory.path());
 
         let mut library = Library::open_read_only(directory.path()).expect("read-only library");
-        assert_eq!(library.schema_version().expect("schema version"), 8);
+        assert_eq!(library.schema_version().expect("schema version"), 9);
         assert_eq!(library.wikis().expect("wikis")[0].wiki_id, wiki_id);
         assert_eq!(library.logical_object_count().expect("object count"), 1);
         assert_eq!(
@@ -6649,13 +6843,13 @@ mod tests {
     #[test]
     fn migration_is_applied_once_and_keeps_locations_separate() {
         let (directory, library) = test_library();
-        assert_eq!(library.schema_version().expect("schema version"), 8);
-        assert_eq!(migration_count(&library), 8);
+        assert_eq!(library.schema_version().expect("schema version"), 9);
+        assert_eq!(migration_count(&library), 9);
 
         drop(library);
         let reopened = Library::open(directory.path()).expect("reopen library");
-        assert_eq!(reopened.schema_version().expect("schema version"), 8);
-        assert_eq!(migration_count(&reopened), 8);
+        assert_eq!(reopened.schema_version().expect("schema version"), 9);
+        assert_eq!(migration_count(&reopened), 9);
 
         let logical_columns: Vec<String> = reopened
             .connection()
@@ -6669,6 +6863,180 @@ mod tests {
             !logical_columns
                 .iter()
                 .any(|column| column == "relative_path")
+        );
+    }
+
+    #[test]
+    fn network_transfer_policy_is_bounded_and_defaults_are_explicit() {
+        assert_eq!(
+            NetworkTransferPolicy::default().max_concurrent_requests(),
+            4
+        );
+        assert_eq!(
+            NetworkTransferPolicy::default().max_download_bytes_per_second(),
+            None
+        );
+        assert!(!NetworkTransferPolicy::default().avoid_metered_networks());
+
+        assert!(NetworkTransferPolicy::new(0, None, false).is_err());
+        assert!(NetworkTransferPolicy::new(MAX_CONCURRENT_REQUESTS, None, false).is_ok());
+        assert!(NetworkTransferPolicy::new(MAX_CONCURRENT_REQUESTS + 1, None, false).is_err());
+        assert!(NetworkTransferPolicy::new(1, Some(0), false).is_err());
+        assert!(NetworkTransferPolicy::new(1, Some(MAX_DOWNLOAD_BYTES_PER_SECOND), false).is_ok());
+        assert!(
+            NetworkTransferPolicy::new(1, Some(MAX_DOWNLOAD_BYTES_PER_SECOND + 1), false).is_err()
+        );
+    }
+
+    #[test]
+    fn network_transfer_policy_update_is_atomic_durable_and_read_only_safe() {
+        let (directory, mut library) = test_library();
+        assert_eq!(
+            library
+                .network_transfer_policy()
+                .expect("default transfer policy"),
+            NetworkTransferPolicy::default()
+        );
+        let configured =
+            NetworkTransferPolicy::new(8, Some(1_000_000), true).expect("valid transfer policy");
+        library
+            .update_network_transfer_policy(configured)
+            .expect("persist transfer policy");
+        assert_eq!(
+            library.network_transfer_policy().expect("updated policy"),
+            configured
+        );
+        drop(library);
+
+        let mut read_only = Library::open_read_only(directory.path()).expect("read-only library");
+        assert_eq!(
+            read_only.network_transfer_policy().expect("durable policy"),
+            configured
+        );
+        assert!(matches!(
+            read_only.update_network_transfer_policy(NetworkTransferPolicy::default()),
+            Err(StoreError::ReadOnly)
+        ));
+        drop(read_only);
+
+        let reopened = Library::open(directory.path()).expect("reopen library");
+        assert_eq!(
+            reopened
+                .network_transfer_policy()
+                .expect("unchanged policy"),
+            configured
+        );
+    }
+
+    #[test]
+    fn new_sync_runs_snapshot_the_network_transfer_policy() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let first = library
+            .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Bootstrap, 100)
+            .expect("start first run");
+        let first_hash = first
+            .status
+            .configuration_hash
+            .clone()
+            .expect("first configuration hash");
+
+        library
+            .update_network_transfer_policy(
+                NetworkTransferPolicy::new(2, Some(500_000), true).expect("policy"),
+            )
+            .expect("update transfer policy");
+        let resumed = library
+            .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Bootstrap, 100)
+            .expect("resume first run");
+        assert!(resumed.resumed);
+        assert_eq!(
+            resumed.status.configuration_hash.as_deref(),
+            Some(first_hash.as_str())
+        );
+
+        library
+            .cancel_sync_run(first.status.run_id)
+            .expect("cancel first run");
+        let second = library
+            .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Bootstrap, 100)
+            .expect("start second run");
+        assert_ne!(second.status.configuration_hash, Some(first_hash));
+    }
+
+    #[test]
+    fn network_transfer_policy_reads_fail_closed_on_corrupt_values() {
+        let (_directory, library) = test_library();
+        library
+            .connection()
+            .pragma_update(None, "ignore_check_constraints", true)
+            .expect("permit corruption fixture");
+
+        library
+            .connection()
+            .execute(
+                "UPDATE network_transfer_policy SET max_concurrent_requests = 0",
+                [],
+            )
+            .expect("corrupt concurrency");
+        assert!(matches!(
+            library.network_transfer_policy(),
+            Err(StoreError::CorruptMetadata(_))
+        ));
+
+        library
+            .connection()
+            .execute(
+                "UPDATE network_transfer_policy
+                 SET max_concurrent_requests = 4, max_download_bytes_per_second = 0",
+                [],
+            )
+            .expect("corrupt rate");
+        assert!(matches!(
+            library.network_transfer_policy(),
+            Err(StoreError::CorruptMetadata(_))
+        ));
+
+        library
+            .connection()
+            .execute(
+                "UPDATE network_transfer_policy
+                 SET max_download_bytes_per_second = NULL, avoid_metered_networks = 2",
+                [],
+            )
+            .expect("corrupt metered flag");
+        assert!(matches!(
+            library.network_transfer_policy(),
+            Err(StoreError::CorruptMetadata(_))
+        ));
+    }
+
+    #[test]
+    fn version_eight_library_upgrades_with_default_network_transfer_policy() {
+        let directory = tempfile::tempdir().expect("temporary library");
+        let library = Library::open(directory.path()).expect("create current library");
+        drop(library);
+        let connection = Connection::open(directory.path().join(DATABASE_NAME))
+            .expect("open database for version-eight fixture");
+        connection
+            .execute_batch(
+                "DROP TABLE network_transfer_policy;
+                 DELETE FROM schema_migrations WHERE version = 9;
+                 PRAGMA user_version = 8;",
+            )
+            .expect("downgrade fixture metadata");
+        drop(connection);
+
+        let upgraded = Library::open(directory.path()).expect("upgrade version eight library");
+        assert_eq!(upgraded.schema_version().expect("schema version"), 9);
+        assert_eq!(migration_count(&upgraded), 9);
+        assert_eq!(
+            upgraded
+                .network_transfer_policy()
+                .expect("migrated default policy"),
+            NetworkTransferPolicy::default()
         );
     }
 
@@ -6715,8 +7083,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 8);
-        assert_eq!(migration_count(&upgraded), 8);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 9);
+        assert_eq!(migration_count(&upgraded), 9);
         assert_eq!(table_count(&upgraded, "revisions"), 0);
     }
 
@@ -6752,8 +7120,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 8);
-        assert_eq!(migration_count(&upgraded), 8);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 9);
+        assert_eq!(migration_count(&upgraded), 9);
         assert_eq!(table_count(&upgraded, "search_documents"), 0);
         let fts_definition: String = upgraded
             .connection()

@@ -165,13 +165,30 @@ Transport policy, manifests, and current-head export now include:
   provenance, source attribution, staged replacement, and symlink/path protections.
   Historical `--at` export is explicitly rejected rather than silently approximated.
 
+Durable network transfer policy now also includes:
+
+- schema migration 9 with one validated library-wide policy for maximum concurrent
+  requests, an optional aggregate downloaded-byte rate, and metered-network
+  avoidance; updates are atomic, survive restart, and are included in new sync-run
+  configuration hashes;
+- a clone-shared monotonic byte-rate limiter applied to every streamed response body,
+  including retry responses, without weakening the existing per-response or per-run
+  byte ceilings;
+- GUI controls that read and edit the durable policy through either a direct writer
+  lease or a versioned daemon extension, with the daemon and direct GUI sync paths
+  applying the same policy to each MediaWiki client; and
+- bounded local metered-network detection through NetworkManager on Linux. A known
+  metered connection blocks foreground synchronization and leaves overdue schedules
+  unclaimed for later; unknown, conflicting, unavailable, and unsupported results are
+  fail-visible but do not pretend to prove that a connection is unmetered. macOS
+  currently reports unsupported because no reliable safe integration is implemented.
+
 Workspace formatting, warning-denied Clippy, and all workspace tests pass. The
 `cargo-deny` subcommand is unavailable in this environment. This checkpoint adds no
 new package version; `serde` and `serde_json` became direct store dependencies and
 already match the repository's source/license policy. Milestone 4 delivery is still
-partial: metered-network avoidance, byte-rate shaping and durable GUI bandwidth/
-concurrency policy, private-address/DNS-rebinding review, signed packages/installers,
-and optional online reachability in `doctor` remain.
+partial: private-address/DNS-rebinding review, signed packages/installers, and optional
+online reachability in `doctor` remain.
 
 ## Plan audit notes
 
@@ -186,13 +203,13 @@ protection, or universal whole-archive verification.
 
 ## Next checkpoint
 
-Add metered-network avoidance where the target OS exposes it reliably, byte-rate
-shaping, and durable GUI/daemon policy for the implemented aggregate bandwidth and
-concurrency controls. Then add optional Ed25519 manifest signing with an externally
-exportable trusted head, extend full verification to revision/page/checkpoint and
-search/cache reachability, and close signed beta packaging without weakening the
-offline fixture test policy. Historical/time-slice export, administrative CLI work,
-optional media, and dump bootstrap remain separately tracked milestone work.
+Add optional Ed25519 manifest signing with an externally exportable trusted head,
+extend full verification to revision/page/checkpoint and search/cache reachability,
+and close signed beta packaging without weakening the offline fixture test policy.
+Private-address/DNS-rebinding review and optional online reachability in `doctor` also
+remain Milestone 4 hardening. Historical/time-slice export, administrative CLI work,
+optional media, periodic dynamic-category reconciliation, and dump bootstrap remain
+separately tracked milestone work.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening

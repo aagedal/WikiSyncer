@@ -6,9 +6,13 @@
 //! when no daemon is present, and reports a busy library in every other case.
 
 mod application;
+mod network;
 mod schedule;
 
 pub use application::ApplicationHandler;
+pub use network::{
+    MeteredNetworkProbeOutcome, MeteredNetworkState, MeteredNetworkStatus, detect_metered_network,
+};
 pub use schedule::{
     RecoveryDecision, jittered_occurrence, next_nominal_after, next_occurrence_after, recover,
 };
@@ -40,6 +44,8 @@ pub const WRITER_SOCKET_NAME: &str = ".wikisync-writer.sock";
 const IPC_LOCK_NAME: &str = ".wikisync-ipc.lock";
 /// Versioned extension name used to configure one collection schedule.
 pub const SET_COLLECTION_SCHEDULE_EXTENSION: &str = "set-collection-schedule-v1";
+/// Versioned extension name used to configure the library-wide network policy.
+pub const SET_NETWORK_TRANSFER_POLICY_EXTENSION: &str = "set-network-transfer-policy-v1";
 
 const REQUEST_MAGIC: &[u8; 4] = b"WKSR";
 const RESPONSE_MAGIC: &[u8; 4] = b"WKSP";
@@ -305,6 +311,26 @@ pub fn set_collection_schedule_mutation(
     payload.push(u8::from(paused));
     Mutation::Extension {
         name: SET_COLLECTION_SCHEDULE_EXTENSION.to_owned(),
+        payload,
+    }
+}
+
+/// Creates the bounded version-one extension mutation for the network transfer policy.
+#[must_use]
+pub fn set_network_transfer_policy_mutation(
+    policy: wikisync_store::NetworkTransferPolicy,
+) -> Mutation {
+    let mut payload = Vec::with_capacity(13);
+    payload.extend_from_slice(&policy.max_concurrent_requests().to_be_bytes());
+    payload.extend_from_slice(
+        &policy
+            .max_download_bytes_per_second()
+            .unwrap_or(0)
+            .to_be_bytes(),
+    );
+    payload.push(u8::from(policy.avoid_metered_networks()));
+    Mutation::Extension {
+        name: SET_NETWORK_TRANSFER_POLICY_EXTENSION.to_owned(),
         payload,
     }
 }

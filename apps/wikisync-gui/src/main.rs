@@ -18,8 +18,8 @@ use wikisync_core::{
 use wikisync_integrity::{VerificationReport, VerificationScope, verify_library};
 use wikisync_mediawiki::ClientConfig;
 use wikisync_store::{
-    CollectionSchedule, Library, ScheduleCadence, StoredCollection, SyncCheckpoint, SyncRunState,
-    SyncRunStatus,
+    CollectionSchedule, Library, NetworkTransferPolicy, ScheduleCadence, StoredCollection,
+    SyncCheckpoint, SyncRunState, SyncRunStatus,
 };
 use wikisync_sync::{
     CategoryPreviewLimits, CollectionSelectionPreview, bootstrap_collection,
@@ -28,7 +28,8 @@ use wikisync_sync::{
 };
 use wikisync_web::ReaderHandle;
 use wikisyncd::{
-    Mutation, WriterAccess, WriterLease, next_occurrence_after, set_collection_schedule_mutation,
+    MeteredNetworkState, Mutation, WriterAccess, WriterLease, detect_metered_network,
+    next_occurrence_after, set_collection_schedule_mutation, set_network_transfer_policy_mutation,
 };
 
 const DATABASE_NAME: &str = "library.sqlite3";
@@ -55,6 +56,7 @@ struct App {
     path_status: PathStatus,
     collection_form: CollectionForm,
     schedule_editor: Option<ScheduleEditor>,
+    network_policy_editor: NetworkPolicyEditor,
     selection_preview: Option<CollectionSelectionPreview>,
     verification: VerificationState,
     reader: Option<Arc<ReaderHandle>>,
@@ -80,6 +82,7 @@ impl App {
             path_status: PathStatus::Checking,
             collection_form: CollectionForm::default(),
             schedule_editor: None,
+            network_policy_editor: NetworkPolicyEditor::default(),
             selection_preview: None,
             verification: VerificationState::NotRun,
             reader: None,
@@ -139,6 +142,8 @@ impl App {
                 }
                 match completion.result {
                     Ok(snapshot) => {
+                        self.network_policy_editor =
+                            NetworkPolicyEditor::from_policy(snapshot.network_policy);
                         self.library_path = snapshot.path.display().to_string();
                         self.snapshot = Some(snapshot);
                         self.screen = Screen::Dashboard;
@@ -257,6 +262,12 @@ impl App {
                 let path = PathBuf::from(&self.library_path);
                 let request = PreviewCollectionRequest {
                     api_endpoint: self.collection_form.api_endpoint.trim().to_owned(),
+                    network_policy: self
+                        .snapshot
+                        .as_ref()
+                        .map_or_else(NetworkTransferPolicy::default, |snapshot| {
+                            snapshot.network_policy
+                        }),
                     rule: match self.collection_form.rule() {
                         Ok(rule) => rule,
                         Err(error) => {
@@ -331,6 +342,8 @@ impl App {
                 }
                 match completion.result {
                     Ok(snapshot) => {
+                        self.network_policy_editor =
+                            NetworkPolicyEditor::from_policy(snapshot.network_policy);
                         self.snapshot = Some(snapshot);
                         self.collection_form.name.clear();
                         self.collection_form.selection.clear();
@@ -357,6 +370,8 @@ impl App {
                 }
                 match completion.result {
                     Ok(snapshot) => {
+                        self.network_policy_editor =
+                            NetworkPolicyEditor::from_policy(snapshot.network_policy);
                         self.snapshot = Some(snapshot);
                         self.notice = Some(Notice::success(
                             "Collection update completed; every discovered intermediate revision is durable.",
@@ -442,9 +457,56 @@ impl App {
                 }
                 match completion.result {
                     Ok(snapshot) => {
+                        self.network_policy_editor =
+                            NetworkPolicyEditor::from_policy(snapshot.network_policy);
                         self.snapshot = Some(snapshot);
                         self.schedule_editor = None;
                         self.notice = Some(Notice::success("Schedule saved."));
+                    }
+                    Err(error) => self.notice = Some(Notice::error(error)),
+                }
+            }
+            Message::NetworkConcurrencyChanged(value) => {
+                if !self.is_busy() {
+                    self.network_policy_editor.max_concurrent_requests = value;
+                }
+            }
+            Message::NetworkRateChanged(value) => {
+                if !self.is_busy() {
+                    self.network_policy_editor.max_download_bytes_per_second = value;
+                }
+            }
+            Message::AvoidMeteredNetworksChanged(value) => {
+                if !self.is_busy() {
+                    self.network_policy_editor.avoid_metered_networks = value;
+                }
+            }
+            Message::SaveNetworkPolicy => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let policy = match self.network_policy_editor.policy() {
+                    Ok(policy) => policy,
+                    Err(error) => {
+                        self.notice = Some(Notice::error(error));
+                        return Task::none();
+                    }
+                };
+                self.notice = None;
+                let path = PathBuf::from(&self.library_path);
+                let key = self.begin_request(path.clone());
+                return save_network_policy_task(key, path, policy);
+            }
+            Message::NetworkPolicySaved(completion) => {
+                if !self.finish_request(&completion.key) {
+                    return Task::none();
+                }
+                match completion.result {
+                    Ok(snapshot) => {
+                        self.network_policy_editor =
+                            NetworkPolicyEditor::from_policy(snapshot.network_policy);
+                        self.snapshot = Some(snapshot);
+                        self.notice = Some(Notice::success("Network transfer policy saved."));
                     }
                     Err(error) => self.notice = Some(Notice::error(error)),
                 }
@@ -928,9 +990,51 @@ impl App {
     }
 
     fn sync_view<'a>(&self, snapshot: &'a DashboardSnapshot) -> Element<'a, Message> {
+        let rate_label = snapshot
+            .network_policy
+            .max_download_bytes_per_second()
+            .map_or_else(
+                || "unlimited".to_owned(),
+                |bytes| format!("{}/s", format_bytes(bytes)),
+            );
         let mut content = column![
             text("Synchronization").size(30),
             text("Create-and-sync and Update actions use the shared durable capture/reconciliation services. Interrupted page jobs resume without advancing their checkpoint prematurely."),
+            container(
+                column![
+                    text("Network transfer policy").size(23),
+                    text(format!(
+                        "Active policy: up to {} concurrent request(s), byte rate {rate_label}, metered-network avoidance {}.",
+                        snapshot.network_policy.max_concurrent_requests(),
+                        if snapshot.network_policy.avoid_metered_networks() { "enabled" } else { "disabled" },
+                    )),
+                    row![
+                        text_input(
+                            "Maximum concurrent requests",
+                            &self.network_policy_editor.max_concurrent_requests,
+                        )
+                        .on_input(Message::NetworkConcurrencyChanged)
+                        .padding(10),
+                        text_input(
+                            "Maximum downloaded bytes/second (blank = unlimited)",
+                            &self.network_policy_editor.max_download_bytes_per_second,
+                        )
+                        .on_input(Message::NetworkRateChanged)
+                        .padding(10),
+                    ]
+                    .spacing(10),
+                    checkbox(
+                        "Avoid synchronization on connections reported as metered",
+                        self.network_policy_editor.avoid_metered_networks,
+                    )
+                    .on_toggle(Message::AvoidMeteredNetworksChanged),
+                    text("Linux uses NetworkManager's metered state when available. Unsupported or indeterminate detection is reported as unknown and does not silently block synchronization.").size(13),
+                    button("Save network policy")
+                        .on_press_maybe((!self.is_busy()).then_some(Message::SaveNetworkPolicy)),
+                ]
+                .spacing(9),
+            )
+            .padding(12),
         ]
         .spacing(10);
 
@@ -1096,6 +1200,11 @@ enum Message {
     EditSchedulePaused(bool),
     SaveSchedule,
     ScheduleSaved(ScopedResult<DashboardSnapshot>),
+    NetworkConcurrencyChanged(String),
+    NetworkRateChanged(String),
+    AvoidMeteredNetworksChanged(bool),
+    SaveNetworkPolicy,
+    NetworkPolicySaved(ScopedResult<DashboardSnapshot>),
     VerifyFull,
     VerificationFinished(ScopedResult<VerificationReport>),
     OpenReader,
@@ -1125,6 +1234,7 @@ enum PathStatus {
 #[derive(Clone, Debug)]
 struct DashboardSnapshot {
     path: PathBuf,
+    network_policy: NetworkTransferPolicy,
     collections: Vec<StoredCollection>,
     schedules: Vec<CollectionSchedule>,
     runs: Vec<SyncRunStatus>,
@@ -1140,6 +1250,59 @@ struct DashboardSnapshot {
 struct StorageUsage {
     bytes: u64,
     files: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NetworkPolicyEditor {
+    max_concurrent_requests: String,
+    max_download_bytes_per_second: String,
+    avoid_metered_networks: bool,
+}
+
+impl Default for NetworkPolicyEditor {
+    fn default() -> Self {
+        Self::from_policy(NetworkTransferPolicy::default())
+    }
+}
+
+impl NetworkPolicyEditor {
+    fn from_policy(policy: NetworkTransferPolicy) -> Self {
+        Self {
+            max_concurrent_requests: policy.max_concurrent_requests().to_string(),
+            max_download_bytes_per_second: policy
+                .max_download_bytes_per_second()
+                .map_or_else(String::new, |value| value.to_string()),
+            avoid_metered_networks: policy.avoid_metered_networks(),
+        }
+    }
+
+    fn policy(&self) -> Result<NetworkTransferPolicy, String> {
+        let max_concurrent_requests = self
+            .max_concurrent_requests
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| "Maximum concurrent requests must be a positive integer.".to_owned())?;
+        let max_download_bytes_per_second = if self.max_download_bytes_per_second.trim().is_empty()
+        {
+            None
+        } else {
+            Some(
+                self.max_download_bytes_per_second
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| {
+                        "Maximum downloaded bytes/second must be a positive integer or blank."
+                            .to_owned()
+                    })?,
+            )
+        };
+        NetworkTransferPolicy::new(
+            max_concurrent_requests,
+            max_download_bytes_per_second,
+            self.avoid_metered_networks,
+        )
+        .map_err(|error| error.to_string())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1344,6 +1507,7 @@ impl ScheduleEditor {
 #[derive(Clone, Debug)]
 struct PreviewCollectionRequest {
     api_endpoint: String,
+    network_policy: NetworkTransferPolicy,
     rule: CollectionRule,
 }
 
@@ -1464,6 +1628,20 @@ fn save_schedule_task(
     )
 }
 
+fn save_network_policy_task(
+    key: RequestKey,
+    path: PathBuf,
+    policy: NetworkTransferPolicy,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = save_network_transfer_policy(path, policy).await;
+            ScopedResult { key, result }
+        },
+        Message::NetworkPolicySaved,
+    )
+}
+
 fn verification_task(key: RequestKey) -> Task<Message> {
     Task::perform(
         async move {
@@ -1533,11 +1711,8 @@ async fn create_collection(request: CreateCollectionRequest) -> Result<Dashboard
 async fn preview_collection(
     request: PreviewCollectionRequest,
 ) -> Result<CollectionSelectionPreview, String> {
-    let config = ClientConfig::new(
-        &request.api_endpoint,
-        concat!("WikiSyncer/", env!("CARGO_PKG_VERSION")),
-    )
-    .map_err(|error| error.to_string())?;
+    enforce_metered_policy(request.network_policy)?;
+    let config = configured_client(&request.api_endpoint, request.network_policy)?;
     let client =
         wikisync_mediawiki::MediaWikiClient::new(config).map_err(|error| error.to_string())?;
     preview_collection_rule(&client, &request.rule, CategoryPreviewLimits::default())
@@ -1554,11 +1729,6 @@ async fn create_collection_and_sync(
     {
         return Err("Collection name, language code, and API endpoint are required.".to_owned());
     }
-    let client_config = ClientConfig::new(
-        &request.api_endpoint,
-        concat!("WikiSyncer/", env!("CARGO_PKG_VERSION")),
-    )
-    .map_err(|error| error.to_string())?;
     let _writer_lease = match WriterAccess::discover(&request.library_path)
         .map_err(|error| error.to_string())?
     {
@@ -1571,6 +1741,11 @@ async fn create_collection_and_sync(
         }
     };
     let mut library = Library::open(&request.library_path).map_err(|error| error.to_string())?;
+    let network_policy = library
+        .network_transfer_policy()
+        .map_err(|error| error.to_string())?;
+    enforce_metered_policy(network_policy)?;
+    let client_config = configured_client(&request.api_endpoint, network_policy)?;
     let wiki_id = library
         .register_wiki(client_config.endpoint().as_str(), &request.language_code)
         .map_err(|error| error.to_string())?;
@@ -1640,11 +1815,11 @@ async fn update_collection(
         .wiki(configuration.wiki_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "Collection source is missing.".to_owned())?;
-    let client_config = ClientConfig::new(
-        &wiki.api_endpoint,
-        concat!("WikiSyncer/", env!("CARGO_PKG_VERSION")),
-    )
-    .map_err(|error| error.to_string())?;
+    let network_policy = library
+        .network_transfer_policy()
+        .map_err(|error| error.to_string())?;
+    enforce_metered_policy(network_policy)?;
+    let client_config = configured_client(&wiki.api_endpoint, network_policy)?;
     let client = wikisync_mediawiki::MediaWikiClient::new(client_config)
         .map_err(|error| error.to_string())?;
     let checkpoint = SystemTime::now()
@@ -1702,6 +1877,64 @@ async fn save_collection_schedule(
     snapshot(&library)
 }
 
+async fn save_network_transfer_policy(
+    path: PathBuf,
+    policy: NetworkTransferPolicy,
+) -> Result<DashboardSnapshot, String> {
+    match WriterAccess::discover(&path).map_err(|error| error.to_string())? {
+        WriterAccess::Daemon(client) => {
+            client
+                .forward_mutation(set_network_transfer_policy_mutation(policy))
+                .map_err(|error| error.to_string())?;
+        }
+        WriterAccess::Direct(_lease) => {
+            let mut library = Library::open(&path).map_err(|error| error.to_string())?;
+            library
+                .update_network_transfer_policy(policy)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    let library = Library::open(&path).map_err(|error| error.to_string())?;
+    snapshot(&library)
+}
+
+fn configured_client(
+    api_endpoint: &str,
+    policy: NetworkTransferPolicy,
+) -> Result<ClientConfig, String> {
+    let max_concurrent_requests = usize::try_from(policy.max_concurrent_requests())
+        .map_err(|_| "Maximum concurrent request policy is too large.".to_owned())?;
+    let max_downloaded_response_bytes_per_second = policy
+        .max_download_bytes_per_second()
+        .map(usize::try_from)
+        .transpose()
+        .map_err(|_| "Maximum byte-rate policy is too large.".to_owned())?;
+    ClientConfig::new(
+        api_endpoint,
+        concat!("WikiSyncer/", env!("CARGO_PKG_VERSION")),
+    )
+    .and_then(|config| config.with_max_concurrent_requests(max_concurrent_requests))
+    .and_then(|config| {
+        config
+            .with_max_downloaded_response_bytes_per_second(max_downloaded_response_bytes_per_second)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn enforce_metered_policy(policy: NetworkTransferPolicy) -> Result<(), String> {
+    if !policy.avoid_metered_networks() {
+        return Ok(());
+    }
+    let status = detect_metered_network();
+    if status.state == MeteredNetworkState::Metered {
+        return Err(
+            "Synchronization is blocked by the library policy while the active network is metered."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn unix_time_seconds() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1730,6 +1963,9 @@ fn open_system_browser(url: &str) -> Result<(), String> {
 }
 
 fn snapshot(library: &Library) -> Result<DashboardSnapshot, String> {
+    let network_policy = library
+        .network_transfer_policy()
+        .map_err(|error| error.to_string())?;
     let collections = library.collections().map_err(|error| error.to_string())?;
     let schedules = library.schedules().map_err(|error| error.to_string())?;
     let mut unique_pages = BTreeSet::new();
@@ -1779,6 +2015,7 @@ fn snapshot(library: &Library) -> Result<DashboardSnapshot, String> {
         .map_err(|error| error.to_string());
     Ok(DashboardSnapshot {
         path: library.root().to_path_buf(),
+        network_policy,
         collections,
         schedules,
         runs,
@@ -2173,7 +2410,7 @@ mod tests {
 
         let created = load_library_snapshot(&root, true).expect("create library");
         assert_eq!(created.path, root);
-        assert_eq!(created.schema_version, 8);
+        assert_eq!(created.schema_version, 9);
         assert!(root.join(DATABASE_NAME).is_file());
 
         let reopened = load_library_snapshot(&root, false).expect("reopen library");
@@ -2211,6 +2448,33 @@ mod tests {
         assert!(matches!(daily.cadence, ScheduleCadence::DailyUtc(_)));
         assert_eq!(daily.jitter_seconds, 300);
         assert!(parse_schedule_settings(ScheduleMode::DailyUtc, "24:00", "0", false).is_err());
+    }
+
+    #[test]
+    fn network_policy_editor_round_trips_bounded_durable_values() {
+        let policy = NetworkTransferPolicy::new(8, Some(1_048_576), true).expect("policy");
+        let editor = NetworkPolicyEditor::from_policy(policy);
+        assert_eq!(editor.policy(), Ok(policy));
+
+        let unlimited = NetworkPolicyEditor {
+            max_concurrent_requests: "4".to_owned(),
+            max_download_bytes_per_second: String::new(),
+            avoid_metered_networks: false,
+        };
+        assert_eq!(
+            unlimited
+                .policy()
+                .expect("unlimited policy")
+                .max_download_bytes_per_second(),
+            None
+        );
+
+        let invalid = NetworkPolicyEditor {
+            max_concurrent_requests: "0".to_owned(),
+            max_download_bytes_per_second: "0".to_owned(),
+            avoid_metered_networks: true,
+        };
+        assert!(invalid.policy().is_err());
     }
 
     #[test]
@@ -2337,6 +2601,7 @@ mod tests {
         );
         let preview = preview_collection(PreviewCollectionRequest {
             api_endpoint: server.endpoint.clone(),
+            network_policy: NetworkTransferPolicy::default(),
             rule: rule.clone(),
         })
         .await

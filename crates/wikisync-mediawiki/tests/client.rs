@@ -430,7 +430,9 @@ async fn cloned_clients_share_one_aggregate_download_budget() {
     let config = ClientConfig::new(server.endpoint(), "WikiSyncer/0.1 budget-tests")
         .expect("valid config")
         .with_max_downloaded_response_bytes_per_run(TITLE_RESOLUTION.len())
-        .expect("positive aggregate limit");
+        .expect("positive aggregate limit")
+        .with_max_downloaded_response_bytes_per_second(Some(usize::MAX))
+        .expect("positive byte rate");
     let client = MediaWikiClient::new(config).expect("fixture client");
     let clone = client.clone();
 
@@ -451,6 +453,90 @@ async fn cloned_clients_share_one_aggregate_download_budget() {
             ..
         } if limit == TITLE_RESOLUTION.len() && downloaded == TITLE_RESOLUTION.len()
     ));
+    assert_eq!(server.finish().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cloned_clients_share_one_bounded_download_rate() {
+    let server = FixtureServer::start(vec![
+        FixtureResponse::json(EMPTY_PAGES),
+        FixtureResponse::json(EMPTY_PAGES),
+    ]);
+    let config = ClientConfig::new(server.endpoint(), "WikiSyncer/0.1 rate-tests")
+        .expect("valid config")
+        .with_max_downloaded_response_bytes_per_second(Some(100))
+        .expect("positive byte rate");
+    let client = MediaWikiClient::new(config).expect("fixture client");
+    let clone = client.clone();
+    let started = Instant::now();
+
+    let first = tokio::spawn(async move {
+        client
+            .resolve_titles(&[PageTitle::new("First").expect("valid title")])
+            .await
+    });
+    let second = tokio::spawn(async move {
+        clone
+            .resolve_titles(&[PageTitle::new("Second").expect("valid title")])
+            .await
+    });
+    first
+        .await
+        .expect("first task did not panic")
+        .expect("first response succeeds");
+    second
+        .await
+        .expect("second task did not panic")
+        .expect("second response succeeds");
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(950),
+        "the two {}-byte bodies must share the configured rate; elapsed {elapsed:?}",
+        EMPTY_PAGES.len()
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "rate shaping took unexpectedly long: {elapsed:?}"
+    );
+    assert_eq!(server.finish().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_response_bodies_also_consume_the_download_rate() {
+    let server = FixtureServer::start(vec![
+        FixtureResponse {
+            status: 503,
+            body: TITLE_RESOLUTION,
+            retry_after: None,
+            location: None,
+            delay: Duration::ZERO,
+        },
+        FixtureResponse::json(TITLE_RESOLUTION),
+    ]);
+    let config = ClientConfig::new(server.endpoint(), "WikiSyncer/0.1 retry-rate-tests")
+        .expect("valid config")
+        .with_max_downloaded_response_bytes_per_second(Some(1_000))
+        .expect("positive byte rate")
+        .with_retry_policy(fast_retry_policy(2));
+    let client = MediaWikiClient::new(config).expect("fixture client");
+    let started = Instant::now();
+
+    client
+        .resolve_titles(&[PageTitle::new("Rust").expect("valid title")])
+        .await
+        .expect("retry succeeds");
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(1_250),
+        "both {}-byte attempt bodies must be shaped; elapsed {elapsed:?}",
+        TITLE_RESOLUTION.len()
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "retry rate shaping took unexpectedly long: {elapsed:?}"
+    );
     assert_eq!(server.finish().len(), 2);
 }
 

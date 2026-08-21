@@ -8,12 +8,14 @@ use tokio::runtime::{Builder, Runtime};
 use wikisync_core::CollectionId;
 use wikisync_integrity::{VerificationScope, verify_library};
 use wikisync_mediawiki::{ClientConfig, MediaWikiClient};
-use wikisync_store::{Library, ScheduleCadence};
+use wikisync_store::{Library, NetworkTransferPolicy, ScheduleCadence};
 use wikisync_sync::{ReconciliationReport, reconcile_collection_heads_with_cancellation};
 
 use crate::{
-    HandlerStatus, Mutation, MutationOutcome, OperationControl, OperationError, RequestHandler,
-    SET_COLLECTION_SCHEDULE_EXTENSION, canonical_library_root, next_occurrence_after, recover,
+    HandlerStatus, MeteredNetworkState, MeteredNetworkStatus, Mutation, MutationOutcome,
+    OperationControl, OperationError, RequestHandler, SET_COLLECTION_SCHEDULE_EXTENSION,
+    SET_NETWORK_TRANSFER_POLICY_EXTENSION, canonical_library_root, detect_metered_network,
+    next_occurrence_after, recover,
 };
 
 const BACKGROUND_RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -26,6 +28,8 @@ const BACKGROUND_RETRY_DELAY: Duration = Duration::from_secs(30);
 pub struct ApplicationHandler {
     library_root: PathBuf,
     last_operation: Option<String>,
+    last_network_status: Option<MeteredNetworkStatus>,
+    metered_network_probe: fn() -> MeteredNetworkStatus,
     background_retry_not_before: HashMap<CollectionId, Instant>,
 }
 
@@ -35,6 +39,8 @@ impl ApplicationHandler {
         Ok(Self {
             library_root: canonical_library_root(library_root.as_ref())?,
             last_operation: None,
+            last_network_status: None,
+            metered_network_probe: detect_metered_network,
             background_retry_not_before: HashMap::new(),
         })
     }
@@ -51,6 +57,7 @@ impl ApplicationHandler {
         library: &mut Library,
         collection_id: CollectionId,
         checkpoint_candidate: u64,
+        network_policy: NetworkTransferPolicy,
         control: &OperationControl,
     ) -> Result<ReconciliationReport, OperationError> {
         let configuration = library
@@ -70,7 +77,20 @@ impl ApplicationHandler {
                     configuration.wiki_id
                 ))
             })?;
+        let max_concurrent_requests = usize::try_from(network_policy.max_concurrent_requests())
+            .map_err(|_| OperationError::failed("network concurrency policy is too large"))?;
+        let max_downloaded_response_bytes_per_second = network_policy
+            .max_download_bytes_per_second()
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| OperationError::failed("network byte-rate policy is too large"))?;
         let client_config = ClientConfig::new(&wiki.api_endpoint, user_agent())
+            .and_then(|config| config.with_max_concurrent_requests(max_concurrent_requests))
+            .and_then(|config| {
+                config.with_max_downloaded_response_bytes_per_second(
+                    max_downloaded_response_bytes_per_second,
+                )
+            })
             .map_err(|error| OperationError::failed(error.to_string()))?;
         let client = MediaWikiClient::new(client_config)
             .map_err(|error| OperationError::failed(error.to_string()))?;
@@ -94,9 +114,19 @@ impl ApplicationHandler {
         let collection_id = CollectionId::new(raw_collection_id)
             .map_err(|error| OperationError::failed(error.to_string()))?;
         let mut library = Library::open(&self.library_root).map_err(operation_failed)?;
+        let network_policy = library
+            .network_transfer_policy()
+            .map_err(operation_failed)?;
+        self.enforce_metered_policy(network_policy)?;
         let runtime = Self::runtime()?;
-        let report =
-            Self::sync_collection(&runtime, &mut library, collection_id, unix_time()?, control)?;
+        let report = Self::sync_collection(
+            &runtime,
+            &mut library,
+            collection_id,
+            unix_time()?,
+            network_policy,
+            control,
+        )?;
         self.background_retry_not_before.remove(&collection_id);
         let payload = reconciliation_payload(1, &report);
         self.last_operation = Some(format!("synchronized collection {collection_id}"));
@@ -108,6 +138,10 @@ impl ApplicationHandler {
 
     fn sync_all(&mut self, control: &OperationControl) -> Result<MutationOutcome, OperationError> {
         let mut library = Library::open(&self.library_root).map_err(operation_failed)?;
+        let network_policy = library
+            .network_transfer_policy()
+            .map_err(operation_failed)?;
+        self.enforce_metered_policy(network_policy)?;
         let collections = library.collections().map_err(operation_failed)?;
         let runtime = Self::runtime()?;
         let checkpoint_candidate = unix_time()?;
@@ -123,6 +157,7 @@ impl ApplicationHandler {
                 &mut library,
                 collection.collection_id,
                 checkpoint_candidate,
+                network_policy,
                 control,
             )?;
             totals.add(&report);
@@ -238,6 +273,27 @@ impl ApplicationHandler {
         })
     }
 
+    fn set_network_policy(&mut self, payload: &[u8]) -> Result<MutationOutcome, OperationError> {
+        let policy = decode_network_policy(payload)?;
+        let mut library = Library::open(&self.library_root).map_err(operation_failed)?;
+        library
+            .update_network_transfer_policy(policy)
+            .map_err(operation_failed)?;
+        self.last_operation = Some("configured network transfer policy".to_owned());
+        Ok(MutationOutcome {
+            result: "network-transfer-policy-configured".to_owned(),
+            payload: format!(
+                "max_concurrent_requests={} max_download_bytes_per_second={} avoid_metered_networks={}",
+                policy.max_concurrent_requests(),
+                policy
+                    .max_download_bytes_per_second()
+                    .map_or_else(|| "unlimited".to_owned(), |value| value.to_string()),
+                policy.avoid_metered_networks(),
+            )
+            .into_bytes(),
+        })
+    }
+
     fn poll_schedule(
         &mut self,
         control: &OperationControl,
@@ -247,6 +303,16 @@ impl ApplicationHandler {
         }
         let now = unix_time()?;
         let mut library = Library::open(&self.library_root).map_err(operation_failed)?;
+        let network_policy = library
+            .network_transfer_policy()
+            .map_err(operation_failed)?;
+        if network_policy.avoid_metered_networks()
+            && self.metered_status().state == MeteredNetworkState::Metered
+        {
+            self.last_operation =
+                Some("automatic synchronization is waiting for an unmetered network".to_owned());
+            return Ok(None);
+        }
         let retry_now = Instant::now();
         let unfinished = library
             .running_collection_reconciliations(100)
@@ -322,16 +388,47 @@ impl ApplicationHandler {
             }
         }
     }
+
+    fn metered_status(&mut self) -> MeteredNetworkStatus {
+        let status = (self.metered_network_probe)();
+        self.last_network_status = Some(status);
+        status
+    }
+
+    fn enforce_metered_policy(
+        &mut self,
+        network_policy: NetworkTransferPolicy,
+    ) -> Result<(), OperationError> {
+        if !network_policy.avoid_metered_networks() {
+            return Ok(());
+        }
+        let status = self.metered_status();
+        if status.state == MeteredNetworkState::Metered {
+            return Err(OperationError::failed(
+                "synchronization is blocked by the library policy while the active network is metered",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl RequestHandler for ApplicationHandler {
     fn status(&self) -> HandlerStatus {
+        let network_detail = self.last_network_status.map_or_else(String::new, |status| {
+            format!(
+                "; metered-network probe: {:?} ({:?})",
+                status.state, status.outcome
+            )
+        });
         HandlerStatus {
             state: "idle".to_owned(),
-            detail: self
-                .last_operation
-                .clone()
-                .unwrap_or_else(|| "application mutation dispatcher is ready".to_owned()),
+            detail: format!(
+                "{}{}",
+                self.last_operation
+                    .clone()
+                    .unwrap_or_else(|| "application mutation dispatcher is ready".to_owned()),
+                network_detail
+            ),
         }
     }
 
@@ -348,6 +445,11 @@ impl RequestHandler for ApplicationHandler {
             Mutation::Extension { name, payload } if name == SET_COLLECTION_SCHEDULE_EXTENSION => {
                 self.set_schedule(&payload)
             }
+            Mutation::Extension { name, payload }
+                if name == SET_NETWORK_TRANSFER_POLICY_EXTENSION =>
+            {
+                self.set_network_policy(&payload)
+            }
             Mutation::Extension { name, .. } => Err(OperationError::unsupported(format!(
                 "extension operation {name:?} is not implemented"
             ))),
@@ -360,6 +462,39 @@ impl RequestHandler for ApplicationHandler {
     ) -> Result<Option<MutationOutcome>, OperationError> {
         self.poll_schedule(&control)
     }
+}
+
+fn decode_network_policy(payload: &[u8]) -> Result<NetworkTransferPolicy, OperationError> {
+    if payload.len() != 13 {
+        return Err(OperationError::failed(
+            "network policy extension payload must be exactly 13 bytes",
+        ));
+    }
+    let max_concurrent_requests = u32::from_be_bytes(
+        payload[0..4]
+            .try_into()
+            .map_err(|_| OperationError::failed("invalid network concurrency"))?,
+    );
+    let encoded_rate = u64::from_be_bytes(
+        payload[4..12]
+            .try_into()
+            .map_err(|_| OperationError::failed("invalid network byte rate"))?,
+    );
+    let avoid_metered_networks = match payload[12] {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(OperationError::failed(
+                "invalid metered-network policy flag",
+            ));
+        }
+    };
+    NetworkTransferPolicy::new(
+        max_concurrent_requests,
+        (encoded_rate != 0).then_some(encoded_rate),
+        avoid_metered_networks,
+    )
+    .map_err(operation_failed)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -685,6 +820,34 @@ mod tests {
     }
 
     #[test]
+    fn network_policy_extension_is_validated_and_durable() {
+        let temporary = TempLibrary::new();
+        let policy = NetworkTransferPolicy::new(7, Some(500_000), true).expect("policy");
+        let mut handler = ApplicationHandler::new(temporary.path()).expect("handler");
+        let outcome = handler
+            .mutate(
+                crate::set_network_transfer_policy_mutation(policy),
+                operation_control(),
+            )
+            .expect("save network policy");
+        assert_eq!(outcome.result, "network-transfer-policy-configured");
+
+        let library = Library::open(temporary.path()).expect("reopen library");
+        assert_eq!(library.network_transfer_policy().unwrap(), policy);
+
+        let error = handler
+            .mutate(
+                Mutation::Extension {
+                    name: SET_NETWORK_TRANSFER_POLICY_EXTENSION.to_owned(),
+                    payload: vec![0; 12],
+                },
+                operation_control(),
+            )
+            .expect_err("truncated policy must fail");
+        assert_eq!(error.code(), crate::ErrorCode::OperationFailed);
+    }
+
+    #[test]
     fn sync_all_with_no_collections_completes_without_networking() {
         let temporary = TempLibrary::new();
         let mut handler = ApplicationHandler::new(temporary.path()).expect("handler");
@@ -764,6 +927,68 @@ mod tests {
         assert_eq!(stored.jitter_seconds, 300);
         assert!(!stored.paused);
         assert!(stored.next_run_at.is_some());
+    }
+
+    #[test]
+    fn metered_policy_leaves_an_overdue_schedule_unclaimed() {
+        fn metered() -> MeteredNetworkStatus {
+            MeteredNetworkStatus {
+                state: MeteredNetworkState::Metered,
+                outcome: crate::MeteredNetworkProbeOutcome::Reported,
+            }
+        }
+
+        let temporary = TempLibrary::new();
+        let mut library = Library::open(temporary.path()).expect("open library");
+        let wiki_id = library
+            .register_wiki("http://127.0.0.1:9/w/api.php", "en")
+            .expect("register source");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Metered")
+            .expect("create collection");
+        let due_at = unix_time().expect("clock");
+        library
+            .set_collection_schedule(
+                collection_id,
+                ScheduleCadence::interval(60).expect("interval"),
+                0,
+                false,
+                Some(due_at),
+            )
+            .expect("set overdue schedule");
+        library
+            .update_network_transfer_policy(
+                NetworkTransferPolicy::new(4, None, true).expect("policy"),
+            )
+            .expect("save policy");
+        drop(library);
+
+        let mut handler = ApplicationHandler::new(temporary.path()).expect("handler");
+        handler.metered_network_probe = metered;
+        assert_eq!(
+            handler
+                .poll_background(operation_control())
+                .expect("metered poll"),
+            None
+        );
+        assert!(
+            handler
+                .status()
+                .detail
+                .contains("waiting for an unmetered network")
+        );
+        let error = handler
+            .mutate(Mutation::SyncAll, operation_control())
+            .expect_err("foreground sync must honor metered policy");
+        assert!(error.message().contains("blocked by the library policy"));
+
+        let library = Library::open(temporary.path()).expect("reopen library");
+        let stored = library
+            .collection_schedule(collection_id)
+            .expect("read schedule")
+            .expect("schedule exists");
+        assert_eq!(stored.next_run_at, Some(due_at));
+        assert_eq!(stored.last_started_at, None);
     }
 
     #[test]
