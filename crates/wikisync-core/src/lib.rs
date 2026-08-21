@@ -184,6 +184,26 @@ impl TitleSelection {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Parses a newline-delimited title list.
+    ///
+    /// Blank lines are ignored, surrounding whitespace is trimmed by [`PageTitle`],
+    /// and duplicate titles are removed. The returned selection retains deterministic
+    /// lexical ordering rather than file ordering.
+    pub fn from_newline_delimited(input: &str) -> Result<Self, InvalidTitleList> {
+        let mut titles = Vec::new();
+        for (index, line) in input.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let title = PageTitle::new(line).map_err(|source| InvalidTitleList::InvalidTitle {
+                line: index + 1,
+                source,
+            })?;
+            titles.push(title);
+        }
+        Self::new(titles).map_err(|_| InvalidTitleList::Empty)
+    }
 }
 
 /// The error returned when an explicit-title selection has no titles.
@@ -198,11 +218,47 @@ impl fmt::Display for EmptyTitleSelection {
 
 impl Error for EmptyTitleSelection {}
 
+/// A newline-delimited title list could not be converted into a selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvalidTitleList {
+    /// The input contained no non-blank titles.
+    Empty,
+    /// A non-blank line was not a safe page title.
+    InvalidTitle {
+        /// One-based line number in the imported text.
+        line: usize,
+        /// Title validation failure.
+        source: InvalidPageTitle,
+    },
+}
+
+impl fmt::Display for InvalidTitleList {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("title list contains no titles"),
+            Self::InvalidTitle { line, source } => {
+                write!(formatter, "invalid title on line {line}: {source}")
+            }
+        }
+    }
+}
+
+impl Error for InvalidTitleList {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidTitle { source, .. } => Some(source),
+            Self::Empty => None,
+        }
+    }
+}
+
 /// The rule used to resolve membership in a collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CollectionRule {
-    /// A fixed set of titles, whether entered directly or imported from a title list.
+    /// A fixed set of titles entered directly by the user.
     ExplicitTitles(TitleSelection),
+    /// A fixed set of titles imported from a newline-delimited list.
+    TitleList(TitleSelection),
     /// Pages reachable from a category, including the category at depth zero.
     Category {
         /// The source category title.
@@ -211,6 +267,118 @@ pub enum CollectionRule {
         recursion_depth: u16,
     },
 }
+
+impl CollectionRule {
+    /// Returns the fixed titles for a direct or imported selection.
+    #[must_use]
+    pub fn titles(&self) -> Option<&TitleSelection> {
+        match self {
+            Self::ExplicitTitles(titles) | Self::TitleList(titles) => Some(titles),
+            Self::Category { .. } => None,
+        }
+    }
+}
+
+/// Why one page was included in a resolved collection preview.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InclusionReason {
+    /// The title was entered directly.
+    ExplicitTitle(PageTitle),
+    /// The title came from a newline-delimited import.
+    TitleList(PageTitle),
+    /// The page was reached while resolving a category rule.
+    Category {
+        /// Category from which traversal began.
+        category: PageTitle,
+        /// Number of subcategory edges between the configured category and the page.
+        depth: u16,
+    },
+}
+
+/// What to do when a dynamic rule no longer resolves a previously selected page.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CollectionRemovalPolicy {
+    /// Stop tracking the page while retaining every already captured revision.
+    #[default]
+    StopTrackingRetainHistory,
+    /// Retain the page as an active member until the user removes it explicitly.
+    KeepTracking,
+}
+
+/// Hard page-count and canonical-storage limits for a collection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CollectionBudget {
+    maximum_pages: Option<NonZeroU64>,
+    maximum_bytes: Option<NonZeroU64>,
+}
+
+impl CollectionBudget {
+    /// Creates an unlimited budget.
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            maximum_pages: None,
+            maximum_bytes: None,
+        }
+    }
+
+    /// Sets a hard maximum resolved page count.
+    pub fn with_maximum_pages(mut self, pages: u64) -> Result<Self, InvalidCollectionBudget> {
+        self.maximum_pages =
+            Some(NonZeroU64::new(pages).ok_or(InvalidCollectionBudget::ZeroMaximumPages)?);
+        Ok(self)
+    }
+
+    /// Sets a hard maximum number of canonical storage bytes.
+    pub fn with_maximum_bytes(mut self, bytes: u64) -> Result<Self, InvalidCollectionBudget> {
+        self.maximum_bytes =
+            Some(NonZeroU64::new(bytes).ok_or(InvalidCollectionBudget::ZeroMaximumBytes)?);
+        Ok(self)
+    }
+
+    /// Returns the hard page limit, or `None` when unlimited.
+    #[must_use]
+    pub const fn maximum_pages(self) -> Option<NonZeroU64> {
+        self.maximum_pages
+    }
+
+    /// Returns the hard canonical-byte limit, or `None` when unlimited.
+    #[must_use]
+    pub const fn maximum_bytes(self) -> Option<NonZeroU64> {
+        self.maximum_bytes
+    }
+
+    /// Reports whether a page-count and byte estimate fits both configured limits.
+    #[must_use]
+    pub fn permits(self, pages: u64, bytes: u64) -> bool {
+        self.maximum_pages.is_none_or(|limit| pages <= limit.get())
+            && self.maximum_bytes.is_none_or(|limit| bytes <= limit.get())
+    }
+}
+
+/// A collection budget contained a zero-valued hard limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvalidCollectionBudget {
+    /// The maximum page count was zero.
+    ZeroMaximumPages,
+    /// The maximum byte count was zero.
+    ZeroMaximumBytes,
+}
+
+impl fmt::Display for InvalidCollectionBudget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroMaximumPages => {
+                formatter.write_str("maximum pages must be greater than zero")
+            }
+            Self::ZeroMaximumBytes => {
+                formatter.write_str("maximum bytes must be greater than zero")
+            }
+        }
+    }
+}
+
+impl Error for InvalidCollectionBudget {}
 
 /// The amount of public revision history retained for a selected page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -310,6 +478,36 @@ mod tests {
         let selection = TitleSelection::new([rust.clone(), rust]).expect("non-empty");
         assert_eq!(selection.len(), 1);
         assert!(!selection.is_empty());
+    }
+
+    #[test]
+    fn newline_title_lists_ignore_blanks_and_deduplicate() {
+        let selection = TitleSelection::from_newline_delimited(" Rust \n\nFerris\nRust\n")
+            .expect("valid title list");
+        assert_eq!(
+            selection.iter().map(PageTitle::as_str).collect::<Vec<_>>(),
+            ["Ferris", "Rust"]
+        );
+        assert_eq!(
+            TitleSelection::from_newline_delimited("\n \n"),
+            Err(InvalidTitleList::Empty)
+        );
+    }
+
+    #[test]
+    fn collection_budgets_are_hard_and_zero_is_invalid() {
+        let budget = CollectionBudget::unlimited()
+            .with_maximum_pages(10)
+            .expect("page budget")
+            .with_maximum_bytes(1_024)
+            .expect("byte budget");
+        assert!(budget.permits(10, 1_024));
+        assert!(!budget.permits(11, 1_024));
+        assert!(!budget.permits(10, 1_025));
+        assert_eq!(
+            CollectionBudget::default().with_maximum_pages(0),
+            Err(InvalidCollectionBudget::ZeroMaximumPages)
+        );
     }
 
     #[test]

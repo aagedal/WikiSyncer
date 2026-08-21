@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use axum::Router;
@@ -26,26 +26,98 @@ const CSP: &str = "default-src 'none'; style-src 'self'; img-src 'self' data:; \
     script-src 'none'; connect-src 'none'; font-src 'none'; form-action 'self'; \
     base-uri 'none'; frame-ancestors 'none'";
 const CSS: &str = r#"
-:root { color-scheme: light dark; font-family: ui-serif, Georgia, serif; line-height: 1.55; }
-body { margin: 0 auto; max-width: 72rem; padding: 1.5rem; }
-header { border-bottom: 1px solid #8886; margin-bottom: 2rem; padding-bottom: .8rem; }
-nav a { margin-right: 1rem; }
-a { color: #2769aa; }
-input { font: inherit; min-width: min(28rem, 70vw); padding: .4rem; }
-button { font: inherit; padding: .4rem .8rem; }
-.meta, time { color: #666; font-family: ui-sans-serif, system-ui, sans-serif; font-size: .9rem; }
-.notice { border-left: .25rem solid #b87900; padding-left: 1rem; }
-.diff { border-collapse: collapse; font-family: ui-monospace, monospace; width: 100%; }
-.diff td { padding: .15rem .5rem; vertical-align: top; white-space: pre-wrap; }
-.diff .delete { background: #d733331a; }
-.diff .insert { background: #2a9d4b1a; }
-.diff del { background: #d7333340; }
-.diff ins { background: #2a9d4b40; }
-article { overflow-wrap: anywhere; }
-pre { overflow-x: auto; }
-table:not(.diff) { border-collapse: collapse; display: block; overflow-x: auto; }
-th, td { border: 1px solid #8886; padding: .25rem .5rem; }
-@media (prefers-color-scheme: dark) { a { color: #75baff; } .meta, time { color: #aaa; } }
+:root {
+  color-scheme: light dark;
+  --canvas: #f7f5ef;
+  --surface: #fffefa;
+  --surface-muted: #efede6;
+  --text: #24221f;
+  --muted: #69645d;
+  --border: #d6d1c6;
+  --accent: #155f86;
+  --accent-strong: #0d4564;
+  --notice: #9c6500;
+  --insert: #dff4e4;
+  --delete: #f8dfdf;
+  font-family: Charter, "Bitstream Charter", "Iowan Old Style", Georgia, serif;
+  font-size: 18px;
+  line-height: 1.68;
+  text-rendering: optimizeLegibility;
+}
+* { box-sizing: border-box; }
+html { scroll-padding-top: 6rem; }
+body { background: var(--canvas); color: var(--text); margin: 0; }
+a { color: var(--accent); text-decoration-thickness: .08em; text-underline-offset: .15em; }
+a:hover { color: var(--accent-strong); text-decoration-thickness: .12em; }
+a:focus-visible, button:focus-visible, input:focus-visible, [tabindex="0"]:focus-visible {
+  outline: .18rem solid var(--accent);
+  outline-offset: .18rem;
+}
+.skip-link { background: var(--surface); left: 1rem; padding: .5rem .75rem; position: fixed; top: -5rem; z-index: 3; }
+.skip-link:focus { top: 1rem; }
+.site-header { background: color-mix(in srgb, var(--surface) 94%, transparent); border-bottom: 1px solid var(--border); }
+.site-header-inner { align-items: center; display: flex; gap: 2rem; justify-content: space-between; margin: 0 auto; max-width: 76rem; padding: .8rem 1.25rem; }
+.brand { color: var(--text); font-family: ui-sans-serif, system-ui, sans-serif; font-size: 1.05rem; font-weight: 750; text-decoration: none; }
+.brand small { color: var(--muted); display: block; font-size: .68rem; font-weight: 500; letter-spacing: .08em; text-transform: uppercase; }
+.primary-nav { display: flex; flex-wrap: wrap; font-family: ui-sans-serif, system-ui, sans-serif; font-size: .82rem; gap: .3rem .9rem; }
+.primary-nav a { white-space: nowrap; }
+main { margin: 0 auto; max-width: 76rem; min-height: 70vh; padding: clamp(1.5rem, 4vw, 3.5rem) 1.25rem 4rem; }
+main > :not(article):not(.wide) { max-width: 58rem; }
+h1, h2, h3, h4, h5, h6 { line-height: 1.18; margin: 1.8em 0 .55em; text-wrap: balance; }
+h1 { font-size: clamp(2rem, 7vw, 3.25rem); letter-spacing: -.035em; margin-top: 0; }
+h2 { border-bottom: 1px solid var(--border); font-size: clamp(1.45rem, 4vw, 2rem); padding-bottom: .2em; }
+h3 { font-size: 1.3rem; }
+p, li { max-width: 72ch; }
+li + li { margin-top: .32em; }
+article { font-size: 1.04rem; max-width: 72ch; overflow-wrap: anywhere; }
+article > :first-child { margin-top: 0; }
+article blockquote { border-left: .22rem solid var(--border); color: var(--muted); margin-left: 0; padding-left: 1.2rem; }
+pre, code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .88em; }
+code { background: var(--surface-muted); border-radius: .18rem; padding: .08em .25em; }
+pre { background: var(--surface-muted); border: 1px solid var(--border); border-radius: .3rem; overflow-x: auto; padding: 1rem; }
+pre code { background: none; padding: 0; }
+form { align-items: end; display: flex; flex-wrap: wrap; gap: .65rem; margin: 1.2rem 0 2rem; }
+label { font-family: ui-sans-serif, system-ui, sans-serif; font-size: .86rem; font-weight: 650; }
+input { background: var(--surface); border: 1px solid var(--border); border-radius: .25rem; color: var(--text); display: block; font: inherit; margin-top: .25rem; min-width: min(30rem, 82vw); padding: .5rem .65rem; }
+button { background: var(--accent); border: 0; border-radius: .25rem; color: white; cursor: pointer; font: 650 .9rem ui-sans-serif, system-ui, sans-serif; padding: .55rem .9rem; }
+.meta, time { color: var(--muted); font-family: ui-sans-serif, system-ui, sans-serif; font-size: .82rem; }
+.notice { background: var(--surface); border: 1px solid var(--border); border-left: .3rem solid var(--notice); border-radius: .2rem; padding: .9rem 1rem; }
+.context-nav { align-items: center; display: flex; flex-wrap: wrap; font: .8rem ui-sans-serif, system-ui, sans-serif; gap: .45rem 1rem; margin: 0 0 1.25rem; }
+.context-nav a[aria-current="page"] { color: var(--text); font-weight: 700; text-decoration: none; }
+.revision-pager { background: var(--surface); border: 1px solid var(--border); border-radius: .25rem; display: flex; flex-wrap: wrap; font: .8rem ui-sans-serif, system-ui, sans-serif; gap: .4rem 1.2rem; margin: 1rem 0 1.5rem; padding: .6rem .8rem; }
+.history-list li, .revision-list li { padding: .22rem 0; }
+.provenance { border-top: 1px solid var(--border); margin-top: 3.5rem; max-width: 72ch; padding-top: .5rem; }
+.provenance dl { display: grid; font: .82rem ui-sans-serif, system-ui, sans-serif; gap: .25rem 1rem; grid-template-columns: max-content minmax(0, 1fr); margin: 1rem 0; }
+.provenance dt { color: var(--muted); font-weight: 650; }
+.provenance dd { margin: 0; overflow-wrap: anywhere; }
+.table-scroll { margin: 1.5rem 0; max-width: 100%; overflow-x: auto; }
+.table-scroll table { border-collapse: collapse; font: .9rem ui-sans-serif, system-ui, sans-serif; width: 100%; }
+.table-scroll th, .table-scroll td { border: 1px solid var(--border); min-width: 8rem; padding: .5rem .65rem; text-align: left; vertical-align: top; }
+.table-scroll th { background: var(--surface-muted); font-weight: 700; }
+.table-scroll tbody tr:nth-child(even) { background: color-mix(in srgb, var(--surface-muted) 55%, transparent); }
+.footnote-reference { font-family: ui-sans-serif, system-ui, sans-serif; font-size: .72em; line-height: 1; }
+.footnote-definition { border-top: 1px solid var(--border); color: var(--muted); font-size: .86rem; padding: .55rem 0 .1rem 2rem; position: relative; }
+.footnote-definition-label { font-family: ui-sans-serif, system-ui, sans-serif; font-weight: 700; left: .25rem; position: absolute; }
+.footnote-definition p { margin: 0; }
+.site-footer { border-top: 1px solid var(--border); color: var(--muted); font: .78rem ui-sans-serif, system-ui, sans-serif; margin: 0 auto; max-width: 76rem; padding: 1rem 1.25rem 2rem; }
+.diff { border-collapse: collapse; font-family: ui-monospace, monospace; font-size: .82rem; width: 100%; }
+.diff td { border: 1px solid var(--border); padding: .2rem .5rem; vertical-align: top; white-space: pre-wrap; }
+.diff .delete { background: var(--delete); }
+.diff .insert { background: var(--insert); }
+.diff del { background: color-mix(in srgb, #c22 25%, transparent); }
+.diff ins { background: color-mix(in srgb, #198a36 25%, transparent); }
+@media (max-width: 44rem) {
+  :root { font-size: 16px; }
+  .site-header-inner { align-items: flex-start; flex-direction: column; gap: .65rem; }
+  .primary-nav { gap: .3rem .75rem; }
+  main { padding-top: 2rem; }
+  .provenance dl { grid-template-columns: 1fr; }
+  .provenance dd + dt { margin-top: .4rem; }
+}
+@media (prefers-color-scheme: dark) {
+  :root { --canvas: #171817; --surface: #202220; --surface-muted: #292c29; --text: #ecebe5; --muted: #b0ada4; --border: #41443f; --accent: #7fc9ef; --accent-strong: #b6e4fa; --notice: #e4a83a; --insert: #153c22; --delete: #482020; }
+  button { color: #10222c; }
+}
 "#;
 
 #[derive(Clone, Debug)]
@@ -98,6 +170,79 @@ pub async fn serve(library_root: impl AsRef<Path>, address: SocketAddr) -> Resul
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, router(library_root)).await?;
     Ok(())
+}
+
+/// Starts a ready-to-accept reader on an ephemeral IPv4 loopback port.
+///
+/// Binding completes before this function returns, so GUI callers can immediately
+/// open [`ReaderHandle::local_url`]. Dropping the handle requests graceful shutdown;
+/// callers that need confirmation should await [`ReaderHandle::shutdown`].
+pub async fn start_loopback(library_root: impl AsRef<Path>) -> Result<ReaderHandle, ServeError> {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let address = listener.local_addr()?;
+    let local_url = format!("http://{address}/");
+    let application = router(library_root.as_ref());
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, application)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_receiver.await;
+            })
+            .await
+    });
+    Ok(ReaderHandle {
+        address,
+        local_url,
+        shutdown_sender: Some(shutdown_sender),
+        task: Some(task),
+    })
+}
+
+/// A running ephemeral loopback reader suitable for ownership by the GUI.
+#[derive(Debug)]
+pub struct ReaderHandle {
+    address: SocketAddr,
+    local_url: String,
+    shutdown_sender: Option<tokio::sync::oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<io::Result<()>>>,
+}
+
+impl ReaderHandle {
+    /// Returns the bound loopback socket address, including its allocated port.
+    #[must_use]
+    pub const fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// Returns the absolute loopback URL for the reader home page.
+    #[must_use]
+    pub fn local_url(&self) -> &str {
+        &self.local_url
+    }
+
+    /// Requests graceful shutdown and waits until the listener has stopped.
+    pub async fn shutdown(mut self) -> Result<(), ServeError> {
+        self.request_shutdown();
+        let task = self
+            .task
+            .take()
+            .expect("reader task is present until shutdown consumes the handle");
+        task.await
+            .map_err(|error| ServeError::Io(io::Error::other(error)))??;
+        Ok(())
+    }
+
+    fn request_shutdown(&mut self) {
+        if let Some(sender) = self.shutdown_sender.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+impl Drop for ReaderHandle {
+    fn drop(&mut self) {
+        self.request_shutdown();
+    }
 }
 
 async fn home(State(state): State<AppState>) -> Result<Response, ReaderError> {
@@ -178,7 +323,11 @@ async fn article(
                 "page head points to a missing revision",
             ))?;
     let source = canonical_source(&library, &stored_revision)?;
-    let mut body = format!("<h1>{}</h1>", escape_html(page_data.title.as_str()));
+    let mut body = page_navigation(&page_data, PageView::Article);
+    body.push_str(&format!(
+        "<h1>{}</h1>",
+        escape_html(page_data.title.as_str())
+    ));
     body.push_str(&revision_meta(&page_data, &stored_revision));
     body.push_str("<article>");
     body.push_str(&markdown_to_html(
@@ -186,8 +335,8 @@ async fn article(
         page_data.wiki_id,
         &library,
     )?);
-    body.push_str("</article><h2>Source and attribution</h2>");
-    body.push_str(&source_notice(&page_data, &stored_revision));
+    body.push_str("</article>");
+    body.push_str(&source_section(&page_data, &stored_revision));
     Ok(page(StatusCode::OK, page_data.title.as_str(), &body))
 }
 
@@ -207,12 +356,13 @@ async fn history(
         unique_page_by_id(library.pages_by_id(page_id)?, page_id)?
     };
     let revisions = library.revisions_for_page(page_data.wiki_id, page_data.page_id)?;
-    let mut body = format!(
-        "<h1>History: <a href=\"{}\">{}</a></h1><ol>",
+    let mut body = page_navigation(&page_data, PageView::History);
+    body.push_str(&format!(
+        "<h1>History: <a href=\"{}\">{}</a></h1><ol class=\"history-list\">",
         escape_attribute(&article_url(&page_data.title, page_data.wiki_id)),
         escape_html(page_data.title.as_str())
-    );
-    for item in revisions {
+    ));
+    for (index, item) in revisions.iter().enumerate() {
         let current = if page_data.current_revision_id == Some(item.revision_id) {
             " <strong>current</strong>"
         } else {
@@ -235,6 +385,15 @@ async fn history(
             body.push_str(&escape_html(comment));
             body.push_str("</span>");
         }
+        if let Some(older) = revisions.get(index + 1) {
+            body.push_str("<br><a class=\"meta\" href=\"");
+            body.push_str(&escape_attribute(&diff_url(
+                older.revision_id,
+                item.revision_id,
+                page_data.wiki_id,
+            )));
+            body.push_str("\">Compare with previous captured revision</a>");
+        }
         body.push_str("</li>");
     }
     body.push_str("</ol>");
@@ -254,16 +413,18 @@ async fn revision(
         .page(wiki_id, stored_revision.page_id)?
         .ok_or(ReaderError::corrupt("revision points to a missing page"))?;
     let source = canonical_source(&library, &stored_revision)?;
-    let mut body = format!(
+    let mut body = page_navigation(&page_data, PageView::Neither);
+    body.push_str(&format!(
         "<h1>{} — revision {}</h1>",
         escape_html(page_data.title.as_str()),
         revision_id
-    );
+    ));
     body.push_str(&revision_meta(&page_data, &stored_revision));
+    body.push_str(&revision_pager(&library, &page_data, &stored_revision)?);
     body.push_str("<article>");
     body.push_str(&markdown_to_html(&to_markdown(&source), wiki_id, &library)?);
-    body.push_str("</article><h2>Source and attribution</h2>");
-    body.push_str(&source_notice(&page_data, &stored_revision));
+    body.push_str("</article>");
+    body.push_str(&source_section(&page_data, &stored_revision));
     Ok(page(StatusCode::OK, "Captured revision", &body))
 }
 
@@ -286,10 +447,17 @@ async fn revision_diff(
     let older = canonical_source(&library, &from)?;
     let newer = canonical_source(&library, &to)?;
     let comparison = diff(&older, &newer, DiffMode::ExactSource);
-    let mut body = format!(
-        "<h1>Diff: revision {} → {}</h1><table class=\"diff\"><tbody>",
+    let page_data = library
+        .page(from_wiki, from.page_id)?
+        .ok_or(ReaderError::corrupt("revision points to a missing page"))?;
+    let mut body = page_navigation(&page_data, PageView::Neither);
+    body.push_str(&format!(
+        "<h1>Diff: revision {} → {}</h1>\
+         <p class=\"meta\">Exact captured wikitext comparison</p>\
+         <div class=\"wide table-scroll\" tabindex=\"0\" role=\"region\" \
+         aria-label=\"Revision diff\"><table class=\"diff\"><tbody>",
         from_id, to_id
-    );
+    ));
     for line in comparison.lines {
         let (class, prefix) = match line.tag {
             DiffTag::Equal => ("equal", " "),
@@ -307,7 +475,7 @@ async fn revision_diff(
         }
         body.push_str("</td></tr>");
     }
-    body.push_str("</tbody></table>");
+    body.push_str("</tbody></table></div>");
     Ok(page(StatusCode::OK, "Revision diff", &body))
 }
 
@@ -341,12 +509,20 @@ async fn about() -> Response {
         StatusCode::OK,
         "Source and integrity",
         "<h1>Source and integrity</h1>\
-         <p>WikiSyncer stores exact public wikitext and revision metadata returned by \
-         the configured MediaWiki source. Reading views are deterministic derived content.</p>\
-         <p>Object verification means the captured bytes have not changed locally. It does \
-         not prove that an upstream statement is true, unbiased, or still publicly available.</p>\
+         <p>WikiSyncer stores exact public wikitext and revision metadata captured from each \
+         configured MediaWiki source. Article HTML is derived locally and can be rebuilt from \
+         that canonical record.</p>\
+         <p>When an article or revision opens successfully, WikiSyncer has checked the content \
+         object bytes used for that view against their local object ID. That check can detect \
+         alteration or corruption of those bytes. It is not a claim that a statement is true, \
+         unbiased, complete, or still publicly available upstream, and it is not by itself a \
+         full-library or manifest-chain verification.</p>\
+         <p>Licensing and attribution requirements depend on the configured source. Keep the \
+         displayed revision and authorship details when reusing captured material, and consult \
+         the source terms. Material retained here may remain available after it is deleted or \
+         suppressed upstream, which can carry privacy, copyright, or safety obligations.</p>\
          <p>This reader uses bundled assets and does not request remote fonts, scripts, styles, \
-         or images.</p>",
+         or images. Article text may retain clearly visible links to external sources.</p>",
     )
 }
 
@@ -436,7 +612,7 @@ fn revision_list(
     if revisions.is_empty() {
         return Ok("<p class=\"meta\">No revisions have been captured yet.</p>".to_owned());
     }
-    let mut output = String::from("<ol>");
+    let mut output = String::from("<ol class=\"revision-list\">");
     for (wiki_id, revision) in revisions {
         let page_data = library
             .page(*wiki_id, revision.page_id)?
@@ -469,17 +645,122 @@ fn revision_meta(page_data: &StoredPage, revision: &StoredRevision) -> String {
     )
 }
 
-fn source_notice(page_data: &StoredPage, revision: &StoredRevision) -> String {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageView {
+    Article,
+    History,
+    Neither,
+}
+
+fn page_navigation(page_data: &StoredPage, active: PageView) -> String {
+    let article_current = if active == PageView::Article {
+        " aria-current=\"page\""
+    } else {
+        ""
+    };
+    let history_current = if active == PageView::History {
+        " aria-current=\"page\""
+    } else {
+        ""
+    };
+    let revision = page_data
+        .current_revision_id
+        .map_or_else(String::new, |revision_id| {
+            format!(
+                "<a href=\"{}\">Latest captured revision</a>",
+                escape_attribute(&revision_url(revision_id, page_data.wiki_id))
+            )
+        });
     format!(
-        "<p class=\"notice\">Captured from MediaWiki at revision {} ({}) and stored as \
-         <code>{}</code>. Wikipedia text is generally available under CC BY-SA; consult the \
-         configured source and page history for complete attribution and license details. \
-         Integrity here means verified since local capture, not verified as true.</p>\
-         <p><a href=\"{}\">View captured revision metadata</a></p>",
+        "<nav class=\"context-nav\" aria-label=\"Article\">\
+         <a{article_current} href=\"{}\">Article</a>\
+         <a{history_current} href=\"/page/{}/history?wiki={}\">History</a>{revision}</nav>",
+        escape_attribute(&article_url(&page_data.title, page_data.wiki_id)),
+        page_data.page_id,
+        page_data.wiki_id,
+    )
+}
+
+fn revision_pager(
+    library: &Library,
+    page_data: &StoredPage,
+    revision: &StoredRevision,
+) -> Result<String, ReaderError> {
+    let revisions = library.revisions_for_page(page_data.wiki_id, page_data.page_id)?;
+    let Some(position) = revisions
+        .iter()
+        .position(|candidate| candidate.revision_id == revision.revision_id)
+    else {
+        return Err(ReaderError::corrupt(
+            "revision is missing from its page history",
+        ));
+    };
+    let mut output = String::from("<nav class=\"revision-pager\" aria-label=\"Revision\">");
+    if let Some(newer) = position
+        .checked_sub(1)
+        .and_then(|index| revisions.get(index))
+    {
+        output.push_str(&format!(
+            "<a href=\"{}\">← Newer captured revision</a>",
+            escape_attribute(&revision_url(newer.revision_id, page_data.wiki_id))
+        ));
+    }
+    if let Some(older) = revisions.get(position + 1) {
+        output.push_str(&format!(
+            "<a href=\"{}\">Older captured revision →</a>",
+            escape_attribute(&revision_url(older.revision_id, page_data.wiki_id))
+        ));
+    }
+    if let Some(parent_id) = revision.parent_id
+        && library
+            .revision(page_data.wiki_id, parent_id)?
+            .is_some_and(|parent| parent.page_id == page_data.page_id)
+    {
+        output.push_str(&format!(
+            "<a href=\"{}\">Compare with captured parent</a>",
+            escape_attribute(&diff_url(
+                parent_id,
+                revision.revision_id,
+                page_data.wiki_id,
+            ))
+        ));
+    }
+    output.push_str("</nav>");
+    Ok(output)
+}
+
+fn source_section(page_data: &StoredPage, revision: &StoredRevision) -> String {
+    let author = revision
+        .author
+        .as_deref()
+        .unwrap_or("not publicly recorded");
+    format!(
+        "<section class=\"provenance\" aria-labelledby=\"source-attribution\">\
+         <h2 id=\"source-attribution\">Source, attribution, and integrity</h2>\
+         <dl><dt>Configured source</dt><dd>MediaWiki source {}</dd>\
+         <dt>Page and revision</dt><dd>Page {} · Revision {}</dd>\
+         <dt>Source timestamp</dt><dd>{}</dd><dt>Recorded author</dt><dd>{}</dd>\
+         <dt>Captured locally</dt><dd>Unix timestamp {}</dd>\
+         <dt>Content object</dt><dd><code>{}</code></dd></dl>\
+         <p class=\"notice\">This reading view was derived locally from the exact public \
+         wikitext captured for this revision. The content object bytes were checked against \
+         the displayed object ID while loading this page. This can detect local alteration or \
+         corruption of those bytes; it does not verify that the content is true, unbiased, \
+         complete, or still public upstream.</p>\
+         <p>Licensing and attribution requirements depend on the configured source. Retain \
+         these revision and authorship details and consult the source terms when reusing this \
+         material. <a href=\"{}\">Browse the captured revision history</a>.</p></section>",
+        page_data.wiki_id,
+        page_data.page_id,
         revision.revision_id,
         escape_html(&revision.timestamp),
+        escape_html(author),
+        revision.captured_at,
         escape_html(&revision.content_object_id.to_string()),
-        escape_attribute(&revision_url(revision.revision_id, page_data.wiki_id)),
+        escape_attribute(&format!(
+            "/page/{}/history?wiki={}",
+            page_data.page_id, page_data.wiki_id
+        )),
     )
 }
 
@@ -499,12 +780,25 @@ fn markdown_to_html(
     wiki_id: WikiId,
     library: &Library,
 ) -> Result<String, ReaderError> {
-    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
+    let markdown = reader_markdown(markdown);
+    let options =
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_FOOTNOTES;
     let mut events = Vec::new();
     let mut unavailable_links = Vec::new();
-    for event in Parser::new_ext(markdown, options) {
+    for event in Parser::new_ext(&markdown, options) {
         match event {
             Event::Html(value) | Event::InlineHtml(value) => events.push(Event::Text(value)),
+            event @ Event::Start(Tag::Table(_)) => {
+                events.push(Event::Html(CowStr::Borrowed(
+                    "<div class=\"table-scroll\" tabindex=\"0\" role=\"region\" \
+                     aria-label=\"Article table\">",
+                )));
+                events.push(event);
+            }
+            event @ Event::End(TagEnd::Table) => {
+                events.push(event);
+                events.push(Event::Html(CowStr::Borrowed("</div>")));
+            }
             Event::Start(Tag::Link {
                 link_type,
                 dest_url,
@@ -549,6 +843,76 @@ fn markdown_to_html(
     let mut output = String::new();
     html::push_html(&mut output, events.into_iter());
     Ok(output)
+}
+
+fn reader_markdown(markdown: &str) -> String {
+    let mut output = String::with_capacity(markdown.len());
+    let mut references = Vec::new();
+    let mut remaining = markdown;
+    while let Some(start) = remaining.find("[ref: ") {
+        output.push_str(&remaining[..start]);
+        let reference = &remaining[start + 6..];
+        let Some(end) = closing_reference_bracket(reference) else {
+            output.push_str(&remaining[start..]);
+            remaining = "";
+            break;
+        };
+        references.push(reference[..end].trim().to_owned());
+        output.push_str(&format!("[^reader-reference-{}]", references.len()));
+        remaining = &reference[end + 1..];
+    }
+    output.push_str(remaining);
+    if references.is_empty() {
+        return output;
+    }
+    if !has_reference_heading(&output) {
+        output.push_str("\n\n## References\n");
+    }
+    for (index, reference) in references.iter().enumerate() {
+        output.push_str(&format!(
+            "\n[^reader-reference-{}]: {}\n",
+            index + 1,
+            reference
+        ));
+    }
+    output
+}
+
+fn closing_reference_bracket(reference: &str) -> Option<usize> {
+    let mut depth = 1_u32;
+    let mut escaped = false;
+    for (offset, character) in reference.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '[' => depth = depth.saturating_add(1),
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn has_reference_heading(markdown: &str) -> bool {
+    markdown.lines().any(|line| {
+        let line = line.trim_start();
+        if !line.starts_with('#') {
+            return false;
+        }
+        let heading = line.trim_start_matches('#').trim();
+        matches!(
+            heading.to_ascii_lowercase().as_str(),
+            "references" | "notes" | "notes and references"
+        )
+    })
 }
 
 fn rewrite_link(destination: &str, wiki_id: WikiId) -> String {
@@ -606,6 +970,10 @@ fn revision_url(revision_id: RevisionId, wiki_id: WikiId) -> String {
     format!("/revision/{revision_id}?wiki={wiki_id}")
 }
 
+fn diff_url(from_id: RevisionId, to_id: RevisionId, wiki_id: WikiId) -> String {
+    format!("/diff/{from_id}/{to_id}?wiki={wiki_id}")
+}
+
 fn excerpt(body: &str, maximum: usize) -> String {
     let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut characters = collapsed.chars();
@@ -626,10 +994,14 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
          <title>{}</title><link rel=\"stylesheet\" href=\"/assets/reader.css\"></head>\
-         <body><header><nav><a href=\"/\">WikiSyncer</a><a href=\"/search\">Search</a>\
+         <body><a class=\"skip-link\" href=\"#content\">Skip to content</a>\
+         <header class=\"site-header\"><div class=\"site-header-inner\">\
+         <a class=\"brand\" href=\"/\">WikiSyncer<small>Offline library</small></a>\
+         <nav class=\"primary-nav\" aria-label=\"Library\"><a href=\"/search\">Search</a>\
          <a href=\"/changes\">Changes</a><a href=\"/collections\">Collections</a>\
-         <a href=\"/about/source-and-integrity\">Source &amp; integrity</a></nav></header>\
-         <main>{body}</main></body></html>",
+         <a href=\"/about/source-and-integrity\">Source &amp; integrity</a></nav></div></header>\
+         <main id=\"content\">{body}</main><footer class=\"site-footer\">Read-only local archive · \
+         Reader styles and other page assets are bundled for offline use.</footer></body></html>",
         escape_html(title),
     );
     secured_response(status, "text/html; charset=utf-8", document)
@@ -792,7 +1164,14 @@ mod tests {
         let current_revision = RevisionId::new(1_300_000_001).expect("current revision");
         let title = PageTitle::new("Rust (programming language)").expect("title");
         let current_source = b"== Rust ==\nA [[systems programming language]] with \
-            [https://example.com external docs]. <script>alert('ignored')</script>";
+            [https://example.com external docs].<ref name=\"guide\">See the \
+            [https://example.com/guide reference guide].</ref> \
+            <script>alert('ignored')</script>\n\n\
+            {| class=\"wikitable\"\n\
+            ! Channel !! Purpose\n\
+            |-\n\
+            | Stable || Production use\n\
+            |}";
         library
             .capture_current_revision(
                 wiki_id,
@@ -937,6 +1316,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn article_renders_references_tables_and_context_navigation() {
+        let fixture = fixture();
+        let title = utf8_percent_encode(fixture.title.as_str(), NON_ALPHANUMERIC);
+        let (_, _, body) = response_text(
+            router(&fixture.root),
+            &format!("/wiki/{title}?wiki={}", fixture.wiki_id),
+        )
+        .await;
+
+        assert!(body.contains("class=\"context-nav\" aria-label=\"Article\""));
+        assert!(body.contains("aria-current=\"page\""));
+        assert!(body.contains(&format!(
+            "/page/{}/history?wiki={}",
+            fixture.page_id, fixture.wiki_id
+        )));
+        assert!(body.contains("class=\"table-scroll\""));
+        assert!(body.contains("aria-label=\"Article table\""));
+        assert!(body.contains("<th>Channel</th>"));
+        assert!(body.contains("class=\"footnote-reference\""));
+        assert!(body.contains("<h2>References</h2>"));
+        assert!(body.contains("reference guide"));
+    }
+
+    #[tokio::test]
+    async fn revision_views_link_adjacent_captures_parent_diff_and_article() {
+        let fixture = fixture();
+        let (_, _, current) = response_text(
+            router(&fixture.root),
+            &format!(
+                "/revision/{}?wiki={}",
+                fixture.current_revision, fixture.wiki_id
+            ),
+        )
+        .await;
+        assert!(current.contains("Older captured revision"));
+        assert!(current.contains("Compare with captured parent"));
+        assert!(current.contains(&diff_url(
+            fixture.older_revision,
+            fixture.current_revision,
+            fixture.wiki_id
+        )));
+        assert!(current.contains(&article_url(&fixture.title, fixture.wiki_id)));
+
+        let (_, _, older) = response_text(
+            router(&fixture.root),
+            &format!(
+                "/revision/{}?wiki={}",
+                fixture.older_revision, fixture.wiki_id
+            ),
+        )
+        .await;
+        assert!(older.contains("Newer captured revision"));
+    }
+
+    #[tokio::test]
+    async fn provenance_language_matches_the_verified_read_boundary() {
+        let fixture = fixture();
+        let title = utf8_percent_encode(fixture.title.as_str(), NON_ALPHANUMERIC);
+        let (_, _, article) = response_text(
+            router(&fixture.root),
+            &format!("/wiki/{title}?wiki={}", fixture.wiki_id),
+        )
+        .await;
+        assert!(article.contains("bytes were checked against"));
+        assert!(article.contains("does not verify that the content is true"));
+        assert!(article.contains("Licensing and attribution requirements depend on"));
+        assert!(!article.contains("verified as true"));
+
+        let (_, _, about) =
+            response_text(router(&fixture.root), "/about/source-and-integrity").await;
+        assert!(about.contains("not by itself a full-library or manifest-chain verification"));
+        assert!(about.contains("privacy, copyright, or safety obligations"));
+    }
+
+    #[tokio::test]
+    async fn reader_shell_is_responsive_accessible_and_uses_only_bundled_styles() {
+        let fixture = fixture();
+        let (_, _, home) = response_text(router(&fixture.root), "/").await;
+        assert!(home.contains("class=\"skip-link\" href=\"#content\""));
+        assert!(home.contains("<main id=\"content\">"));
+        assert!(home.contains("aria-label=\"Library\""));
+
+        let (_, _, css) = response_text(router(&fixture.root), "/assets/reader.css").await;
+        assert!(css.contains("@media (max-width: 44rem)"));
+        assert!(css.contains("@media (prefers-color-scheme: dark)"));
+        assert!(css.contains(".footnote-definition"));
+        assert!(!css.contains("url("));
+    }
+
+    #[test]
+    fn reference_rewrite_handles_nested_markdown_links_and_malformed_input() {
+        let markdown = "Text [ref: See [guide](https://example.test/a).]\n";
+        let rewritten = reader_markdown(markdown);
+        assert!(rewritten.contains("Text [^reader-reference-1]"));
+        assert!(rewritten.contains("## References"));
+        assert!(rewritten.contains("[^reader-reference-1]: See [guide](https://example.test/a)."));
+        assert_eq!(
+            reader_markdown("Text [ref: unfinished"),
+            "Text [ref: unfinished"
+        );
+    }
+
+    #[tokio::test]
     async fn offline_crawl_has_no_outbound_resource_requests() {
         let fixture = fixture();
         let mut pending = vec!["/".to_owned()];
@@ -978,6 +1460,44 @@ mod tests {
             serve(&fixture.root, address).await,
             Err(ServeError::NonLoopbackAddress(value)) if value == address
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ephemeral_reader_is_ready_and_shuts_down_gracefully() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        let fixture = fixture();
+        let reader = start_loopback(&fixture.root).await.expect("start reader");
+        let address = reader.address();
+        assert!(address.ip().is_loopback());
+        assert_ne!(address.port(), 0);
+        assert_eq!(reader.local_url(), format!("http://{address}/"));
+
+        let response = tokio::task::spawn_blocking(move || {
+            let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))
+                .expect("reader accepts connections once returned");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .expect("HTTP request");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("HTTP response");
+            response
+        })
+        .await
+        .expect("request task");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("Your offline encyclopedia"));
+
+        reader.shutdown().await.expect("graceful shutdown");
+        assert!(
+            TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_err(),
+            "listener remained reachable after shutdown completed"
+        );
     }
 
     fn attribute_values(document: &str, attribute: &str) -> Vec<String> {

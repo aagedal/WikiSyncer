@@ -1,14 +1,18 @@
 mod support;
 
 use support::{FixtureResponse, FixtureServer};
-use wikisync_core::{PageId, PageTitle, RevisionId, TitleSelection};
+use wikisync_core::{
+    CollectionBudget, CollectionRemovalPolicy, CollectionRule, HistoryPolicy, InclusionReason,
+    PageId, PageTitle, RevisionId, TitleSelection,
+};
 use wikisync_mediawiki::{ClientConfig, MediaWikiClient};
 use wikisync_search::{SearchIndex, SearchQuery, SqliteSearchIndex};
 use wikisync_store::{Library, SyncRunKind, SyncRunState};
 use wikisync_sync::{
-    CategoryPreviewError, CategoryPreviewLimits, ReconciliationLimits, capture_explicit_titles,
-    capture_revision_history, preview_category_selection, reconcile_collection_heads,
-    reconcile_collection_heads_with_limits,
+    CategoryPreviewError, CategoryPreviewLimits, ReconciliationLimits,
+    capture_committed_collection, capture_explicit_titles, capture_revision_history,
+    commit_collection_preview, parse_title_list, preview_category_selection,
+    preview_collection_rule, reconcile_collection_heads, reconcile_collection_heads_with_limits,
 };
 
 const TITLE_RESOLUTION: &str = include_str!("../../../fixtures/mediawiki/title-resolution.json");
@@ -23,6 +27,8 @@ const CATEGORY_MEMBERS_PAGE_2: &str =
     include_str!("../../../fixtures/mediawiki/category-members-page-2.json");
 const CATEGORY_MEMBERS_SUBCATEGORY: &str =
     include_str!("../../../fixtures/mediawiki/category-members-subcategory.json");
+const CATEGORY_MEMBERS_RUST: &str =
+    include_str!("../../../fixtures/mediawiki/category-members-rust.json");
 const RECONCILIATION_TITLE_RESOLUTION: &str =
     include_str!("../../../fixtures/mediawiki/reconciliation-title-resolution.json");
 const RECONCILIATION_REVISIONS: &str =
@@ -84,6 +90,14 @@ async fn category_preview_handles_continuation_recursion_cycles_and_deduplicatio
         ["Alpha", "Beta", "Gamma"]
     );
     assert!(preview.pages.iter().all(|page| page.namespace == 0));
+    assert_eq!(
+        preview
+            .pages
+            .iter()
+            .map(|page| (page.title.as_str(), page.category_depth))
+            .collect::<Vec<_>>(),
+        [("Alpha", 0), ("Beta", 0), ("Gamma", 1)]
+    );
     assert_eq!(library.collections().expect("collections"), before);
     assert!(
         library
@@ -224,6 +238,151 @@ async fn explicit_title_capture_is_durable_and_idempotent() {
     assert_eq!(requests.len(), 4);
     assert!(requests[0].contains("titles=Definitely+missing"));
     assert!(requests[1].contains("rvstartid=1300000001"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn title_list_preview_commit_and_capture_are_explicit_and_durable() {
+    let server = FixtureServer::start(vec![
+        FixtureResponse::json(TITLE_RESOLUTION),
+        FixtureResponse::json(RECONCILIATION_UNCHANGED_TITLE_RESOLUTION),
+        FixtureResponse::json(REVISION_CONTENT),
+    ]);
+    let client = MediaWikiClient::new(
+        ClientConfig::new(server.endpoint(), "WikiSyncer/0.1 title-list-test")
+            .expect("client configuration"),
+    )
+    .expect("client");
+    let directory = tempfile::tempdir().expect("temporary library");
+    let mut library = Library::open(directory.path()).expect("library");
+    let wiki_id = library
+        .register_wiki(server.endpoint(), "en")
+        .expect("wiki");
+    let selection = parse_title_list(
+        "Rust_programming_language\nDefinitely missing WikiSyncer fixture page\n",
+        10_000,
+    )
+    .expect("title list");
+    let rule = CollectionRule::TitleList(selection);
+    let preview = preview_collection_rule(&client, &rule, CategoryPreviewLimits::default())
+        .await
+        .expect("preview");
+    assert_eq!(preview.members.len(), 1);
+    assert_eq!(preview.missing_titles.len(), 1);
+    assert!(library.collections().unwrap().is_empty());
+
+    let collection_id = library
+        .create_collection(
+            wiki_id,
+            "Imported pages",
+            &rule,
+            HistoryPolicy::CurrentAndFuture,
+            CollectionBudget::unlimited(),
+            CollectionRemovalPolicy::StopTrackingRetainHistory,
+        )
+        .expect("collection");
+    let committed = commit_collection_preview(
+        &mut library,
+        collection_id,
+        &preview,
+        HistoryPolicy::CurrentAndFuture,
+        CollectionBudget::unlimited(),
+        CollectionRemovalPolicy::StopTrackingRetainHistory,
+    )
+    .expect("commit preview");
+    assert_eq!(committed.active_members, 1);
+    assert!(matches!(
+        library.resolved_collection_members(collection_id).unwrap()[0].inclusion_reason,
+        InclusionReason::TitleList(_)
+    ));
+
+    let captured = capture_committed_collection(&client, &mut library, collection_id)
+        .await
+        .expect("capture committed collection");
+    assert_eq!(captured.pages.len(), 1);
+    assert!(
+        library
+            .page(wiki_id, captured.pages[0].page_id)
+            .unwrap()
+            .is_some()
+    );
+    drop(library);
+    let reopened = Library::open(directory.path()).expect("reopen");
+    assert_eq!(
+        reopened
+            .resolved_collection_members(collection_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        reopened
+            .collection_pages(wiki_id, collection_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    server.finish();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn category_preview_commit_captures_members_with_category_reason() {
+    let server = FixtureServer::start(vec![
+        FixtureResponse::json(CATEGORY_MEMBERS_RUST),
+        FixtureResponse::json(RECONCILIATION_UNCHANGED_TITLE_RESOLUTION),
+        FixtureResponse::json(REVISION_CONTENT),
+    ]);
+    let client = MediaWikiClient::new(
+        ClientConfig::new(server.endpoint(), "WikiSyncer/0.1 category-commit-test")
+            .expect("client configuration"),
+    )
+    .expect("client");
+    let directory = tempfile::tempdir().expect("temporary library");
+    let mut library = Library::open(directory.path()).expect("library");
+    let wiki_id = library
+        .register_wiki(server.endpoint(), "en")
+        .expect("wiki");
+    let rule = CollectionRule::Category {
+        title: PageTitle::new("Category:Systems programming languages").unwrap(),
+        recursion_depth: 0,
+    };
+    let preview = preview_collection_rule(&client, &rule, CategoryPreviewLimits::default())
+        .await
+        .expect("category preview");
+    let collection_id = library
+        .create_collection(
+            wiki_id,
+            "Systems languages",
+            &rule,
+            HistoryPolicy::CurrentAndFuture,
+            CollectionBudget::unlimited(),
+            CollectionRemovalPolicy::StopTrackingRetainHistory,
+        )
+        .expect("collection");
+    commit_collection_preview(
+        &mut library,
+        collection_id,
+        &preview,
+        HistoryPolicy::CurrentAndFuture,
+        CollectionBudget::unlimited(),
+        CollectionRemovalPolicy::StopTrackingRetainHistory,
+    )
+    .expect("commit");
+    assert!(matches!(
+        library.resolved_collection_members(collection_id).unwrap()[0].inclusion_reason,
+        InclusionReason::Category { depth: 0, .. }
+    ));
+    let captured = capture_committed_collection(&client, &mut library, collection_id)
+        .await
+        .expect("capture category member");
+    assert_eq!(captured.pages.len(), 1);
+    assert_eq!(
+        library
+            .collection_pages(wiki_id, collection_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    server.finish();
 }
 
 #[tokio::test(flavor = "multi_thread")]

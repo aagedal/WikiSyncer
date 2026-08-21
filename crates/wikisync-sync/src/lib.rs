@@ -4,19 +4,22 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::str;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha1::{Digest, Sha1};
 use wikisync_core::{
-    CollectionId, MAIN_NAMESPACE, PageId, PageTitle, RevisionId, TitleSelection, WikiId,
+    CollectionBudget, CollectionId, CollectionRemovalPolicy, CollectionRule, HistoryPolicy,
+    InclusionReason, InvalidPageTitle, MAIN_NAMESPACE, PageId, PageTitle, RevisionId,
+    TitleSelection, WikiId,
 };
 use wikisync_mediawiki::{
-    CategoryMemberKind, ClientError, MediaWikiClient, PageHeadResolution, RevisionMetadata,
-    RevisionOrder, TitleResolution,
+    CategoryMemberKind, ClientError, MediaWikiClient, PageHeadResolution, ResolvedPage,
+    RevisionMetadata, RevisionOrder, TitleResolution,
 };
 use wikisync_search::{SearchDocument, SearchError, SearchIndex, SqliteSearchIndex};
 use wikisync_store::{
-    CurrentRevisionCapture, Library, ObjectId, RevisionCapture, StoreError, StoredPage,
-    SyncRunKind, SyncRunStatus,
+    CurrentRevisionCapture, Library, MembershipCommit, ObjectId, ResolvedCollectionMember,
+    RevisionCapture, StoreError, StoredPage, SyncRunKind, SyncRunStatus,
 };
 
 /// Default maximum subcategory depth accepted by one category preview.
@@ -30,6 +33,85 @@ pub const DEFAULT_MAX_PREVIEW_PAGES: usize = 10_000;
 
 /// Default maximum number of bounded MediaWiki responses consumed by one preview.
 pub const DEFAULT_MAX_PREVIEW_BATCHES: usize = 20_000;
+
+/// Default maximum number of unique titles accepted from one newline-delimited import.
+pub const DEFAULT_MAX_TITLE_LIST_TITLES: usize = 10_000;
+
+/// Parses a bounded newline-delimited title list without performing I/O.
+///
+/// Blank lines are ignored, duplicate titles are removed, and a UTF-8 byte-order
+/// mark is accepted at the beginning of the first line. The returned selection is
+/// ordered deterministically by [`PageTitle`].
+pub fn parse_title_list(source: &str, max_titles: usize) -> Result<TitleSelection, TitleListError> {
+    if max_titles == 0 {
+        return Err(TitleListError::InvalidLimit);
+    }
+    let mut titles = BTreeSet::new();
+    for (index, raw_line) in source.lines().enumerate() {
+        let raw_line = if index == 0 {
+            raw_line.strip_prefix('\u{feff}').unwrap_or(raw_line)
+        } else {
+            raw_line
+        };
+        if raw_line.trim().is_empty() {
+            continue;
+        }
+        let title = PageTitle::new(raw_line).map_err(|source| TitleListError::InvalidTitle {
+            line: index + 1,
+            source,
+        })?;
+        titles.insert(title);
+        if titles.len() > max_titles {
+            return Err(TitleListError::TitleLimitExceeded { limit: max_titles });
+        }
+    }
+    TitleSelection::new(titles).map_err(|_| TitleListError::Empty)
+}
+
+/// A validation failure while importing newline-delimited titles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TitleListError {
+    /// The caller supplied a zero title ceiling.
+    InvalidLimit,
+    /// The input contained no non-blank title.
+    Empty,
+    /// One line was not a valid MediaWiki title.
+    InvalidTitle {
+        /// One-based input line number.
+        line: usize,
+        /// Title validation failure.
+        source: InvalidPageTitle,
+    },
+    /// The unique-title ceiling was exceeded.
+    TitleLimitExceeded {
+        /// Configured maximum unique title count.
+        limit: usize,
+    },
+}
+
+impl fmt::Display for TitleListError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLimit => formatter.write_str("title-list limit must be greater than zero"),
+            Self::Empty => formatter.write_str("title list contains no titles"),
+            Self::InvalidTitle { line, source } => {
+                write!(formatter, "invalid title on line {line}: {source}")
+            }
+            Self::TitleLimitExceeded { limit } => {
+                write!(formatter, "title list exceeds its {limit}-title limit")
+            }
+        }
+    }
+}
+
+impl Error for TitleListError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidTitle { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// Resource bounds for recursive category selection preview.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +146,9 @@ pub struct CategoryPreviewPage {
     pub namespace: i32,
     /// Current canonical page title.
     pub title: PageTitle,
+    /// Minimum number of subcategory edges from the configured root, determined by
+    /// breadth-first traversal.
+    pub category_depth: u16,
 }
 
 /// One category actually enumerated while resolving a preview.
@@ -88,6 +173,169 @@ pub struct CategoryPreview {
     pub categories: Vec<PreviewedCategory>,
     /// Number of bounded MediaWiki responses consumed.
     pub batches: usize,
+}
+
+/// A complete, non-mutating collection-rule preview ready for explicit commitment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectionSelectionPreview {
+    /// Exact rule that was resolved.
+    pub rule: CollectionRule,
+    /// Stable resolved page identities and auditable inclusion reasons.
+    pub members: Vec<ResolvedCollectionMember>,
+    /// Fixed titles currently absent from the source.
+    pub missing_titles: Vec<PageTitle>,
+    /// Sum of source-declared current-revision sizes when every size was available.
+    pub predicted_canonical_bytes: Option<u64>,
+    /// Number of bounded category-member responses, or zero for title rules.
+    pub category_batches: usize,
+}
+
+/// Resolves any MVP collection rule without changing the library.
+pub async fn preview_collection_rule(
+    client: &MediaWikiClient,
+    rule: &CollectionRule,
+    limits: CategoryPreviewLimits,
+) -> Result<CollectionSelectionPreview, CollectionPreviewError> {
+    match rule {
+        CollectionRule::Category {
+            title,
+            recursion_depth,
+        } => {
+            let preview =
+                preview_category_selection(client, title, *recursion_depth, limits).await?;
+            Ok(CollectionSelectionPreview {
+                rule: rule.clone(),
+                members: preview
+                    .pages
+                    .into_iter()
+                    .map(|page| ResolvedCollectionMember {
+                        page_id: page.page_id,
+                        namespace: page.namespace,
+                        title: page.title,
+                        inclusion_reason: InclusionReason::Category {
+                            category: title.clone(),
+                            depth: page.category_depth,
+                        },
+                    })
+                    .collect(),
+                missing_titles: Vec::new(),
+                predicted_canonical_bytes: None,
+                category_batches: preview.batches,
+            })
+        }
+        CollectionRule::ExplicitTitles(selection) | CollectionRule::TitleList(selection) => {
+            let resolutions = client
+                .resolve_titles(&selection.iter().cloned().collect::<Vec<_>>())
+                .await?;
+            let mut members = Vec::new();
+            let mut missing_titles = Vec::new();
+            let mut predicted = Some(0_u64);
+            for resolution in resolutions {
+                match resolution {
+                    TitleResolution::Missing { title, .. } => missing_titles.push(title),
+                    TitleResolution::Found(page) => {
+                        predicted = predicted.and_then(|total| {
+                            page.current_revision
+                                .as_ref()
+                                .and_then(|revision| revision.size)
+                                .and_then(|size| total.checked_add(size))
+                        });
+                        let reason = match rule {
+                            CollectionRule::ExplicitTitles(_) => {
+                                InclusionReason::ExplicitTitle(page.title.clone())
+                            }
+                            CollectionRule::TitleList(_) => {
+                                InclusionReason::TitleList(page.title.clone())
+                            }
+                            CollectionRule::Category { .. } => unreachable!("matched title rule"),
+                        };
+                        members.push(ResolvedCollectionMember {
+                            page_id: page.page_id,
+                            namespace: page.namespace,
+                            title: page.title,
+                            inclusion_reason: reason,
+                        });
+                    }
+                }
+            }
+            members.sort_by_key(|member| member.page_id);
+            missing_titles.sort();
+            Ok(CollectionSelectionPreview {
+                rule: rule.clone(),
+                members,
+                missing_titles,
+                predicted_canonical_bytes: predicted,
+                category_batches: 0,
+            })
+        }
+    }
+}
+
+/// Commits a completed preview and all collection policy fields.
+///
+/// A preview that exceeds either hard budget is rejected before membership changes.
+pub fn commit_collection_preview(
+    library: &mut Library,
+    collection_id: CollectionId,
+    preview: &CollectionSelectionPreview,
+    history_policy: HistoryPolicy,
+    budget: CollectionBudget,
+    removal_policy: CollectionRemovalPolicy,
+) -> Result<MembershipCommit, StoreError> {
+    let page_count = u64::try_from(preview.members.len())
+        .map_err(|_| StoreError::InvalidConfig("collection preview is too large"))?;
+    library.set_collection_configuration(
+        collection_id,
+        &preview.rule,
+        history_policy,
+        budget,
+        removal_policy,
+    )?;
+    library.record_collection_estimate(
+        collection_id,
+        page_count,
+        preview.predicted_canonical_bytes,
+    )?;
+    library.commit_resolved_membership(collection_id, &preview.members)
+}
+
+/// A source or category-preview failure while resolving a collection rule.
+#[derive(Debug)]
+pub enum CollectionPreviewError {
+    /// Title resolution failed.
+    Source(ClientError),
+    /// Category traversal failed.
+    Category(CategoryPreviewError),
+}
+
+impl fmt::Display for CollectionPreviewError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(error) => error.fmt(formatter),
+            Self::Category(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for CollectionPreviewError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(error) => Some(error),
+            Self::Category(error) => Some(error),
+        }
+    }
+}
+
+impl From<ClientError> for CollectionPreviewError {
+    fn from(error: ClientError) -> Self {
+        Self::Source(error)
+    }
+}
+
+impl From<CategoryPreviewError> for CollectionPreviewError {
+    fn from(error: CategoryPreviewError) -> Self {
+        Self::Category(error)
+    }
 }
 
 /// Resolves a category recursively without changing a library or collection.
@@ -140,6 +388,7 @@ pub async fn preview_category_selection(
                             page_id: member.page_id,
                             namespace: MAIN_NAMESPACE,
                             title: member.title,
+                            category_depth: depth,
                         });
                     }
                     CategoryMemberKind::Subcategory if depth < recursion_depth => {
@@ -316,6 +565,17 @@ pub struct HistoryCaptureReport {
     pub revisions_reused: usize,
 }
 
+/// Initial capture outcome for one committed collection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BootstrapReport {
+    /// Completed durable bootstrap run and checkpoint state.
+    pub status: SyncRunStatus,
+    /// Current heads captured for committed members.
+    pub current: CaptureReport,
+    /// Aggregate historical work required by the configured policy.
+    pub history: HistoryCaptureReport,
+}
+
 /// Result of reconciling the durable heads selected by one collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReconciliationReport {
@@ -385,6 +645,15 @@ pub async fn capture_explicit_titles(
     collection_id: CollectionId,
     selection: &TitleSelection,
 ) -> Result<CaptureReport, CaptureError> {
+    if library.collection_configuration(collection_id)?.is_none() {
+        library.set_collection_configuration(
+            collection_id,
+            &CollectionRule::ExplicitTitles(selection.clone()),
+            HistoryPolicy::CurrentAndFuture,
+            CollectionBudget::unlimited(),
+            CollectionRemovalPolicy::StopTrackingRetainHistory,
+        )?;
+    }
     let titles = selection.iter().cloned().collect::<Vec<_>>();
     let resolutions = client.resolve_titles(&titles).await?;
     let mut search_index = SqliteSearchIndex::open(library)?;
@@ -400,78 +669,162 @@ pub async fn capture_explicit_titles(
                 report.missing_titles.push(title);
             }
             TitleResolution::Found(page) => {
-                let head = page
-                    .current_revision
-                    .ok_or(CaptureError::MissingCurrentRevision(page.page_id))?;
-                let content = client
-                    .revision_content(page.page_id, head.revision_id)
-                    .await?;
-                if content.metadata.revision_id != head.revision_id {
-                    return Err(CaptureError::RevisionIdentityChanged {
-                        expected: head.revision_id,
-                        actual: content.metadata.revision_id,
-                    });
-                }
-                validate_content(&content.metadata, &content.source)?;
-
-                let newly_captured = library
-                    .revision(wiki_id, content.metadata.revision_id)?
-                    .is_none();
-                let stored = library.capture_current_revision(
-                    wiki_id,
-                    collection_id,
-                    &CurrentRevisionCapture {
-                        page_id: page.page_id,
-                        namespace: page.namespace,
-                        title: &page.title,
-                        revision_id: content.metadata.revision_id,
-                        parent_id: content.metadata.parent_id,
-                        timestamp: &content.metadata.timestamp,
-                        author: content.metadata.user.as_deref(),
-                        author_id: content.metadata.user_id,
-                        comment: content.metadata.comment.as_deref(),
-                        minor: content.metadata.minor,
-                        upstream_sha1: content.metadata.sha1.as_deref(),
-                        content_model: content
-                            .metadata
-                            .content_model
-                            .as_deref()
-                            .expect("validated content model"),
-                        source: &content.source,
-                    },
-                )?;
-                let source = str::from_utf8(&content.source)
-                    .map_err(|_| CaptureError::InvalidUtf8(content.metadata.revision_id))?;
-                let search_content = wikisync_content::to_search_content(source);
-                let aliases = library
-                    .page_titles(wiki_id, page.page_id)?
-                    .into_iter()
-                    .filter(|title| title != &page.title)
-                    .map(PageTitle::into_string)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                search_index.index_document(&SearchDocument {
-                    wiki_id,
-                    page_id: page.page_id,
-                    revision_id: content.metadata.revision_id,
-                    title: &page.title,
-                    aliases: &aliases,
-                    headings: &search_content.headings,
-                    body: &search_content.body,
-                    categories: "",
-                    captions: "",
-                    transformer_version: search_content.transformer_version.as_str(),
-                })?;
-                report.pages.push(CapturedPage {
-                    page_id: page.page_id,
-                    revision_id: content.metadata.revision_id,
-                    content_object_id: stored.id,
-                    newly_captured,
-                });
+                report.pages.push(
+                    capture_resolved_page_head(
+                        client,
+                        library,
+                        &mut search_index,
+                        wiki_id,
+                        collection_id,
+                        page,
+                    )
+                    .await?,
+                );
             }
         }
     }
 
+    Ok(report)
+}
+
+async fn capture_resolved_page_head(
+    client: &MediaWikiClient,
+    library: &mut Library,
+    search_index: &mut SqliteSearchIndex,
+    wiki_id: WikiId,
+    collection_id: CollectionId,
+    page: ResolvedPage,
+) -> Result<CapturedPage, CaptureError> {
+    let head = page
+        .current_revision
+        .ok_or(CaptureError::MissingCurrentRevision(page.page_id))?;
+    let content = client
+        .revision_content(page.page_id, head.revision_id)
+        .await?;
+    if content.metadata.revision_id != head.revision_id {
+        return Err(CaptureError::RevisionIdentityChanged {
+            expected: head.revision_id,
+            actual: content.metadata.revision_id,
+        });
+    }
+    validate_content(&content.metadata, &content.source)?;
+
+    let newly_captured = library
+        .revision(wiki_id, content.metadata.revision_id)?
+        .is_none();
+    if newly_captured {
+        enforce_collection_byte_budget(library, collection_id, content.source.len() as u64)?;
+    }
+    let stored = library.capture_current_revision(
+        wiki_id,
+        collection_id,
+        &CurrentRevisionCapture {
+            page_id: page.page_id,
+            namespace: page.namespace,
+            title: &page.title,
+            revision_id: content.metadata.revision_id,
+            parent_id: content.metadata.parent_id,
+            timestamp: &content.metadata.timestamp,
+            author: content.metadata.user.as_deref(),
+            author_id: content.metadata.user_id,
+            comment: content.metadata.comment.as_deref(),
+            minor: content.metadata.minor,
+            upstream_sha1: content.metadata.sha1.as_deref(),
+            content_model: content
+                .metadata
+                .content_model
+                .as_deref()
+                .expect("validated content model"),
+            source: &content.source,
+        },
+    )?;
+    let source = str::from_utf8(&content.source)
+        .map_err(|_| CaptureError::InvalidUtf8(content.metadata.revision_id))?;
+    let search_content = wikisync_content::to_search_content(source);
+    let aliases = library
+        .page_titles(wiki_id, page.page_id)?
+        .into_iter()
+        .filter(|title| title != &page.title)
+        .map(PageTitle::into_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    search_index.index_document(&SearchDocument {
+        wiki_id,
+        page_id: page.page_id,
+        revision_id: content.metadata.revision_id,
+        title: &page.title,
+        aliases: &aliases,
+        headings: &search_content.headings,
+        body: &search_content.body,
+        categories: "",
+        captions: "",
+        transformer_version: search_content.transformer_version.as_str(),
+    })?;
+    Ok(CapturedPage {
+        page_id: page.page_id,
+        revision_id: content.metadata.revision_id,
+        content_object_id: stored.id,
+        newly_captured,
+    })
+}
+
+fn enforce_collection_byte_budget(
+    library: &Library,
+    collection_id: CollectionId,
+    additional_bytes: u64,
+) -> Result<(), StoreError> {
+    let Some(configuration) = library.collection_configuration(collection_id)? else {
+        return Err(StoreError::CollectionNotConfigured(collection_id));
+    };
+    let Some(limit) = configuration.budget.maximum_bytes() else {
+        return Ok(());
+    };
+    let current = library
+        .collection_estimate(collection_id)?
+        .current_canonical_bytes;
+    let estimated = current.saturating_add(additional_bytes);
+    if estimated > limit.get() {
+        return Err(StoreError::CollectionBudgetExceeded {
+            resource: "bytes",
+            limit: limit.get(),
+            estimated,
+        });
+    }
+    Ok(())
+}
+
+/// Captures current heads for every committed member by stable page identity.
+pub async fn capture_committed_collection(
+    client: &MediaWikiClient,
+    library: &mut Library,
+    collection_id: CollectionId,
+) -> Result<CaptureReport, CaptureError> {
+    let configuration = library
+        .collection_configuration(collection_id)?
+        .ok_or(StoreError::CollectionNotConfigured(collection_id))?;
+    let mut search_index = SqliteSearchIndex::open(library)?;
+    let mut report = CaptureReport {
+        pages: Vec::new(),
+        missing_titles: Vec::new(),
+    };
+    for member in library.resolved_collection_members(collection_id)? {
+        match client.resolve_page_head(member.page_id).await? {
+            PageHeadResolution::Found(page) => {
+                report.pages.push(
+                    capture_resolved_page_head(
+                        client,
+                        library,
+                        &mut search_index,
+                        configuration.wiki_id,
+                        collection_id,
+                        *page,
+                    )
+                    .await?,
+                );
+            }
+            PageHeadResolution::Missing { .. } => report.missing_titles.push(member.title),
+        }
+    }
     Ok(report)
 }
 
@@ -487,6 +840,26 @@ pub async fn capture_revision_history(
     wiki_id: WikiId,
     page_id: PageId,
 ) -> Result<HistoryCaptureReport, CaptureError> {
+    capture_revision_history_with_policy(
+        client,
+        library,
+        wiki_id,
+        None,
+        page_id,
+        HistoryPolicy::Complete,
+    )
+    .await
+}
+
+/// Captures the bounded history selected by one collection policy.
+pub async fn capture_revision_history_with_policy(
+    client: &MediaWikiClient,
+    library: &mut Library,
+    wiki_id: WikiId,
+    collection_id: Option<CollectionId>,
+    page_id: PageId,
+    policy: HistoryPolicy,
+) -> Result<HistoryCaptureReport, CaptureError> {
     if library.page(wiki_id, page_id)?.is_none() {
         return Err(StoreError::PageNotFound { wiki_id, page_id }.into());
     }
@@ -497,15 +870,34 @@ pub async fn capture_revision_history(
         revisions_captured: 0,
         revisions_reused: 0,
     };
+    if policy == HistoryPolicy::CurrentAndFuture {
+        return Ok(report);
+    }
     let mut continuation = None;
+    let mut selected = 0_u32;
+    let mut complete = false;
     loop {
         let batch = client
             .revision_batch(page_id, RevisionOrder::NewestFirst, continuation.as_ref())
             .await?;
         report.batches += 1;
-        report.revisions_enumerated += batch.revisions.len();
 
         for metadata in batch.revisions {
+            let include = match policy {
+                HistoryPolicy::CurrentAndFuture => false,
+                HistoryPolicy::LastN(limit) => selected < limit.get(),
+                HistoryPolicy::Since(since) => {
+                    parse_mediawiki_timestamp(&metadata.timestamp, metadata.revision_id)?
+                        >= since.as_seconds()
+                }
+                HistoryPolicy::Complete => true,
+            };
+            if !include {
+                complete = true;
+                break;
+            }
+            selected = selected.saturating_add(1);
+            report.revisions_enumerated += 1;
             if let Some(existing) = library.revision(wiki_id, metadata.revision_id)? {
                 if existing.page_id != page_id
                     || existing.parent_id != metadata.parent_id
@@ -530,6 +922,13 @@ pub async fn capture_revision_history(
                 });
             }
             validate_content(&content.metadata, &content.source)?;
+            if let Some(collection_id) = collection_id {
+                enforce_collection_byte_budget(
+                    library,
+                    collection_id,
+                    content.source.len() as u64,
+                )?;
+            }
             let model = content
                 .metadata
                 .content_model
@@ -554,12 +953,177 @@ pub async fn capture_revision_history(
             report.revisions_captured += 1;
         }
 
+        if complete {
+            break;
+        }
         continuation = batch.continuation;
         if continuation.is_none() {
             break;
         }
     }
     Ok(report)
+}
+
+/// Captures current heads and configured history for every committed member.
+pub async fn bootstrap_collection(
+    client: &MediaWikiClient,
+    library: &mut Library,
+    collection_id: CollectionId,
+) -> Result<BootstrapReport, CaptureError> {
+    let configuration = library
+        .collection_configuration(collection_id)?
+        .ok_or(StoreError::CollectionNotConfigured(collection_id))?;
+    let checkpoint_candidate = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| StoreError::ClockBeforeUnixEpoch)?
+        .as_secs();
+    let started = library.start_or_resume_sync_run(
+        configuration.wiki_id,
+        Some(collection_id),
+        SyncRunKind::Bootstrap,
+        checkpoint_candidate,
+    )?;
+    let run_id = started.status.run_id;
+    for member in library.resolved_collection_members(collection_id)? {
+        library.enqueue_sync_job(
+            run_id,
+            &format!("bootstrap-page:{}", member.page_id),
+            "bootstrap-page",
+            Some(&member.page_id.to_string()),
+        )?;
+    }
+    let mut current = CaptureReport {
+        pages: Vec::new(),
+        missing_titles: Vec::new(),
+    };
+    let mut history = HistoryCaptureReport {
+        batches: 0,
+        revisions_enumerated: 0,
+        revisions_captured: 0,
+        revisions_reused: 0,
+    };
+    let mut search_index = SqliteSearchIndex::open(library)?;
+    while let Some(job) = library.claim_next_sync_job(run_id)? {
+        let result: Result<
+            (
+                Option<CapturedPage>,
+                Option<PageTitle>,
+                HistoryCaptureReport,
+            ),
+            CaptureError,
+        > = async {
+            let page_id = job
+                .subject
+                .as_deref()
+                .ok_or(CaptureError::InvalidBootstrapJob)?
+                .parse::<u64>()
+                .ok()
+                .and_then(|value| PageId::new(value).ok())
+                .ok_or(CaptureError::InvalidBootstrapJob)?;
+            let member = library
+                .resolved_collection_members(collection_id)?
+                .into_iter()
+                .find(|member| member.page_id == page_id)
+                .ok_or(CaptureError::InvalidBootstrapJob)?;
+            match client.resolve_page_head(page_id).await? {
+                PageHeadResolution::Missing { .. } => Ok((
+                    None,
+                    Some(member.title),
+                    HistoryCaptureReport {
+                        batches: 0,
+                        revisions_enumerated: 0,
+                        revisions_captured: 0,
+                        revisions_reused: 0,
+                    },
+                )),
+                PageHeadResolution::Found(page) => {
+                    let captured = capture_resolved_page_head(
+                        client,
+                        library,
+                        &mut search_index,
+                        configuration.wiki_id,
+                        collection_id,
+                        *page,
+                    )
+                    .await?;
+                    let page_history = capture_revision_history_with_policy(
+                        client,
+                        library,
+                        configuration.wiki_id,
+                        Some(collection_id),
+                        captured.page_id,
+                        configuration.history_policy,
+                    )
+                    .await?;
+                    Ok((Some(captured), None, page_history))
+                }
+            }
+        }
+        .await;
+        match result {
+            Ok((captured, missing, page_history)) => {
+                library.complete_sync_job(job.job_id)?;
+                current.pages.extend(captured);
+                current.missing_titles.extend(missing);
+                history.batches += page_history.batches;
+                history.revisions_enumerated += page_history.revisions_enumerated;
+                history.revisions_captured += page_history.revisions_captured;
+                history.revisions_reused += page_history.revisions_reused;
+            }
+            Err(error) => {
+                let retryable = error.is_retryable();
+                library.fail_sync_job(job.job_id, error.code(), &error.to_string(), retryable)?;
+                if !retryable {
+                    library.cancel_sync_run(run_id)?;
+                }
+                return Err(error);
+            }
+        }
+    }
+    let status = library.complete_sync_run(run_id, None)?;
+    Ok(BootstrapReport {
+        status,
+        current,
+        history,
+    })
+}
+
+fn parse_mediawiki_timestamp(value: &str, revision_id: RevisionId) -> Result<i64, CaptureError> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return Err(CaptureError::InvalidTimestamp(revision_id));
+    }
+    let number =
+        |start: usize, end: usize| -> Option<i64> { value.get(start..end)?.parse::<i64>().ok() };
+    let year = number(0, 4).ok_or(CaptureError::InvalidTimestamp(revision_id))?;
+    let month = number(5, 7).ok_or(CaptureError::InvalidTimestamp(revision_id))?;
+    let day = number(8, 10).ok_or(CaptureError::InvalidTimestamp(revision_id))?;
+    let hour = number(11, 13).ok_or(CaptureError::InvalidTimestamp(revision_id))?;
+    let minute = number(14, 16).ok_or(CaptureError::InvalidTimestamp(revision_id))?;
+    let second = number(17, 19).ok_or(CaptureError::InvalidTimestamp(revision_id))?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return Err(CaptureError::InvalidTimestamp(revision_id));
+    }
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Ok(days * 86_400 + hour * 3_600 + minute * 60 + second)
 }
 
 /// Reconciles every currently selected page against its remote head.
@@ -709,6 +1273,7 @@ async fn reconcile_page_head(
                 client,
                 library,
                 wiki_id,
+                collection_id,
                 page.page_id,
                 &head,
                 &durable_tip,
@@ -742,6 +1307,7 @@ async fn stream_forward_gap(
     client: &MediaWikiClient,
     library: &mut Library,
     wiki_id: WikiId,
+    collection_id: CollectionId,
     page_id: PageId,
     remote_head: &RevisionMetadata,
     durable_tip: &wikisync_store::StoredRevision,
@@ -811,6 +1377,11 @@ async fn stream_forward_gap(
                     });
                 }
                 validate_content(&content.metadata, &content.source)?;
+                enforce_collection_byte_budget(
+                    library,
+                    collection_id,
+                    content.source.len() as u64,
+                )?;
                 library.capture_revision(
                     wiki_id,
                     page_id,
@@ -996,6 +1567,8 @@ pub enum CaptureError {
     MissingCurrentRevision(PageId),
     /// A durable reconciliation job did not contain a valid page identity.
     InvalidReconciliationJob,
+    /// A durable bootstrap job did not contain a committed page identity.
+    InvalidBootstrapJob,
     /// The caller supplied a zero reconciliation ceiling.
     InvalidReconciliationLimits,
     /// A selected page did not have a durable local head to reconcile from.
@@ -1020,6 +1593,8 @@ pub enum CaptureError {
     },
     /// Canonical wikitext was not valid UTF-8.
     InvalidUtf8(RevisionId),
+    /// MediaWiki returned a revision timestamp outside its required UTC format.
+    InvalidTimestamp(RevisionId),
     /// The exact-content request returned another revision than title resolution.
     RevisionIdentityChanged {
         /// Head revision selected during title resolution.
@@ -1075,6 +1650,9 @@ impl fmt::Display for CaptureError {
             Self::InvalidReconciliationJob => {
                 formatter.write_str("durable reconciliation job has an invalid page subject")
             }
+            Self::InvalidBootstrapJob => {
+                formatter.write_str("durable bootstrap job has an invalid page subject")
+            }
             Self::InvalidReconciliationLimits => formatter
                 .write_str("reconciliation batch and revision limits must be greater than zero"),
             Self::MissingLocalPageHead(page_id) => {
@@ -1105,6 +1683,10 @@ impl fmt::Display for CaptureError {
                     "revision {revision_id} source is not valid UTF-8"
                 )
             }
+            Self::InvalidTimestamp(revision_id) => write!(
+                formatter,
+                "revision {revision_id} returned an invalid MediaWiki UTC timestamp"
+            ),
             Self::RevisionIdentityChanged { expected, actual } => write!(
                 formatter,
                 "resolved revision {expected}, but source content belonged to {actual}"
@@ -1154,12 +1736,14 @@ impl CaptureError {
             Self::Store(_) => "local-store",
             Self::Search(_) => "search-index",
             Self::InvalidReconciliationJob => "invalid-reconciliation-job",
+            Self::InvalidBootstrapJob => "invalid-bootstrap-job",
             Self::InvalidReconciliationLimits => "invalid-reconciliation-limits",
             Self::MissingLocalPageHead(_) => "missing-local-page-head",
             Self::ReconciliationLimitExceeded { .. } => "reconciliation-limit",
             Self::MissingCurrentRevision(_) => "page-head-unavailable",
             Self::RevisionChainDisconnected { .. } => "revision-chain-disconnected",
             Self::InvalidUtf8(_)
+            | Self::InvalidTimestamp(_)
             | Self::RevisionIdentityChanged { .. }
             | Self::RevisionMetadataConflict { .. }
             | Self::MissingContentModel(_)
@@ -1229,6 +1813,29 @@ mod tests {
     }
 
     #[test]
+    fn title_list_import_is_bounded_deduplicated_and_line_aware() {
+        let selection =
+            parse_title_list("\u{feff}Rust\r\n\n Ferris \nRust\n", 2).expect("bounded title list");
+        assert_eq!(
+            selection.iter().map(PageTitle::as_str).collect::<Vec<_>>(),
+            ["Ferris", "Rust"]
+        );
+        assert_eq!(
+            parse_title_list("Rust\nFerris\nCargo\n", 2),
+            Err(TitleListError::TitleLimitExceeded { limit: 2 })
+        );
+        assert!(matches!(
+            parse_title_list("Rust\nunsafe\ttitle\n", 10),
+            Err(TitleListError::InvalidTitle { line: 2, .. })
+        ));
+        assert_eq!(parse_title_list("\n \n", 10), Err(TitleListError::Empty));
+        assert_eq!(
+            parse_title_list("Rust", 0),
+            Err(TitleListError::InvalidLimit)
+        );
+    }
+
+    #[test]
     fn validates_mediawiki_base36_sha1() {
         let source = b"== Rust ==\nA systems programming language.";
         assert_eq!(mediawiki_sha1(source), "mz6rzjalvs99ygh9s19aseznld8m1pu");
@@ -1248,6 +1855,23 @@ mod tests {
         assert!(matches!(
             validate_content(&metadata, b"changed"),
             Err(CaptureError::Sha1Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn mediawiki_timestamps_map_to_unix_seconds() {
+        let revision_id = RevisionId::new(1).unwrap();
+        assert_eq!(
+            parse_mediawiki_timestamp("1970-01-01T00:00:00Z", revision_id).unwrap(),
+            0
+        );
+        assert_eq!(
+            parse_mediawiki_timestamp("2024-02-29T12:34:56Z", revision_id).unwrap(),
+            1_709_210_096
+        );
+        assert!(matches!(
+            parse_mediawiki_timestamp("not-a-timestamp", revision_id),
+            Err(CaptureError::InvalidTimestamp(_))
         ));
     }
 }

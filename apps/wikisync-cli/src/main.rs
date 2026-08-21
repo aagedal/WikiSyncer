@@ -159,6 +159,7 @@ fn category_preview(
                 "page_id": page.page_id.get(),
                 "namespace": page.namespace,
                 "title": page.title.as_str(),
+                "category_depth": page.category_depth,
             })).collect::<Vec<_>>(),
         }))?;
     } else {

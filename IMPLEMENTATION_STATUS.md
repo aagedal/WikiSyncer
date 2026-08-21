@@ -52,39 +52,38 @@ Updated: 2026-08-21
     packed reads with loose-copy fallback; safe loose pruning; tamper detection for
     pack payloads, indexes, and database pointers; and repacking that retains the old
     generation until every replacement object is verified.
+13. Category recursion, long-gap recovery, and the Iced GUI through the Milestone 3
+    gate, including:
 
-## In-progress backlog item
+    - bounded deterministic title/category previews and explicit schema-backed commit;
+      durable inclusion reasons, title normalization, retained-history category
+      removal, estimates, and hard page/canonical-byte budgets;
+    - policy-aware, resumable per-page bootstrap for current-and-future, last-N,
+      since-date, and complete history plus stable-page-ID long-gap reconciliation
+      that captures every intermediate revision before advancing its checkpoint;
+    - an Iced workflow for privacy-aware library setup, title-list/category selection,
+      preview and estimates, history and budget configuration, create-and-sync,
+      per-collection update, synchronization status, full logical-object verification,
+      and managed offline-reader launch;
+    - a responsive offline-only reader with semantic references, accessible tables and
+      diffs, article/history/revision navigation, accurate capture/integrity language,
+      and graceful ephemeral loopback lifecycle; and
+    - a fixture-backed headless gate test that creates and synchronizes a collection,
+      captures a multi-revision update, verifies the complete logical-object catalog,
+      and starts/stops the reader without using the CLI.
 
-13. Category recursion, long-gap recovery, and the Iced GUI are underway. The first
-    implementation slices now include:
+## Milestone 3 gate
 
-    - A bounded, non-mutating category preview with MediaWiki continuation,
-      main-namespace filtering, breadth-first subcategory recursion, cycle and
-      duplicate handling, deterministic output, and a standalone human/JSON CLI.
-    - Durable collection-head reconciliation by stable page ID, including moved-title
-      updates, retained missing-page history, bounded forward gap capture from the
-      newest durable revision, resumable partial progress, current-search refresh,
-      and checkpoint advancement only after every page job succeeds.
-    - An initial Iced application with first-run privacy/storage acknowledgement,
-      library creation/opening, collection and revision overview, empty collection
-      creation through shared store services, synchronization status, and bounded
-      recent-object verification. Background results are scoped to their originating
-      library, and MediaWiki endpoints are validated before configuration is stored.
-    - User-only Unix permissions for library directories and SQLite/object files,
-      applied centrally by the store for GUI, CLI, and daemon callers.
-
-    This backlog item is not complete. Category rules and resolved inclusion reasons
-    still need schema-backed persistence and article capture; title-list import,
-    estimates, budgets, policy editing, sync controls, scheduling, reader launching,
-    deletion/restoration log semantics, and full integrity verification are not yet
-    exposed through the GUI.
+Passed on 2026-08-21. A nontechnical user can create, preview, synchronize, browse,
+verify, and update a collection from Iced without using the CLI. Routine tests remain
+offline and fixture-backed. Scheduling and the single-writer daemon remain Milestone 4
+work; optional media and periodic dynamic-category reconciliation remain stable-v1
+work as specified by the plan.
 
 ## Next checkpoint
 
-Persist category collection rules and previewed membership with an explicit commit
-step, then capture those pages through the existing synchronization services. Add
-newline-delimited title-list import in the same collection-service layer before
-expanding the GUI editor.
+Begin Milestone 4 with the single-writer daemon and explicit GUI/CLI forwarding
+contract before adding scheduling or service installation.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening

@@ -10,3 +10,8 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[dependencies]
+wikisync-store = { path = "../wikisync-store" }
+
+[dev-dependencies]
+tempfile = "3.20"

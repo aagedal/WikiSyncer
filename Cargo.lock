@@ -3586,14 +3586,22 @@ version = "0.1.0"
 dependencies = [
  "iced",
  "tempfile",
+ "tokio",
  "wikisync-core",
+ "wikisync-integrity",
  "wikisync-mediawiki",
  "wikisync-store",
+ "wikisync-sync",
+ "wikisync-web",
 ]
 
 [[package]]
 name = "wikisync-integrity"
 version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "wikisync-store",
+]
 
 [[package]]
 name = "wikisync-mediawiki"

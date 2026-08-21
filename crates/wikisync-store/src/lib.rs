@@ -4,7 +4,7 @@
 //! are compressed into a temporary file, made durable, and atomically installed
 //! before the SQLite transaction records their location.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -17,13 +17,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use wikisync_core::{CollectionId, PageId, PageTitle, RevisionId, WikiId};
+use wikisync_core::{
+    CollectionBudget, CollectionId, CollectionRemovalPolicy, CollectionRule, HistoryPolicy,
+    InclusionReason, PageId, PageTitle, RevisionId, TitleSelection, UnixTimestamp, WikiId,
+};
 
 const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
 const MIGRATION_2: &str = include_str!("../migrations/0002_capture.sql");
 const MIGRATION_3: &str = include_str!("../migrations/0003_search.sql");
 const MIGRATION_4: &str = include_str!("../migrations/0004_sync.sql");
 const MIGRATION_5: &str = include_str!("../migrations/0005_packs.sql");
+const MIGRATION_6: &str = include_str!("../migrations/0006_collections.sql");
 const OBJECT_DOMAIN: &[u8] = b"wikisync-object-v1\0";
 const DATABASE_NAME: &str = "library.sqlite3";
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
@@ -369,6 +373,117 @@ pub struct StoredCollection {
     pub name: String,
     /// Number of currently resolved pages in the collection.
     pub page_count: u64,
+}
+
+/// A configured MediaWiki source available to collection and GUI services.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredWiki {
+    /// Stable local identity.
+    pub wiki_id: WikiId,
+    /// MediaWiki Action API endpoint.
+    pub api_endpoint: String,
+    /// User-facing source language code.
+    pub language_code: String,
+}
+
+/// Complete persisted collection selection and retention configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredCollectionConfiguration {
+    /// Stable local collection identity.
+    pub collection_id: CollectionId,
+    /// Source wiki identity.
+    pub wiki_id: WikiId,
+    /// User-visible name.
+    pub name: String,
+    /// Rule committed after any potentially large preview.
+    pub rule: CollectionRule,
+    /// Public revision-history capture policy.
+    pub history_policy: HistoryPolicy,
+    /// Hard collection limits.
+    pub budget: CollectionBudget,
+    /// Non-destructive behavior for pages removed by a dynamic rule.
+    pub removal_policy: CollectionRemovalPolicy,
+}
+
+/// One stable page identity returned by a completed collection-rule preview.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedCollectionMember {
+    /// Remote stable page identity.
+    pub page_id: PageId,
+    /// MediaWiki namespace number.
+    pub namespace: i32,
+    /// Canonical title observed during resolution.
+    pub title: PageTitle,
+    /// Auditable reason this rule included the page.
+    pub inclusion_reason: InclusionReason,
+}
+
+/// Result of atomically replacing resolved membership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MembershipCommit {
+    /// Active members after the commit.
+    pub active_members: u64,
+    /// Former active members newly marked removed by this commit.
+    pub removed_members: u64,
+}
+
+/// Current collection size information for budget decisions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollectionEstimate {
+    /// Active stable page identities in the most recently committed resolution.
+    pub resolved_page_count: u64,
+    /// Deduplicated canonical bytes already captured for active member pages.
+    pub current_canonical_bytes: u64,
+    /// Optional pre-capture prediction supplied by a resolver.
+    pub predicted_canonical_bytes: Option<u64>,
+    /// Unix time of the resolver prediction, when one has been recorded.
+    pub predicted_at: Option<u64>,
+}
+
+impl CollectionEstimate {
+    /// Uses a prediction when available, but never reports less than already captured.
+    #[must_use]
+    pub fn expected_canonical_bytes(self) -> u64 {
+        self.predicted_canonical_bytes
+            .map_or(self.current_canonical_bytes, |predicted| {
+                predicted.max(self.current_canonical_bytes)
+            })
+    }
+}
+
+/// Logical object metadata used by paginated full-integrity verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogicalObject {
+    /// Stable logical identity, kind, and uncompressed length.
+    pub object: StoredObject,
+    /// Persisted MIME type.
+    pub media_type: String,
+    /// Persisted metadata verification state.
+    pub verification_state: ObjectVerificationState,
+}
+
+/// Persisted logical-object verification state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectVerificationState {
+    /// Installation or verification is not complete.
+    Pending,
+    /// Canonical bytes were verified when recorded.
+    Verified,
+    /// A prior verification detected corruption.
+    Corrupt,
+}
+
+impl ObjectVerificationState {
+    fn from_database(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "verified" => Ok(Self::Verified),
+            "corrupt" => Ok(Self::Corrupt),
+            _ => Err(StoreError::CorruptMetadata(
+                "unknown object verification state",
+            )),
+        }
+    }
 }
 
 /// The source-level operation represented by a durable synchronization run.
@@ -796,6 +911,50 @@ impl Library {
         sql_id(raw_id, "invalid wiki ID")
     }
 
+    /// Looks up one configured source without exposing the SQLite connection.
+    pub fn wiki(&self, wiki_id: WikiId) -> Result<Option<StoredWiki>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT api_endpoint, language_code FROM wikis WHERE wiki_id = ?1",
+                [to_sql_integer(wiki_id.get())?],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(|(api_endpoint, language_code)| {
+                Ok(StoredWiki {
+                    wiki_id,
+                    api_endpoint,
+                    language_code,
+                })
+            })
+            .transpose()
+    }
+
+    /// Lists configured sources in stable identity order.
+    pub fn wikis(&self) -> Result<Vec<StoredWiki>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT wiki_id, api_endpoint, language_code FROM wikis ORDER BY wiki_id")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(wiki_id, api_endpoint, language_code)| {
+                Ok(StoredWiki {
+                    wiki_id: sql_id(wiki_id, "invalid wiki ID")?,
+                    api_endpoint,
+                    language_code,
+                })
+            })
+            .collect()
+    }
+
     /// Creates or reopens an explicit-title, current-and-future collection.
     pub fn create_explicit_collection(
         &mut self,
@@ -819,7 +978,241 @@ impl Library {
             params![to_sql_integer(wiki_id.get())?, name],
             |row| row.get(0),
         )?;
-        sql_id(raw_id, "invalid collection ID")
+        let collection_id: CollectionId = sql_id(raw_id, "invalid collection ID")?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO collection_configuration (
+                collection_id, rule_kind, category_title, category_recursion_depth,
+                history_kind, history_value, maximum_pages, maximum_bytes,
+                removal_policy, updated_at
+             ) VALUES (?1, 'explicit-titles', NULL, NULL,
+                       'current-and-future', NULL, NULL, NULL,
+                       'stop-tracking-retain-history', ?2)",
+            params![to_sql_integer(collection_id.get())?, now],
+        )?;
+        Ok(collection_id)
+    }
+
+    /// Creates or reopens a collection and atomically commits its complete policy.
+    pub fn create_collection(
+        &mut self,
+        wiki_id: WikiId,
+        name: &str,
+        rule: &CollectionRule,
+        history_policy: HistoryPolicy,
+        budget: CollectionBudget,
+        removal_policy: CollectionRemovalPolicy,
+    ) -> Result<CollectionId, StoreError> {
+        let collection_id = self.create_explicit_collection(wiki_id, name)?;
+        self.set_collection_configuration(
+            collection_id,
+            rule,
+            history_policy,
+            budget,
+            removal_policy,
+        )?;
+        Ok(collection_id)
+    }
+
+    /// Atomically replaces a collection rule and its persisted policy fields.
+    ///
+    /// This commits only configuration. Potentially large resolved membership is
+    /// committed separately with [`Self::commit_resolved_membership`] after preview.
+    pub fn set_collection_configuration(
+        &mut self,
+        collection_id: CollectionId,
+        rule: &CollectionRule,
+        history_policy: HistoryPolicy,
+        budget: CollectionBudget,
+        removal_policy: CollectionRemovalPolicy,
+    ) -> Result<(), StoreError> {
+        let now = unix_time()?;
+        let raw_collection_id = to_sql_integer(collection_id.get())?;
+        let (rule_kind, category_title, category_depth) = collection_rule_values(rule);
+        let (history_kind, history_value) = history_policy_values(history_policy)?;
+        let maximum_pages = budget
+            .maximum_pages()
+            .map(|value| to_sql_integer(value.get()))
+            .transpose()?;
+        let maximum_bytes = budget
+            .maximum_bytes()
+            .map(|value| to_sql_integer(value.get()))
+            .transpose()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS (SELECT 1 FROM collections WHERE collection_id = ?1)",
+            [raw_collection_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::CollectionNotFound(collection_id));
+        }
+        transaction.execute(
+            "INSERT INTO collection_configuration (
+                collection_id, rule_kind, category_title, category_recursion_depth,
+                history_kind, history_value, maximum_pages, maximum_bytes,
+                removal_policy, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(collection_id) DO UPDATE SET
+                rule_kind = excluded.rule_kind,
+                category_title = excluded.category_title,
+                category_recursion_depth = excluded.category_recursion_depth,
+                history_kind = excluded.history_kind,
+                history_value = excluded.history_value,
+                maximum_pages = excluded.maximum_pages,
+                maximum_bytes = excluded.maximum_bytes,
+                removal_policy = excluded.removal_policy,
+                updated_at = excluded.updated_at",
+            params![
+                raw_collection_id,
+                rule_kind,
+                category_title,
+                category_depth,
+                history_kind,
+                history_value,
+                maximum_pages,
+                maximum_bytes,
+                removal_policy_value(removal_policy),
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM collection_rule_titles WHERE collection_id = ?1",
+            [raw_collection_id],
+        )?;
+        if let Some(titles) = rule.titles() {
+            for title in titles.iter() {
+                transaction.execute(
+                    "INSERT INTO collection_rule_titles (collection_id, title)
+                     VALUES (?1, ?2)",
+                    params![raw_collection_id, title.as_str()],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Reads a committed configuration; an old empty draft returns `None`.
+    pub fn collection_configuration(
+        &self,
+        collection_id: CollectionId,
+    ) -> Result<Option<StoredCollectionConfiguration>, StoreError> {
+        let raw_collection_id = to_sql_integer(collection_id.get())?;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT collections.wiki_id, collections.name,
+                        config.rule_kind, config.category_title,
+                        config.category_recursion_depth, config.history_kind,
+                        config.history_value, config.maximum_pages,
+                        config.maximum_bytes, config.removal_policy
+                 FROM collections
+                 JOIN collection_configuration AS config USING (collection_id)
+                 WHERE collections.collection_id = ?1",
+                [raw_collection_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            raw_wiki_id,
+            name,
+            rule_kind,
+            category_title,
+            category_depth,
+            history_kind,
+            history_value,
+            maximum_pages,
+            maximum_bytes,
+            removal_policy,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let rule = self.stored_collection_rule(
+            raw_collection_id,
+            &rule_kind,
+            category_title,
+            category_depth,
+        )?;
+        let Some(rule) = rule else {
+            return Ok(None);
+        };
+        Ok(Some(StoredCollectionConfiguration {
+            collection_id,
+            wiki_id: sql_id(raw_wiki_id, "invalid wiki ID")?,
+            name,
+            rule,
+            history_policy: stored_history_policy(&history_kind, history_value)?,
+            budget: stored_collection_budget(maximum_pages, maximum_bytes)?,
+            removal_policy: stored_removal_policy(&removal_policy)?,
+        }))
+    }
+
+    fn stored_collection_rule(
+        &self,
+        raw_collection_id: i64,
+        kind: &str,
+        category_title: Option<String>,
+        category_depth: Option<i64>,
+    ) -> Result<Option<CollectionRule>, StoreError> {
+        match kind {
+            "explicit-titles" | "title-list" => {
+                let mut statement = self.connection.prepare(
+                    "SELECT title FROM collection_rule_titles
+                     WHERE collection_id = ?1 ORDER BY title",
+                )?;
+                let raw_titles = statement
+                    .query_map([raw_collection_id], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                if raw_titles.is_empty() {
+                    return Ok(None);
+                }
+                let titles = raw_titles
+                    .into_iter()
+                    .map(|title| {
+                        PageTitle::new(title).map_err(|_| {
+                            StoreError::CorruptMetadata("invalid configured page title")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let selection = TitleSelection::new(titles)
+                    .map_err(|_| StoreError::CorruptMetadata("empty configured title rule"))?;
+                Ok(Some(if kind == "explicit-titles" {
+                    CollectionRule::ExplicitTitles(selection)
+                } else {
+                    CollectionRule::TitleList(selection)
+                }))
+            }
+            "category" => {
+                let title = category_title
+                    .ok_or(StoreError::CorruptMetadata("category rule lacks title"))?;
+                let depth = category_depth
+                    .ok_or(StoreError::CorruptMetadata("category rule lacks depth"))?;
+                Ok(Some(CollectionRule::Category {
+                    title: PageTitle::new(title)
+                        .map_err(|_| StoreError::CorruptMetadata("invalid category title"))?,
+                    recursion_depth: u16::try_from(depth).map_err(|_| {
+                        StoreError::CorruptMetadata("invalid category recursion depth")
+                    })?,
+                }))
+            }
+            _ => Err(StoreError::CorruptMetadata("unknown collection rule kind")),
+        }
     }
 
     /// Records a title that MediaWiki currently reports as missing.
@@ -867,6 +1260,289 @@ impl Library {
                     .map_err(|_| StoreError::CorruptMetadata("invalid unresolved page title"))
             })
             .collect()
+    }
+
+    /// Atomically commits a fully resolved rule preview as active membership.
+    ///
+    /// Members need not have captured revisions yet. Stable page IDs, titles,
+    /// namespaces, and inclusion reasons become durable together; the prior active
+    /// result remains untouched if validation or the transaction fails.
+    pub fn commit_resolved_membership(
+        &mut self,
+        collection_id: CollectionId,
+        members: &[ResolvedCollectionMember],
+    ) -> Result<MembershipCommit, StoreError> {
+        let configuration = self
+            .collection_configuration(collection_id)?
+            .ok_or(StoreError::CollectionNotConfigured(collection_id))?;
+        let active_members = u64::try_from(members.len())
+            .map_err(|_| StoreError::InvalidConfig("collection member count is too large"))?;
+        if configuration
+            .budget
+            .maximum_pages()
+            .is_some_and(|maximum| active_members > maximum.get())
+        {
+            return Err(StoreError::CollectionBudgetExceeded {
+                resource: "pages",
+                limit: configuration
+                    .budget
+                    .maximum_pages()
+                    .expect("checked maximum")
+                    .get(),
+                estimated: active_members,
+            });
+        }
+        let mut unique_page_ids = HashSet::with_capacity(members.len());
+        for member in members {
+            if !unique_page_ids.insert(member.page_id) {
+                return Err(StoreError::InvalidConfig(
+                    "resolved membership contains a duplicate page ID",
+                ));
+            }
+            validate_inclusion_reason(&configuration.rule, member)?;
+        }
+
+        let now = unix_time()?;
+        let raw_collection_id = to_sql_integer(collection_id.get())?;
+        let raw_wiki_id = to_sql_integer(configuration.wiki_id.get())?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if configuration.removal_policy == CollectionRemovalPolicy::StopTrackingRetainHistory {
+            transaction.execute(
+                "UPDATE collection_resolved_members
+                 SET membership_state = 'removed', removed_at = ?2
+                 WHERE collection_id = ?1 AND membership_state = 'active'",
+                params![raw_collection_id, now],
+            )?;
+            transaction.execute(
+                "DELETE FROM collection_pages
+                 WHERE collection_id = ?1
+                   AND page_id IN (
+                       SELECT page_id FROM collection_resolved_members
+                       WHERE collection_id = ?1 AND membership_state = 'removed'
+                   )",
+                [raw_collection_id],
+            )?;
+        }
+
+        for member in members {
+            let (kind, inclusion_title, inclusion_depth) =
+                inclusion_reason_values(&member.inclusion_reason);
+            let raw_page_id = to_sql_integer(member.page_id.get())?;
+            transaction.execute(
+                "INSERT INTO collection_resolved_members (
+                    collection_id, wiki_id, page_id, namespace, title,
+                    inclusion_kind, inclusion_title, inclusion_depth,
+                    membership_state, first_resolved_at, last_resolved_at, removed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                           'active', ?9, ?9, NULL)
+                 ON CONFLICT(collection_id, page_id) DO UPDATE SET
+                    wiki_id = excluded.wiki_id,
+                    namespace = excluded.namespace,
+                    title = excluded.title,
+                    inclusion_kind = excluded.inclusion_kind,
+                    inclusion_title = excluded.inclusion_title,
+                    inclusion_depth = excluded.inclusion_depth,
+                    membership_state = 'active',
+                    last_resolved_at = excluded.last_resolved_at,
+                    removed_at = NULL",
+                params![
+                    raw_collection_id,
+                    raw_wiki_id,
+                    raw_page_id,
+                    member.namespace,
+                    member.title.as_str(),
+                    kind,
+                    inclusion_title,
+                    inclusion_depth,
+                    now,
+                ],
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO collection_pages (
+                    collection_id, wiki_id, page_id, inclusion_reason, added_at
+                 )
+                 SELECT ?1, ?2, ?3, 'explicit-title', ?4
+                 WHERE EXISTS (
+                    SELECT 1 FROM pages WHERE wiki_id = ?2 AND page_id = ?3
+                 )",
+                params![raw_collection_id, raw_wiki_id, raw_page_id, now],
+            )?;
+        }
+        let raw_removed_members: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM collection_resolved_members
+             WHERE collection_id = ?1 AND membership_state = 'removed'
+               AND removed_at = ?2",
+            params![raw_collection_id, now],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        Ok(MembershipCommit {
+            active_members,
+            removed_members: sql_u64(raw_removed_members, "invalid removed member count")?,
+        })
+    }
+
+    /// Lists active resolved members in stable page-ID order, including uncaptured pages.
+    pub fn resolved_collection_members(
+        &self,
+        collection_id: CollectionId,
+    ) -> Result<Vec<ResolvedCollectionMember>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT page_id, namespace, title, inclusion_kind,
+                    inclusion_title, inclusion_depth
+             FROM collection_resolved_members
+             WHERE collection_id = ?1 AND membership_state = 'active'
+             ORDER BY page_id",
+        )?;
+        let rows = statement
+            .query_map([to_sql_integer(collection_id.get())?], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(page_id, namespace, title, kind, inclusion_title, depth)| {
+                    Ok(ResolvedCollectionMember {
+                        page_id: sql_id(page_id, "invalid resolved page ID")?,
+                        namespace,
+                        title: PageTitle::new(title).map_err(|_| {
+                            StoreError::CorruptMetadata("invalid resolved page title")
+                        })?,
+                        inclusion_reason: stored_inclusion_reason(&kind, inclusion_title, depth)?,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Records a resolver's bounded pre-capture page/byte prediction.
+    pub fn record_collection_estimate(
+        &mut self,
+        collection_id: CollectionId,
+        resolved_page_count: u64,
+        predicted_canonical_bytes: Option<u64>,
+    ) -> Result<CollectionEstimate, StoreError> {
+        let configuration = self
+            .collection_configuration(collection_id)?
+            .ok_or(StoreError::CollectionNotConfigured(collection_id))?;
+        if !configuration.budget.permits(
+            resolved_page_count,
+            predicted_canonical_bytes.unwrap_or_default(),
+        ) {
+            let (resource, limit, estimated) = if configuration
+                .budget
+                .maximum_pages()
+                .is_some_and(|limit| resolved_page_count > limit.get())
+            {
+                (
+                    "pages",
+                    configuration
+                        .budget
+                        .maximum_pages()
+                        .expect("checked page limit")
+                        .get(),
+                    resolved_page_count,
+                )
+            } else {
+                (
+                    "bytes",
+                    configuration
+                        .budget
+                        .maximum_bytes()
+                        .expect("byte limit must be exceeded")
+                        .get(),
+                    predicted_canonical_bytes.unwrap_or_default(),
+                )
+            };
+            return Err(StoreError::CollectionBudgetExceeded {
+                resource,
+                limit,
+                estimated,
+            });
+        }
+        self.connection.execute(
+            "INSERT INTO collection_estimates (
+                collection_id, resolved_page_count, predicted_canonical_bytes, estimated_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                to_sql_integer(collection_id.get())?,
+                to_sql_integer(resolved_page_count)?,
+                predicted_canonical_bytes.map(to_sql_integer).transpose()?,
+                unix_time()?,
+            ],
+        )?;
+        self.collection_estimate(collection_id)
+    }
+
+    /// Computes current captured usage and combines it with the latest prediction.
+    pub fn collection_estimate(
+        &self,
+        collection_id: CollectionId,
+    ) -> Result<CollectionEstimate, StoreError> {
+        let raw_collection_id = to_sql_integer(collection_id.get())?;
+        let exists: bool = self.connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM collections WHERE collection_id = ?1)",
+            [raw_collection_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::CollectionNotFound(collection_id));
+        }
+        let raw_page_count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM collection_resolved_members
+             WHERE collection_id = ?1 AND membership_state = 'active'",
+            [raw_collection_id],
+            |row| row.get(0),
+        )?;
+        let raw_current_bytes: i64 = self.connection.query_row(
+            "SELECT COALESCE(SUM(uncompressed_length), 0)
+             FROM content_objects
+             WHERE object_id IN (
+                SELECT DISTINCT revisions.content_object_id
+                FROM collection_resolved_members AS members
+                JOIN revisions
+                  ON revisions.wiki_id = members.wiki_id
+                 AND revisions.page_id = members.page_id
+                WHERE members.collection_id = ?1
+                  AND members.membership_state = 'active'
+             )",
+            [raw_collection_id],
+            |row| row.get(0),
+        )?;
+        let latest_prediction = self
+            .connection
+            .query_row(
+                "SELECT predicted_canonical_bytes, estimated_at
+                 FROM collection_estimates WHERE collection_id = ?1
+                 ORDER BY estimated_at DESC, estimate_id DESC LIMIT 1",
+                [raw_collection_id],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        Ok(CollectionEstimate {
+            resolved_page_count: sql_u64(raw_page_count, "negative collection page count")?,
+            current_canonical_bytes: sql_u64(
+                raw_current_bytes,
+                "negative collection canonical byte count",
+            )?,
+            predicted_canonical_bytes: latest_prediction
+                .as_ref()
+                .and_then(|(bytes, _)| *bytes)
+                .map(|bytes| sql_u64(bytes, "negative predicted byte count"))
+                .transpose()?,
+            predicted_at: latest_prediction
+                .map(|(_, timestamp)| sql_u64(timestamp, "negative estimate timestamp"))
+                .transpose()?,
+        })
     }
 
     /// Starts a synchronization run or resumes matching unfinished work.
@@ -1364,6 +2040,39 @@ impl Library {
         )?;
         if !owns_collection {
             return Err(StoreError::CollectionWikiMismatch);
+        }
+
+        let membership_state: Option<String> = transaction
+            .query_row(
+                "SELECT membership_state FROM collection_resolved_members
+                 WHERE collection_id = ?1 AND page_id = ?2",
+                params![collection_id, page_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if membership_state.as_deref() == Some("removed") {
+            return Err(StoreError::CollectionMemberNotActive {
+                collection_id: sql_id(collection_id, "invalid collection ID")?,
+                page_id: capture.page_id,
+            });
+        }
+        if membership_state.is_none() {
+            transaction.execute(
+                "INSERT INTO collection_resolved_members (
+                    collection_id, wiki_id, page_id, namespace, title,
+                    inclusion_kind, inclusion_title, inclusion_depth,
+                    membership_state, first_resolved_at, last_resolved_at, removed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5,
+                           'explicit-title', ?5, NULL, 'active', ?6, ?6, NULL)",
+                params![
+                    collection_id,
+                    wiki_id,
+                    page_id,
+                    capture.namespace,
+                    capture.title.as_str(),
+                    now,
+                ],
+            )?;
         }
 
         transaction.execute(
@@ -2479,6 +3188,68 @@ impl Library {
             |row| row.get(0),
         )?;
         Ok(exists)
+    }
+
+    /// Returns the number of logical canonical objects known to the library.
+    pub fn logical_object_count(&self) -> Result<u64, StoreError> {
+        let count: i64 =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM content_objects", [], |row| row.get(0))?;
+        sql_u64(count, "negative logical object count")
+    }
+
+    /// Enumerates logical objects after an optional cursor in strict ID order.
+    ///
+    /// Callers performing full verification should pass the final ID from one page
+    /// into the next call. The page size is bounded to `1..=1000` so GUI background
+    /// work cannot accidentally materialize an unbounded library inventory.
+    pub fn logical_objects_after(
+        &self,
+        after: Option<ObjectId>,
+        limit: u32,
+    ) -> Result<Vec<LogicalObject>, StoreError> {
+        if !(1..=1_000).contains(&limit) {
+            return Err(StoreError::InvalidConfig(
+                "logical object page size must be between 1 and 1000",
+            ));
+        }
+        let after = after.map(|id| id.to_string()).unwrap_or_default();
+        let mut statement = self.connection.prepare(
+            "SELECT object_id, object_kind, uncompressed_length,
+                    media_type, verification_state
+             FROM content_objects
+             WHERE object_id > ?1
+             ORDER BY object_id
+             LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![after, i64::from(limit)], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(id, kind, length, media_type, verification_state)| {
+                Ok(LogicalObject {
+                    object: StoredObject {
+                        id: id
+                            .parse()
+                            .map_err(|_| StoreError::CorruptMetadata("invalid stored object ID"))?,
+                        kind: ObjectKind::from_database(&kind)?,
+                        uncompressed_length: sql_u64(length, "negative object length")?,
+                    },
+                    media_type,
+                    verification_state: ObjectVerificationState::from_database(
+                        &verification_state,
+                    )?,
+                })
+            })
+            .collect()
     }
 
     /// Reads, bounds, decompresses, and verifies a canonical object.
@@ -3630,6 +4401,138 @@ fn is_safe_relative_path(path: &Path) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
+fn collection_rule_values(rule: &CollectionRule) -> (&'static str, Option<&str>, Option<i64>) {
+    match rule {
+        CollectionRule::ExplicitTitles(_) => ("explicit-titles", None, None),
+        CollectionRule::TitleList(_) => ("title-list", None, None),
+        CollectionRule::Category {
+            title,
+            recursion_depth,
+        } => (
+            "category",
+            Some(title.as_str()),
+            Some(i64::from(*recursion_depth)),
+        ),
+    }
+}
+
+fn history_policy_values(policy: HistoryPolicy) -> Result<(&'static str, Option<i64>), StoreError> {
+    match policy {
+        HistoryPolicy::CurrentAndFuture => Ok(("current-and-future", None)),
+        HistoryPolicy::LastN(count) => Ok(("last-n", Some(i64::from(count.get())))),
+        HistoryPolicy::Since(timestamp) => Ok(("since", Some(timestamp.as_seconds()))),
+        HistoryPolicy::Complete => Ok(("complete", None)),
+    }
+}
+
+fn stored_history_policy(kind: &str, value: Option<i64>) -> Result<HistoryPolicy, StoreError> {
+    match kind {
+        "current-and-future" if value.is_none() => Ok(HistoryPolicy::CurrentAndFuture),
+        "last-n" => HistoryPolicy::last_n(
+            u32::try_from(value.ok_or(StoreError::CorruptMetadata("last-N policy lacks value"))?)
+                .map_err(|_| StoreError::CorruptMetadata("invalid last-N history value"))?,
+        )
+        .map_err(|_| StoreError::CorruptMetadata("invalid last-N history value")),
+        "since" => Ok(HistoryPolicy::Since(UnixTimestamp::from_seconds(
+            value.ok_or(StoreError::CorruptMetadata("since policy lacks value"))?,
+        ))),
+        "complete" if value.is_none() => Ok(HistoryPolicy::Complete),
+        _ => Err(StoreError::CorruptMetadata("invalid history policy")),
+    }
+}
+
+fn stored_collection_budget(
+    maximum_pages: Option<i64>,
+    maximum_bytes: Option<i64>,
+) -> Result<CollectionBudget, StoreError> {
+    let mut budget = CollectionBudget::unlimited();
+    if let Some(pages) = maximum_pages {
+        budget = budget
+            .with_maximum_pages(sql_u64(pages, "invalid collection page budget")?)
+            .map_err(|_| StoreError::CorruptMetadata("invalid collection page budget"))?;
+    }
+    if let Some(bytes) = maximum_bytes {
+        budget = budget
+            .with_maximum_bytes(sql_u64(bytes, "invalid collection byte budget")?)
+            .map_err(|_| StoreError::CorruptMetadata("invalid collection byte budget"))?;
+    }
+    Ok(budget)
+}
+
+const fn removal_policy_value(policy: CollectionRemovalPolicy) -> &'static str {
+    match policy {
+        CollectionRemovalPolicy::StopTrackingRetainHistory => "stop-tracking-retain-history",
+        CollectionRemovalPolicy::KeepTracking => "keep-tracking",
+    }
+}
+
+fn stored_removal_policy(value: &str) -> Result<CollectionRemovalPolicy, StoreError> {
+    match value {
+        "stop-tracking-retain-history" => Ok(CollectionRemovalPolicy::StopTrackingRetainHistory),
+        "keep-tracking" => Ok(CollectionRemovalPolicy::KeepTracking),
+        _ => Err(StoreError::CorruptMetadata(
+            "unknown collection removal policy",
+        )),
+    }
+}
+
+fn inclusion_reason_values(reason: &InclusionReason) -> (&'static str, &str, Option<i64>) {
+    match reason {
+        InclusionReason::ExplicitTitle(title) => ("explicit-title", title.as_str(), None),
+        InclusionReason::TitleList(title) => ("title-list", title.as_str(), None),
+        InclusionReason::Category { category, depth } => {
+            ("category", category.as_str(), Some(i64::from(*depth)))
+        }
+    }
+}
+
+fn stored_inclusion_reason(
+    kind: &str,
+    title: String,
+    depth: Option<i64>,
+) -> Result<InclusionReason, StoreError> {
+    let title = PageTitle::new(title)
+        .map_err(|_| StoreError::CorruptMetadata("invalid inclusion reason title"))?;
+    match kind {
+        "explicit-title" if depth.is_none() => Ok(InclusionReason::ExplicitTitle(title)),
+        "title-list" if depth.is_none() => Ok(InclusionReason::TitleList(title)),
+        "category" => Ok(InclusionReason::Category {
+            category: title,
+            depth: u16::try_from(
+                depth.ok_or(StoreError::CorruptMetadata("category reason lacks depth"))?,
+            )
+            .map_err(|_| StoreError::CorruptMetadata("invalid category inclusion depth"))?,
+        }),
+        _ => Err(StoreError::CorruptMetadata("invalid inclusion reason")),
+    }
+}
+
+fn validate_inclusion_reason(
+    rule: &CollectionRule,
+    member: &ResolvedCollectionMember,
+) -> Result<(), StoreError> {
+    let valid = match (rule, &member.inclusion_reason) {
+        // MediaWiki may normalize or redirect a configured title before returning
+        // the stable page identity. The configured titles remain persisted in the
+        // rule while the inclusion reason records the canonical resolved title.
+        (CollectionRule::ExplicitTitles(_), InclusionReason::ExplicitTitle(_))
+        | (CollectionRule::TitleList(_), InclusionReason::TitleList(_)) => true,
+        (
+            CollectionRule::Category {
+                title,
+                recursion_depth,
+            },
+            InclusionReason::Category { category, depth },
+        ) => category == title && depth <= recursion_depth,
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidInclusionReason(member.page_id))
+    }
+}
+
 fn migrate(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -3639,7 +4542,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
          ) STRICT;",
     )?;
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > 5 {
+    if version > 6 {
         return Err(StoreError::UnsupportedSchemaVersion(version));
     }
     if version == 0 {
@@ -3699,6 +4602,18 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
             [unix_time()?],
         )?;
         transaction.pragma_update(None, "user_version", 5)?;
+        transaction.commit()?;
+    }
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 5 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(MIGRATION_6)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (6, 'collections', ?1)",
+            [unix_time()?],
+        )?;
+        transaction.pragma_update(None, "user_version", 6)?;
         transaction.commit()?;
     }
     Ok(())
@@ -3772,6 +4687,28 @@ pub enum StoreError {
     CorruptMetadata(&'static str),
     /// A collection was used with a different wiki than the one it belongs to.
     CollectionWikiMismatch,
+    /// No collection exists for the supplied identity.
+    CollectionNotFound(CollectionId),
+    /// A legacy empty collection has not committed a selection rule yet.
+    CollectionNotConfigured(CollectionId),
+    /// A resolved member reason did not match the committed rule.
+    InvalidInclusionReason(PageId),
+    /// A capture was attempted for membership removed by reconciliation.
+    CollectionMemberNotActive {
+        /// Local collection identity.
+        collection_id: CollectionId,
+        /// Stable remote page identity.
+        page_id: PageId,
+    },
+    /// A hard page-count or canonical-byte collection budget was exceeded.
+    CollectionBudgetExceeded {
+        /// Budgeted resource (`pages` or `bytes`).
+        resource: &'static str,
+        /// Configured hard maximum.
+        limit: u64,
+        /// Estimated use for the requested operation.
+        estimated: u64,
+    },
     /// A source identity is not registered in this library.
     WikiNotFound(WikiId),
     /// Historical content was supplied for a page not yet present in the library.
@@ -3852,6 +4789,36 @@ impl fmt::Display for StoreError {
             Self::CollectionWikiMismatch => {
                 formatter.write_str("collection does not belong to the requested wiki")
             }
+            Self::CollectionNotFound(collection_id) => {
+                write!(formatter, "collection {collection_id} was not found")
+            }
+            Self::CollectionNotConfigured(collection_id) => {
+                write!(
+                    formatter,
+                    "collection {collection_id} has no committed rule"
+                )
+            }
+            Self::InvalidInclusionReason(page_id) => {
+                write!(
+                    formatter,
+                    "page {page_id} inclusion reason does not match the collection rule"
+                )
+            }
+            Self::CollectionMemberNotActive {
+                collection_id,
+                page_id,
+            } => write!(
+                formatter,
+                "page {page_id} is no longer active in collection {collection_id}"
+            ),
+            Self::CollectionBudgetExceeded {
+                resource,
+                limit,
+                estimated,
+            } => write!(
+                formatter,
+                "collection {resource} estimate {estimated} exceeds hard limit {limit}"
+            ),
             Self::WikiNotFound(wiki_id) => write!(formatter, "wiki {wiki_id} was not found"),
             Self::PageNotFound { wiki_id, page_id } => {
                 write!(
@@ -4012,13 +4979,13 @@ mod tests {
     #[test]
     fn migration_is_applied_once_and_keeps_locations_separate() {
         let (directory, library) = test_library();
-        assert_eq!(library.schema_version().expect("schema version"), 5);
-        assert_eq!(migration_count(&library), 5);
+        assert_eq!(library.schema_version().expect("schema version"), 6);
+        assert_eq!(migration_count(&library), 6);
 
         drop(library);
         let reopened = Library::open(directory.path()).expect("reopen library");
-        assert_eq!(reopened.schema_version().expect("schema version"), 5);
-        assert_eq!(migration_count(&reopened), 5);
+        assert_eq!(reopened.schema_version().expect("schema version"), 6);
+        assert_eq!(migration_count(&reopened), 6);
 
         let logical_columns: Vec<String> = reopened
             .connection()
@@ -4078,8 +5045,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 5);
-        assert_eq!(migration_count(&upgraded), 5);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 6);
+        assert_eq!(migration_count(&upgraded), 6);
         assert_eq!(table_count(&upgraded, "revisions"), 0);
     }
 
@@ -4115,8 +5082,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 5);
-        assert_eq!(migration_count(&upgraded), 5);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 6);
+        assert_eq!(migration_count(&upgraded), 6);
         assert_eq!(table_count(&upgraded, "search_documents"), 0);
         let fts_definition: String = upgraded
             .connection()
@@ -4147,6 +5114,198 @@ mod tests {
         assert_eq!(library.read_object(first.id).expect("read object"), bytes);
         assert_eq!(table_count(&library, "content_objects"), 1);
         assert_eq!(table_count(&library, "object_locations"), 1);
+    }
+
+    #[test]
+    fn collection_configuration_and_preview_membership_round_trip_atomically() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        assert_eq!(
+            library.wikis().expect("list wikis"),
+            [StoredWiki {
+                wiki_id,
+                api_endpoint: "https://en.wikipedia.org/w/api.php".to_owned(),
+                language_code: "en".to_owned(),
+            }]
+        );
+        let category = PageTitle::new("Category:Physics").expect("category");
+        let rule = CollectionRule::Category {
+            title: category.clone(),
+            recursion_depth: 2,
+        };
+        let budget = CollectionBudget::unlimited()
+            .with_maximum_pages(10)
+            .expect("page budget")
+            .with_maximum_bytes(1_000)
+            .expect("byte budget");
+        let collection_id = library
+            .create_collection(
+                wiki_id,
+                "Physics",
+                &rule,
+                HistoryPolicy::last_n(5).expect("history"),
+                budget,
+                CollectionRemovalPolicy::StopTrackingRetainHistory,
+            )
+            .expect("create configured collection");
+        let configuration = library
+            .collection_configuration(collection_id)
+            .expect("configuration query")
+            .expect("configured collection");
+        assert_eq!(configuration.rule, rule);
+        assert_eq!(configuration.budget, budget);
+
+        let first = ResolvedCollectionMember {
+            page_id: PageId::new(10).expect("page ID"),
+            namespace: 0,
+            title: PageTitle::new("Physics").expect("title"),
+            inclusion_reason: InclusionReason::Category {
+                category: category.clone(),
+                depth: 0,
+            },
+        };
+        let second = ResolvedCollectionMember {
+            page_id: PageId::new(11).expect("page ID"),
+            namespace: 0,
+            title: PageTitle::new("Mechanics").expect("title"),
+            inclusion_reason: InclusionReason::Category {
+                category: category.clone(),
+                depth: 2,
+            },
+        };
+        assert_eq!(
+            library
+                .commit_resolved_membership(collection_id, &[first.clone(), second.clone()])
+                .expect("commit preview"),
+            MembershipCommit {
+                active_members: 2,
+                removed_members: 0,
+            }
+        );
+        assert_eq!(
+            library
+                .resolved_collection_members(collection_id)
+                .expect("resolved members"),
+            [first.clone(), second.clone()]
+        );
+        assert_eq!(table_count(&library, "collection_pages"), 0);
+
+        let revision_id = RevisionId::new(20).expect("revision ID");
+        library
+            .capture_current_revision(
+                wiki_id,
+                collection_id,
+                &CurrentRevisionCapture {
+                    page_id: first.page_id,
+                    namespace: first.namespace,
+                    title: &first.title,
+                    revision_id,
+                    parent_id: None,
+                    timestamp: "2026-08-21T10:00:00Z",
+                    author: None,
+                    author_id: None,
+                    comment: None,
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: b"physics",
+                },
+            )
+            .expect("capture resolved member");
+        assert_eq!(table_count(&library, "collection_pages"), 1);
+        assert_eq!(
+            library
+                .resolved_collection_members(collection_id)
+                .expect("reason survives capture")[0]
+                .inclusion_reason,
+            first.inclusion_reason
+        );
+        assert_eq!(
+            library
+                .record_collection_estimate(collection_id, 2, Some(900))
+                .expect("record estimate"),
+            CollectionEstimate {
+                resolved_page_count: 2,
+                current_canonical_bytes: 7,
+                predicted_canonical_bytes: Some(900),
+                predicted_at: library
+                    .collection_estimate(collection_id)
+                    .expect("estimate")
+                    .predicted_at,
+            }
+        );
+
+        assert_eq!(
+            library
+                .commit_resolved_membership(collection_id, std::slice::from_ref(&second))
+                .expect("replace preview"),
+            MembershipCommit {
+                active_members: 1,
+                removed_members: 1,
+            }
+        );
+        assert_eq!(
+            library
+                .resolved_collection_members(collection_id)
+                .expect("replacement"),
+            [second]
+        );
+        assert!(
+            library
+                .revision(wiki_id, revision_id)
+                .expect("retained history")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn title_list_rules_and_logical_object_pagination_are_durable_and_bounded() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let titles =
+            TitleSelection::from_newline_delimited("Rust\nFerris\nRust\n").expect("title list");
+        let collection_id = library
+            .create_collection(
+                wiki_id,
+                "Imported",
+                &CollectionRule::TitleList(titles.clone()),
+                HistoryPolicy::Since(UnixTimestamp::from_seconds(123)),
+                CollectionBudget::unlimited(),
+                CollectionRemovalPolicy::KeepTracking,
+            )
+            .expect("create title-list collection");
+        let stored = library
+            .collection_configuration(collection_id)
+            .expect("configuration")
+            .expect("configured");
+        assert_eq!(stored.rule, CollectionRule::TitleList(titles));
+        assert_eq!(
+            stored.history_policy,
+            HistoryPolicy::Since(UnixTimestamp::from_seconds(123))
+        );
+
+        library
+            .put_bytes(ObjectKind::Wikitext, b"first")
+            .expect("first object");
+        library
+            .put_bytes(ObjectKind::Media, b"second")
+            .expect("second object");
+        assert_eq!(library.logical_object_count().expect("object count"), 2);
+        let first_page = library.logical_objects_after(None, 1).expect("first page");
+        assert_eq!(first_page.len(), 1);
+        let second_page = library
+            .logical_objects_after(Some(first_page[0].object.id), 1)
+            .expect("second page");
+        assert_eq!(second_page.len(), 1);
+        assert!(first_page[0].object.id < second_page[0].object.id);
+        assert!(matches!(
+            library.logical_objects_after(None, 0),
+            Err(StoreError::InvalidConfig(_))
+        ));
     }
 
     #[test]

@@ -1,0 +1,8 @@
+{
+  "batchcomplete": true,
+  "query": {
+    "categorymembers": [
+      {"pageid": 25357340, "ns": 0, "title": "Rust (programming language)"}
+    ]
+  }
+}
