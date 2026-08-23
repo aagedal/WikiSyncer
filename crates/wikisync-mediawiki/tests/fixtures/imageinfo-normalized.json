@@ -1,0 +1,31 @@
+{
+  "query": {
+    "normalized": [
+      {
+        "from": "File:Lead_photo.JPG",
+        "to": "File:Lead photo.JPG"
+      }
+    ],
+    "pages": [
+      {
+        "pageid": 9001,
+        "ns": 6,
+        "title": "File:Lead photo.JPG",
+        "imageinfo": [
+          {
+            "sha1": "abcdef0123456789abcdef0123456789",
+            "mime": "image/jpeg",
+            "thumburl": "https://upload.wikimedia.org/640px-lead.jpg",
+            "thumbwidth": 640,
+            "thumbheight": 427,
+            "descriptionurl": "https://commons.wikimedia.org/wiki/File:Lead_photo.JPG",
+            "extmetadata": {
+              "Artist": { "value": "Fixture photographer" },
+              "LicenseShortName": { "value": "CC BY-SA 4.0" }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

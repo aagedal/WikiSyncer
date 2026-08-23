@@ -682,12 +682,21 @@ impl Client {
                 })
                 .and_then(completed_collection_outcome),
             CollectionAdministration::Estimate(draft) => {
-                self.stage_collection_draft(draft, |token| {
+                self.stage_collection_draft(draft, None, |token| {
                     self.collection_admin_call(CollectionAdminRequest::Estimate { token })
                         .and_then(completed_collection_outcome)
                 })
             }
-            CollectionAdministration::Add(draft) => self.stage_collection_draft(draft, |token| {
+            CollectionAdministration::Add(draft) => {
+                self.stage_collection_draft(draft, None, |token| {
+                    self.collection_admin_call(CollectionAdminRequest::Add { token })
+                        .and_then(completed_collection_outcome)
+                })
+            }
+            CollectionAdministration::AddWithImagePolicy {
+                draft,
+                image_policy,
+            } => self.stage_collection_draft(draft, Some(image_policy), |token| {
                 self.collection_admin_call(CollectionAdminRequest::Add { token })
                     .and_then(completed_collection_outcome)
             }),
@@ -695,7 +704,20 @@ impl Client {
                 collection_id,
                 expected_generation,
                 draft,
-            } => self.stage_collection_draft(draft, |token| {
+            } => self.stage_collection_draft(draft, None, |token| {
+                self.collection_admin_call(CollectionAdminRequest::Edit {
+                    token,
+                    collection_id: collection_id.get(),
+                    expected_generation,
+                })
+                .and_then(completed_collection_outcome)
+            }),
+            CollectionAdministration::EditWithImagePolicy {
+                collection_id,
+                expected_generation,
+                draft,
+                image_policy,
+            } => self.stage_collection_draft(draft, Some(image_policy), |token| {
                 self.collection_admin_call(CollectionAdminRequest::Edit {
                     token,
                     collection_id: collection_id.get(),
@@ -721,10 +743,16 @@ impl Client {
     fn stage_collection_draft(
         &self,
         draft: CollectionDraft,
+        image_policy: Option<wikisync_core::ImagePolicy>,
         finish: impl FnOnce(u64) -> Result<CollectionAdministrationOutcome, DaemonError>,
     ) -> Result<CollectionAdministrationOutcome, DaemonError> {
-        let encoded = encode_collection_draft(&draft)
-            .map_err(|_| DaemonError::Protocol("collection draft failed local validation"))?;
+        let encoded = match image_policy {
+            Some(image_policy) => {
+                collection::encode_collection_draft_with_image_policy(&draft, image_policy)
+            }
+            None => encode_collection_draft(&draft),
+        }
+        .map_err(|_| DaemonError::Protocol("collection draft failed local validation"))?;
         let total_bytes = u32::try_from(encoded.len())
             .map_err(|_| DaemonError::Protocol("collection draft is too large"))?;
         let token =
@@ -2802,19 +2830,23 @@ mod tests {
                 ..
             })
         ));
+        let thumbnails = wikisync_core::ThumbnailPolicy::new(800, 12, 2 * 1024 * 1024)
+            .expect("thumbnail policy");
         let added = client
-            .administer_collection(CollectionAdministration::Add(collection_draft(
-                wiki_id, "Systems",
-            )))
+            .administer_collection(CollectionAdministration::AddWithImagePolicy {
+                draft: collection_draft(wiki_id, "Systems"),
+                image_policy: wikisync_core::ImagePolicy::Thumbnails(thumbnails),
+            })
             .expect("add");
         let CollectionAdministrationOutcome::Added { collection_id, .. } = added else {
             panic!("unexpected add outcome");
         };
         let edited = client
-            .administer_collection(CollectionAdministration::Edit {
+            .administer_collection(CollectionAdministration::EditWithImagePolicy {
                 collection_id,
                 expected_generation: 1,
                 draft: collection_draft(wiki_id, "Programming systems"),
+                image_policy: wikisync_core::ImagePolicy::None,
             })
             .expect("edit");
         assert!(matches!(
@@ -2825,10 +2857,11 @@ mod tests {
             } if edited_id == collection_id
         ));
         let stale = client
-            .administer_collection(CollectionAdministration::Edit {
+            .administer_collection(CollectionAdministration::EditWithImagePolicy {
                 collection_id,
                 expected_generation: 1,
                 draft: collection_draft(wiki_id, "Stale replacement"),
+                image_policy: wikisync_core::ImagePolicy::Thumbnails(thumbnails),
             })
             .expect_err("stale forwarded preview must fail");
         assert!(matches!(
@@ -2838,6 +2871,15 @@ mod tests {
                 ref message,
             }) if message.contains("changed while it was being previewed")
         ));
+        let stored = wikisync_store::Library::open_read_only(library.path()).expect("inspect");
+        let configuration = stored
+            .collection_configuration(collection_id)
+            .expect("configuration")
+            .expect("configured");
+        assert_eq!(configuration.generation, 2);
+        assert_eq!(configuration.name, "Programming systems");
+        assert_eq!(configuration.image_policy, wikisync_core::ImagePolicy::None);
+        drop(stored);
         client
             .administer_collection(CollectionAdministration::Remove { collection_id })
             .expect("remove");

@@ -15,7 +15,7 @@ use iced::widget::{
 use iced::{Alignment, Element, Length, Task, Theme};
 use wikisync_core::{
     CollectionBudget, CollectionId, CollectionRemovalPolicy, CollectionRule, HistoryPolicy,
-    PageTitle, UnixTimestamp, WikiId,
+    ImagePolicy, PageTitle, ThumbnailPolicy, UnixTimestamp, WikiId,
 };
 use wikisync_integrity::{
     MAX_TRUSTED_HEAD_BYTES, ManifestSigningKey, TrustedManifestHead, VerificationFindingKind,
@@ -255,6 +255,26 @@ impl App {
                     self.collection_form.removal_policy = value;
                 }
             }
+            Message::CreateImageModeChanged(value) => {
+                if !self.is_busy() {
+                    self.collection_form.image_mode = value;
+                }
+            }
+            Message::CreateThumbnailEdgeChanged(value) => {
+                if !self.is_busy() {
+                    self.collection_form.thumbnail_max_edge_pixels = value;
+                }
+            }
+            Message::CreateThumbnailCountChanged(value) => {
+                if !self.is_busy() {
+                    self.collection_form.thumbnail_max_images_per_revision = value;
+                }
+            }
+            Message::CreateThumbnailBytesChanged(value) => {
+                if !self.is_busy() {
+                    self.collection_form.thumbnail_max_bytes_per_image = value;
+                }
+            }
             Message::CreateScheduleModeChanged(value) => {
                 if !self.is_busy() {
                     self.collection_form.schedule_mode = value;
@@ -347,6 +367,13 @@ impl App {
                         }
                     },
                     removal_policy: self.collection_form.removal_policy,
+                    image_policy: match self.collection_form.image_policy() {
+                        Ok(policy) => policy,
+                        Err(error) => {
+                            self.notice = Some(Notice::error(error));
+                            return Task::none();
+                        }
+                    },
                     schedule: match self.collection_form.schedule() {
                         Ok(schedule) => schedule,
                         Err(error) => {
@@ -513,6 +540,34 @@ impl App {
                     }
                 }
             }
+            Message::EditImageModeChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.collection_editor {
+                        editor.form.image_mode = value;
+                    }
+                }
+            }
+            Message::EditThumbnailEdgeChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.collection_editor {
+                        editor.form.thumbnail_max_edge_pixels = value;
+                    }
+                }
+            }
+            Message::EditThumbnailCountChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.collection_editor {
+                        editor.form.thumbnail_max_images_per_revision = value;
+                    }
+                }
+            }
+            Message::EditThumbnailBytesChanged(value) => {
+                if !self.is_busy() {
+                    if let Some(editor) = &mut self.collection_editor {
+                        editor.form.thumbnail_max_bytes_per_image = value;
+                    }
+                }
+            }
             Message::EditCollectionScheduleModeChanged(value) => {
                 if !self.is_busy() {
                     if let Some(editor) = &mut self.collection_editor {
@@ -641,6 +696,13 @@ impl App {
                         }
                     },
                     removal_policy: editor.form.removal_policy,
+                    image_policy: match editor.form.image_policy() {
+                        Ok(value) => value,
+                        Err(error) => {
+                            self.notice = Some(Notice::error(error));
+                            return Task::none();
+                        }
+                    },
                     schedule: match editor.form.schedule() {
                         Ok(value) => value,
                         Err(error) => {
@@ -1239,7 +1301,16 @@ impl App {
                     .schedules
                     .iter()
                     .find(|schedule| schedule.collection_id == collection.collection_id);
-                list = list.push(collection_row(collection, schedule, !self.is_busy()));
+                let configuration = snapshot
+                    .collection_configurations
+                    .iter()
+                    .find(|configuration| configuration.collection_id == collection.collection_id);
+                list = list.push(collection_row(
+                    collection,
+                    configuration,
+                    schedule,
+                    !self.is_busy(),
+                ));
             }
         }
 
@@ -1390,6 +1461,21 @@ impl App {
             ),
         ]
         .spacing(8);
+        let image_buttons = row![
+            image_policy_button(
+                "No images",
+                ImageMode::None,
+                self.collection_form.image_mode,
+                Message::CreateImageModeChanged,
+            ),
+            image_policy_button(
+                "Bounded thumbnails",
+                ImageMode::Thumbnails,
+                self.collection_form.image_mode,
+                Message::CreateImageModeChanged,
+            ),
+        ]
+        .spacing(8);
         let preview_summary: Element<'_, Message> = self.selection_preview.as_ref().map_or_else(
             || text("Preview is required before any collection is created or downloaded.").into(),
             |preview| {
@@ -1460,6 +1546,30 @@ impl App {
                 ),
             ]
             .spacing(8),
+            text("Referenced image capture").size(17),
+            image_buttons,
+            row![
+                text_input(
+                    "Maximum thumbnail edge (pixels)",
+                    &self.collection_form.thumbnail_max_edge_pixels,
+                )
+                .on_input(Message::CreateThumbnailEdgeChanged)
+                .padding(10),
+                text_input(
+                    "Maximum images per revision",
+                    &self.collection_form.thumbnail_max_images_per_revision,
+                )
+                .on_input(Message::CreateThumbnailCountChanged)
+                .padding(10),
+                text_input(
+                    "Maximum bytes per thumbnail",
+                    &self.collection_form.thumbnail_max_bytes_per_image,
+                )
+                .on_input(Message::CreateThumbnailBytesChanged)
+                .padding(10),
+            ]
+            .spacing(8),
+            text(image_policy_form_summary(&self.collection_form)),
             text("Automatic synchronization schedule").size(17),
             schedule_buttons,
             text_input(
@@ -1718,6 +1828,10 @@ enum Message {
     MaximumPagesChanged(String),
     MaximumBytesChanged(String),
     CreateRemovalPolicyChanged(CollectionRemovalPolicy),
+    CreateImageModeChanged(ImageMode),
+    CreateThumbnailEdgeChanged(String),
+    CreateThumbnailCountChanged(String),
+    CreateThumbnailBytesChanged(String),
     CreateScheduleModeChanged(ScheduleMode),
     CreateScheduleValueChanged(String),
     CreateScheduleJitterChanged(String),
@@ -1739,6 +1853,10 @@ enum Message {
     EditMaximumPagesChanged(String),
     EditMaximumBytesChanged(String),
     EditRemovalPolicyChanged(CollectionRemovalPolicy),
+    EditImageModeChanged(ImageMode),
+    EditThumbnailEdgeChanged(String),
+    EditThumbnailCountChanged(String),
+    EditThumbnailBytesChanged(String),
     EditCollectionScheduleModeChanged(ScheduleMode),
     EditCollectionScheduleValueChanged(String),
     EditCollectionScheduleJitterChanged(String),
@@ -1896,6 +2014,10 @@ struct CollectionForm {
     maximum_pages: String,
     maximum_bytes: String,
     removal_policy: CollectionRemovalPolicy,
+    image_mode: ImageMode,
+    thumbnail_max_edge_pixels: String,
+    thumbnail_max_images_per_revision: String,
+    thumbnail_max_bytes_per_image: String,
     schedule_mode: ScheduleMode,
     schedule_value: String,
     schedule_jitter_minutes: String,
@@ -1904,6 +2026,7 @@ struct CollectionForm {
 
 impl Default for CollectionForm {
     fn default() -> Self {
+        let thumbnail_policy = ThumbnailPolicy::default();
         Self {
             name: String::new(),
             language_code: "en".to_owned(),
@@ -1916,6 +2039,16 @@ impl Default for CollectionForm {
             maximum_pages: "10000".to_owned(),
             maximum_bytes: String::new(),
             removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            image_mode: ImageMode::None,
+            thumbnail_max_edge_pixels: thumbnail_policy.maximum_edge_pixels().get().to_string(),
+            thumbnail_max_images_per_revision: thumbnail_policy
+                .maximum_images_per_revision()
+                .get()
+                .to_string(),
+            thumbnail_max_bytes_per_image: thumbnail_policy
+                .maximum_bytes_per_image()
+                .get()
+                .to_string(),
             schedule_mode: ScheduleMode::Manual,
             schedule_value: String::new(),
             schedule_jitter_minutes: "0".to_owned(),
@@ -1983,6 +2116,10 @@ impl CollectionForm {
             last_started_at: None,
         });
         let schedule_editor = ScheduleEditor::from_schedule(configuration.collection_id, schedule);
+        let (image_mode, thumbnail_policy) = match configuration.image_policy {
+            ImagePolicy::None => (ImageMode::None, ThumbnailPolicy::default()),
+            ImagePolicy::Thumbnails(policy) => (ImageMode::Thumbnails, policy),
+        };
         Self {
             name: configuration.name.clone(),
             language_code: wiki.language_code.clone(),
@@ -2001,6 +2138,16 @@ impl CollectionForm {
                 .maximum_bytes()
                 .map_or_else(String::new, |value| value.get().to_string()),
             removal_policy: configuration.removal_policy,
+            image_mode,
+            thumbnail_max_edge_pixels: thumbnail_policy.maximum_edge_pixels().get().to_string(),
+            thumbnail_max_images_per_revision: thumbnail_policy
+                .maximum_images_per_revision()
+                .get()
+                .to_string(),
+            thumbnail_max_bytes_per_image: thumbnail_policy
+                .maximum_bytes_per_image()
+                .get()
+                .to_string(),
             schedule_mode: schedule_editor.mode,
             schedule_value: schedule_editor.value,
             schedule_jitter_minutes: schedule_editor.jitter_minutes,
@@ -2080,6 +2227,40 @@ impl CollectionForm {
         Ok(budget)
     }
 
+    fn image_policy(&self) -> Result<ImagePolicy, String> {
+        match self.image_mode {
+            ImageMode::None => Ok(ImagePolicy::None),
+            ImageMode::Thumbnails => {
+                let maximum_edge_pixels = self
+                    .thumbnail_max_edge_pixels
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| "Thumbnail edge must be a positive pixel count.".to_owned())?;
+                let maximum_images_per_revision = self
+                    .thumbnail_max_images_per_revision
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| {
+                        "Thumbnail count must be a positive number per revision.".to_owned()
+                    })?;
+                let maximum_bytes_per_image = self
+                    .thumbnail_max_bytes_per_image
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| {
+                        "Thumbnail byte limit must be a positive number per image.".to_owned()
+                    })?;
+                ThumbnailPolicy::new(
+                    maximum_edge_pixels,
+                    maximum_images_per_revision,
+                    maximum_bytes_per_image,
+                )
+                .map(ImagePolicy::Thumbnails)
+                .map_err(|error| error.to_string())
+            }
+        }
+    }
+
     fn schedule(&self) -> Result<ScheduleSettings, String> {
         parse_schedule_settings(
             self.schedule_mode,
@@ -2103,6 +2284,12 @@ enum HistoryMode {
     LastN,
     Since,
     Complete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImageMode {
+    None,
+    Thumbnails,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2175,6 +2362,7 @@ struct CreateCollectionRequest {
     history_policy: HistoryPolicy,
     budget: CollectionBudget,
     removal_policy: CollectionRemovalPolicy,
+    image_policy: ImagePolicy,
     schedule: ScheduleSettings,
 }
 
@@ -2189,6 +2377,7 @@ struct EditCollectionRequest {
     history_policy: HistoryPolicy,
     budget: CollectionBudget,
     removal_policy: CollectionRemovalPolicy,
+    image_policy: ImagePolicy,
     schedule: ScheduleSettings,
 }
 
@@ -2519,11 +2708,14 @@ async fn create_collection_and_sync(
             .map_err(|error| error.to_string())?;
             let (wiki_id, source_created) = added_source(source_outcome)?;
             let draft = create_draft(request, wiki_id);
-            let outcome =
-                administer_collection_direct(&mut library, CollectionAdministration::Add(draft))
-                    .map_err(|error| {
-                        collection_add_error(&error, source_created.then_some(wiki_id))
-                    })?;
+            let outcome = administer_collection_direct(
+                &mut library,
+                CollectionAdministration::AddWithImagePolicy {
+                    draft,
+                    image_policy: request.image_policy,
+                },
+            )
+            .map_err(|error| collection_add_error(&error, source_created.then_some(wiki_id)))?;
             let collection_id = added_collection_id(outcome)?;
             set_schedule_direct(&mut library, collection_id, request.schedule)?;
             let client = wikisync_mediawiki::MediaWikiClient::new(client_config)
@@ -2566,9 +2758,10 @@ async fn create_collection_and_sync(
                 added_source(outcome)?
             };
             let outcome = client
-                .administer_collection(CollectionAdministration::Add(create_draft(
-                    request, wiki_id,
-                )))
+                .administer_collection(CollectionAdministration::AddWithImagePolicy {
+                    draft: create_draft(request, wiki_id),
+                    image_policy: request.image_policy,
+                })
                 .map_err(|error| collection_add_error(&error, source_created.then_some(wiki_id)))?;
             let collection_id = added_collection_id(outcome)?;
             client
@@ -2680,10 +2873,11 @@ async fn edit_collection(request: EditCollectionRequest) -> Result<DashboardSnap
                 Library::open(&request.library_path).map_err(|error| error.to_string())?;
             let outcome = administer_collection_direct(
                 &mut library,
-                CollectionAdministration::Edit {
+                CollectionAdministration::EditWithImagePolicy {
                     collection_id: request.collection_id,
                     expected_generation: request.expected_generation,
                     draft,
+                    image_policy: request.image_policy,
                 },
             )
             .map_err(|error| collection_edit_error(&error))?;
@@ -2693,10 +2887,11 @@ async fn edit_collection(request: EditCollectionRequest) -> Result<DashboardSnap
         }
         WriterAccess::Daemon(client) => {
             let outcome = client
-                .administer_collection(CollectionAdministration::Edit {
+                .administer_collection(CollectionAdministration::EditWithImagePolicy {
                     collection_id: request.collection_id,
                     expected_generation: request.expected_generation,
                     draft,
+                    image_policy: request.image_policy,
                 })
                 .map_err(|error| collection_edit_error(&error))?;
             ensure_edited_outcome(outcome, request.collection_id)?;
@@ -3426,6 +3621,39 @@ fn removal_policy_button(
     button(text(label)).on_press(message(policy)).into()
 }
 
+fn image_policy_button(
+    label: &str,
+    mode: ImageMode,
+    selected: ImageMode,
+    message: fn(ImageMode) -> Message,
+) -> Element<'static, Message> {
+    let label = if mode == selected {
+        format!("• {label}")
+    } else {
+        label.to_owned()
+    };
+    button(text(label)).on_press(message(mode)).into()
+}
+
+fn image_policy_form_summary(form: &CollectionForm) -> String {
+    match form.image_policy() {
+        Ok(policy) => format!("Configured image policy: {}", image_policy_summary(policy)),
+        Err(error) => format!("Thumbnail limits are invalid: {error}"),
+    }
+}
+
+fn image_policy_summary(policy: ImagePolicy) -> String {
+    match policy {
+        ImagePolicy::None => "off (text capture is independent of media)".to_owned(),
+        ImagePolicy::Thumbnails(policy) => format!(
+            "saved preview policy only; thumbnail download is not active in this build — edge ≤ {} px, ≤ {} images/revision, ≤ {} per image",
+            policy.maximum_edge_pixels(),
+            policy.maximum_images_per_revision(),
+            format_bytes(policy.maximum_bytes_per_image().get()),
+        ),
+    }
+}
+
 fn schedule_button(
     label: &str,
     mode: ScheduleMode,
@@ -3677,6 +3905,44 @@ fn collection_edit_view<'a>(editor: &'a CollectionEditor, enabled: bool) -> Elem
                 ),
             ]
             .spacing(8),
+            text("Referenced image capture").size(17),
+            row![
+                image_policy_button(
+                    "No images",
+                    ImageMode::None,
+                    form.image_mode,
+                    Message::EditImageModeChanged,
+                ),
+                image_policy_button(
+                    "Bounded thumbnails",
+                    ImageMode::Thumbnails,
+                    form.image_mode,
+                    Message::EditImageModeChanged,
+                ),
+            ]
+            .spacing(8),
+            row![
+                text_input(
+                    "Maximum thumbnail edge (pixels)",
+                    &form.thumbnail_max_edge_pixels,
+                )
+                .on_input(Message::EditThumbnailEdgeChanged)
+                .padding(10),
+                text_input(
+                    "Maximum images per revision",
+                    &form.thumbnail_max_images_per_revision,
+                )
+                .on_input(Message::EditThumbnailCountChanged)
+                .padding(10),
+                text_input(
+                    "Maximum bytes per thumbnail",
+                    &form.thumbnail_max_bytes_per_image,
+                )
+                .on_input(Message::EditThumbnailBytesChanged)
+                .padding(10),
+            ]
+            .spacing(8),
+            text(image_policy_form_summary(form)),
             text("Automatic synchronization schedule").size(17),
             row![
                 schedule_button(
@@ -3733,6 +3999,7 @@ fn collection_edit_view<'a>(editor: &'a CollectionEditor, enabled: bool) -> Elem
 
 fn collection_row<'a>(
     collection: &'a StoredCollection,
+    configuration: Option<&StoredCollectionConfiguration>,
     schedule: Option<&CollectionSchedule>,
     update_enabled: bool,
 ) -> Element<'a, Message> {
@@ -3769,6 +4036,11 @@ fn collection_row<'a>(
             ))
             .size(13),
             text(schedule).size(13),
+            text(configuration.map_or_else(
+                || "Image policy unavailable".to_owned(),
+                |configuration| image_policy_summary(configuration.image_policy),
+            ))
+            .size(13),
         ],
         Space::new(Length::Fill, Length::Shrink),
         text(format!("{} pages", collection.page_count)),
@@ -3958,7 +4230,7 @@ mod tests {
 
         let created = load_library_snapshot(&root, true).expect("create library");
         assert_eq!(created.path, root);
-        assert_eq!(created.schema_version, 10);
+        assert_eq!(created.schema_version, 12);
         assert!(root.join(DATABASE_NAME).is_file());
 
         let reopened = load_library_snapshot(&root, false).expect("reopen library");
@@ -3981,6 +4253,29 @@ mod tests {
         let budget = form.budget().expect("budget");
         assert_eq!(budget.maximum_pages().unwrap().get(), 100);
         assert_eq!(budget.maximum_bytes().unwrap().get(), 1_048_576);
+        assert_eq!(form.image_policy(), Ok(ImagePolicy::None));
+
+        let thumbnails = CollectionForm {
+            image_mode: ImageMode::Thumbnails,
+            thumbnail_max_edge_pixels: "640".to_owned(),
+            thumbnail_max_images_per_revision: "8".to_owned(),
+            thumbnail_max_bytes_per_image: "1048576".to_owned(),
+            ..CollectionForm::default()
+        };
+        let ImagePolicy::Thumbnails(policy) = thumbnails.image_policy().expect("image policy")
+        else {
+            panic!("expected thumbnails");
+        };
+        assert_eq!(policy.maximum_edge_pixels().get(), 640);
+        assert_eq!(policy.maximum_images_per_revision().get(), 8);
+        assert_eq!(policy.maximum_bytes_per_image().get(), 1_048_576);
+
+        let invalid = CollectionForm {
+            image_mode: ImageMode::Thumbnails,
+            thumbnail_max_edge_pixels: "0".to_owned(),
+            ..CollectionForm::default()
+        };
+        assert!(invalid.image_policy().is_err());
     }
 
     #[test]
@@ -4096,6 +4391,9 @@ mod tests {
                 .with_maximum_pages(50)
                 .expect("page budget"),
             removal_policy: CollectionRemovalPolicy::KeepTracking,
+            image_policy: ImagePolicy::Thumbnails(
+                ThumbnailPolicy::new(640, 8, 1_048_576).expect("thumbnail policy"),
+            ),
             schedule: ScheduleSettings {
                 cadence: ScheduleCadence::interval(7_200).expect("interval"),
                 jitter_seconds: 300,
@@ -4117,10 +4415,15 @@ mod tests {
                 .expect("configured");
             assert_eq!(configuration.name, "Edited");
             assert_eq!(configuration.history_policy, HistoryPolicy::Complete);
+            assert_eq!(configuration.generation, 2);
             assert_eq!(
                 configuration.removal_policy,
                 CollectionRemovalPolicy::KeepTracking
             );
+            assert!(matches!(
+                configuration.image_policy,
+                ImagePolicy::Thumbnails(_)
+            ));
             let members = library
                 .resolved_collection_members(direct_id)
                 .expect("members");
@@ -4181,6 +4484,9 @@ mod tests {
             history_policy: HistoryPolicy::Complete,
             budget: CollectionBudget::unlimited(),
             removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            image_policy: ImagePolicy::Thumbnails(
+                ThumbnailPolicy::new(320, 4, 524_288).expect("thumbnail policy"),
+            ),
             schedule: ScheduleSettings {
                 cadence: ScheduleCadence::Manual,
                 jitter_seconds: 0,
@@ -4218,6 +4524,7 @@ mod tests {
             .expect("configured");
         assert_eq!(configuration.name, "Concurrent edit");
         assert_eq!(configuration.generation, 2);
+        assert_eq!(configuration.image_policy, ImagePolicy::None);
     }
 
     #[tokio::test]
@@ -4235,6 +4542,7 @@ mod tests {
                 .with_maximum_bytes(1)
                 .expect("byte budget"),
             removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            image_policy: ImagePolicy::None,
             schedule: ScheduleSettings {
                 cadence: ScheduleCadence::Manual,
                 jitter_seconds: 0,
@@ -4275,6 +4583,7 @@ mod tests {
                 .with_maximum_bytes(1)
                 .expect("byte budget"),
             removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            image_policy: ImagePolicy::None,
             schedule: ScheduleSettings {
                 cadence: ScheduleCadence::Manual,
                 jitter_seconds: 0,
@@ -4569,6 +4878,9 @@ mod tests {
             history_policy: HistoryPolicy::CurrentAndFuture,
             budget: CollectionBudget::unlimited(),
             removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            image_policy: ImagePolicy::Thumbnails(
+                ThumbnailPolicy::new(800, 12, 2 * 1024 * 1024).expect("thumbnail policy"),
+            ),
             schedule: ScheduleSettings {
                 cadence: ScheduleCadence::Manual,
                 jitter_seconds: 0,
@@ -4579,6 +4891,15 @@ mod tests {
         .expect("daemon create and bootstrap");
         assert_eq!(snapshot.collections.len(), 1);
         assert_eq!(snapshot.collections[0].page_count, 1);
+        assert_eq!(snapshot.collection_configurations.len(), 1);
+        assert_eq!(snapshot.collection_configurations[0].generation, 1);
+        assert!(matches!(
+            snapshot.collection_configurations[0].image_policy,
+            ImagePolicy::Thumbnails(policy)
+                if policy.maximum_edge_pixels().get() == 800
+                    && policy.maximum_images_per_revision().get() == 12
+                    && policy.maximum_bytes_per_image().get() == 2 * 1024 * 1024
+        ));
         assert_eq!(snapshot.wikis.len(), 1);
         assert_eq!(snapshot.wikis[0].api_endpoint, server.endpoint);
         assert_eq!(snapshot.wikis[0].language_code, "en");
@@ -4635,6 +4956,7 @@ mod tests {
                 .with_maximum_bytes(1_000_000)
                 .unwrap(),
             removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            image_policy: ImagePolicy::None,
             schedule: ScheduleSettings {
                 cadence: ScheduleCadence::interval(3_600).unwrap(),
                 jitter_seconds: 300,

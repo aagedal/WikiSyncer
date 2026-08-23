@@ -11,6 +11,24 @@ pub const MAIN_NAMESPACE: i32 = 0;
 /// MediaWiki's category namespace, traversed but not selected as article content.
 pub const CATEGORY_NAMESPACE: i32 = 14;
 
+/// Default longest edge requested for a captured thumbnail.
+pub const DEFAULT_THUMBNAIL_MAX_EDGE_PIXELS: u32 = 640;
+
+/// Largest supported thumbnail edge. Higher-resolution media is post-v1 work.
+pub const MAX_THUMBNAIL_EDGE_PIXELS: u32 = 4_096;
+
+/// Default maximum image placements captured from one revision.
+pub const DEFAULT_THUMBNAILS_PER_REVISION: u32 = 32;
+
+/// Largest supported number of image placements in one revision.
+pub const MAX_THUMBNAILS_PER_REVISION: u32 = 256;
+
+/// Default maximum canonical bytes accepted for one thumbnail.
+pub const DEFAULT_THUMBNAIL_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Largest supported canonical byte bound for one thumbnail.
+pub const MAX_THUMBNAIL_BYTES: u64 = 64 * 1024 * 1024;
+
 macro_rules! numeric_id {
     ($name:ident, $label:literal) => {
         #[doc = concat!("A validated ", $label, ".")]
@@ -58,6 +76,7 @@ numeric_id!(WikiId, "wiki ID");
 numeric_id!(CollectionId, "collection ID");
 numeric_id!(PageId, "MediaWiki page ID");
 numeric_id!(RevisionId, "MediaWiki revision ID");
+numeric_id!(MediaId, "MediaWiki file page ID");
 
 /// The error returned when a numeric identity is zero.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -380,6 +399,124 @@ impl fmt::Display for InvalidCollectionBudget {
 
 impl Error for InvalidCollectionBudget {}
 
+/// Capture policy for images referenced by selected article revisions.
+///
+/// Stable v1 deliberately supports only disabled image capture and bounded raster
+/// thumbnails. Original/high-resolution media remains a post-v1 policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ImagePolicy {
+    /// Do not acquire media. This is the privacy- and bandwidth-preserving default.
+    #[default]
+    None,
+    /// Capture bounded raster thumbnails with complete attribution metadata.
+    Thumbnails(ThumbnailPolicy),
+}
+
+/// Hard acquisition bounds for the stable-v1 thumbnail policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ThumbnailPolicy {
+    maximum_edge_pixels: NonZeroU32,
+    maximum_images_per_revision: NonZeroU32,
+    maximum_bytes_per_image: NonZeroU64,
+}
+
+impl ThumbnailPolicy {
+    /// Creates a thumbnail policy after enforcing stable-v1 safety ceilings.
+    pub fn new(
+        maximum_edge_pixels: u32,
+        maximum_images_per_revision: u32,
+        maximum_bytes_per_image: u64,
+    ) -> Result<Self, InvalidImagePolicy> {
+        let maximum_edge_pixels =
+            NonZeroU32::new(maximum_edge_pixels).ok_or(InvalidImagePolicy::ZeroMaximumEdge)?;
+        if maximum_edge_pixels.get() > MAX_THUMBNAIL_EDGE_PIXELS {
+            return Err(InvalidImagePolicy::MaximumEdgeTooLarge);
+        }
+        let maximum_images_per_revision = NonZeroU32::new(maximum_images_per_revision)
+            .ok_or(InvalidImagePolicy::ZeroMaximumImages)?;
+        if maximum_images_per_revision.get() > MAX_THUMBNAILS_PER_REVISION {
+            return Err(InvalidImagePolicy::TooManyImages);
+        }
+        let maximum_bytes_per_image =
+            NonZeroU64::new(maximum_bytes_per_image).ok_or(InvalidImagePolicy::ZeroMaximumBytes)?;
+        if maximum_bytes_per_image.get() > MAX_THUMBNAIL_BYTES {
+            return Err(InvalidImagePolicy::MaximumBytesTooLarge);
+        }
+        Ok(Self {
+            maximum_edge_pixels,
+            maximum_images_per_revision,
+            maximum_bytes_per_image,
+        })
+    }
+
+    /// Returns the longest permitted raster edge in pixels.
+    #[must_use]
+    pub const fn maximum_edge_pixels(self) -> NonZeroU32 {
+        self.maximum_edge_pixels
+    }
+
+    /// Returns the maximum number of image placements captured from one revision.
+    #[must_use]
+    pub const fn maximum_images_per_revision(self) -> NonZeroU32 {
+        self.maximum_images_per_revision
+    }
+
+    /// Returns the maximum canonical bytes accepted for one thumbnail.
+    #[must_use]
+    pub const fn maximum_bytes_per_image(self) -> NonZeroU64 {
+        self.maximum_bytes_per_image
+    }
+}
+
+impl Default for ThumbnailPolicy {
+    fn default() -> Self {
+        Self {
+            maximum_edge_pixels: NonZeroU32::new(DEFAULT_THUMBNAIL_MAX_EDGE_PIXELS)
+                .expect("default thumbnail edge is nonzero"),
+            maximum_images_per_revision: NonZeroU32::new(DEFAULT_THUMBNAILS_PER_REVISION)
+                .expect("default thumbnail count is nonzero"),
+            maximum_bytes_per_image: NonZeroU64::new(DEFAULT_THUMBNAIL_BYTES)
+                .expect("default thumbnail byte bound is nonzero"),
+        }
+    }
+}
+
+/// A thumbnail policy exceeded a stable-v1 safety bound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvalidImagePolicy {
+    /// A thumbnail edge bound was zero.
+    ZeroMaximumEdge,
+    /// A thumbnail edge exceeded [`MAX_THUMBNAIL_EDGE_PIXELS`].
+    MaximumEdgeTooLarge,
+    /// A per-revision image count was zero.
+    ZeroMaximumImages,
+    /// A per-revision image count exceeded [`MAX_THUMBNAILS_PER_REVISION`].
+    TooManyImages,
+    /// A per-image byte bound was zero.
+    ZeroMaximumBytes,
+    /// A per-image byte bound exceeded [`MAX_THUMBNAIL_BYTES`].
+    MaximumBytesTooLarge,
+}
+
+impl fmt::Display for InvalidImagePolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroMaximumEdge => formatter.write_str("thumbnail edge must be positive"),
+            Self::MaximumEdgeTooLarge => formatter.write_str("thumbnail edge exceeds 4096 pixels"),
+            Self::ZeroMaximumImages => {
+                formatter.write_str("thumbnail count per revision must be positive")
+            }
+            Self::TooManyImages => formatter.write_str("thumbnail count per revision exceeds 256"),
+            Self::ZeroMaximumBytes => formatter.write_str("thumbnail byte bound must be positive"),
+            Self::MaximumBytesTooLarge => {
+                formatter.write_str("thumbnail byte bound exceeds 64 MiB")
+            }
+        }
+    }
+}
+
+impl Error for InvalidImagePolicy {}
+
 /// The amount of public revision history retained for a selected page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HistoryPolicy {
@@ -520,5 +657,39 @@ mod tests {
             HistoryPolicy::last_n(10),
             Ok(HistoryPolicy::LastN(count)) if count.get() == 10
         ));
+    }
+
+    #[test]
+    fn image_capture_defaults_off_and_thumbnail_bounds_are_explicit() {
+        assert_eq!(ImagePolicy::default(), ImagePolicy::None);
+        let defaults = ThumbnailPolicy::default();
+        assert_eq!(
+            defaults.maximum_edge_pixels().get(),
+            DEFAULT_THUMBNAIL_MAX_EDGE_PIXELS
+        );
+        assert_eq!(
+            defaults.maximum_images_per_revision().get(),
+            DEFAULT_THUMBNAILS_PER_REVISION
+        );
+        assert_eq!(
+            defaults.maximum_bytes_per_image().get(),
+            DEFAULT_THUMBNAIL_BYTES
+        );
+        assert_eq!(
+            ThumbnailPolicy::new(0, 1, 1),
+            Err(InvalidImagePolicy::ZeroMaximumEdge)
+        );
+        assert_eq!(
+            ThumbnailPolicy::new(MAX_THUMBNAIL_EDGE_PIXELS + 1, 1, 1),
+            Err(InvalidImagePolicy::MaximumEdgeTooLarge)
+        );
+        assert_eq!(
+            ThumbnailPolicy::new(1, MAX_THUMBNAILS_PER_REVISION + 1, 1),
+            Err(InvalidImagePolicy::TooManyImages)
+        );
+        assert_eq!(
+            ThumbnailPolicy::new(1, 1, MAX_THUMBNAIL_BYTES + 1),
+            Err(InvalidImagePolicy::MaximumBytesTooLarge)
+        );
     }
 }

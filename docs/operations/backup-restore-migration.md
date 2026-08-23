@@ -1,9 +1,10 @@
 # Backup, restore, and migration
 
-WikiSyncer does not yet publish a stable backup-file contract. The safe beta procedure
-is a quiescent, whole-directory copy of the library. This preserves the SQLite
-database, its WAL state, immutable loose objects, packfiles and indexes, and any
-future manifest or export directories together.
+WikiSyncer's stable-v1 backup contract is a quiescent, permission-preserving,
+whole-directory copy of the library. It is a directory contract rather than a custom
+backup-file format. This preserves the SQLite database, its WAL state, immutable
+loose objects, packfiles and indexes, manifests, and any other durable library-local
+files together.
 
 Never treat a copy of `library.sqlite3` alone as a complete backup. Canonical revision
 bytes live below `objects/`, and a live SQLite database may also have `-wal` and
@@ -175,15 +176,16 @@ Restore into a new empty destination so the existing library remains recoverable
 A restored library whose full check passes demonstrates internal object and manifest-
 chain consistency since capture. Without an externally retained signed manifest head,
 it cannot detect replacement by an older internally consistent backup or prove
-completeness relative to Wikimedia. No current command certifies that the backup
-includes every filesystem artifact expected by a future stable format.
+completeness relative to Wikimedia. The producing binary defines the durable entries
+that belong to its stable-v1 whole-directory backup; no database-only or hand-selected
+subset is a conforming backup.
 
 ## Upgrade and schema migration
 
-`Library::open` applies forward SQLite migrations automatically. At this checkpoint
-the repository schema version is 9, but that number and the migration contract are
-not yet declared stable. Merely running an offline CLI command such as `status` opens
-the library and can migrate it.
+`Library::open` applies forward SQLite migrations automatically. Stable v1 guarantees
+preservation through supported monotonic migrations, not a frozen public table layout
+or schema number. Merely running an offline CLI command such as `status` opens the
+library and can migrate it.
 
 For an upgrade:
 

@@ -69,8 +69,9 @@ async fn captured_library_remains_readable_searchable_and_diffable_offline() {
     );
 
     let search = run_json(&library_root, &["search", "--json", "systems programming"]);
-    assert_eq!(search[0]["title"], "Rust (programming language)");
-    assert_eq!(search[0]["revision_id"], 1_300_000_001_u64);
+    assert_eq!(search["schema_version"], 1);
+    assert_eq!(search["results"][0]["title"], "Rust (programming language)");
+    assert_eq!(search["results"][0]["revision_id"], 1_300_000_001_u64);
 
     let article = run_json(
         &library_root,
@@ -82,6 +83,7 @@ async fn captured_library_remains_readable_searchable_and_diffable_offline() {
             "Rust (programming language)",
         ],
     );
+    assert_eq!(article["schema_version"], 1);
     assert_eq!(article["format"], "markdown");
     assert!(
         article["content"]
@@ -89,7 +91,6 @@ async fn captured_library_remains_readable_searchable_and_diffable_offline() {
             .unwrap()
             .contains("systems programming")
     );
-
     let history = run_json(
         &library_root,
         &[
@@ -100,6 +101,7 @@ async fn captured_library_remains_readable_searchable_and_diffable_offline() {
             "Rust (programming language)",
         ],
     );
+    assert_eq!(history["schema_version"], 1);
     assert_eq!(history["revisions"].as_array().unwrap().len(), 2);
 
     let older = run_json(
@@ -115,6 +117,7 @@ async fn captured_library_remains_readable_searchable_and_diffable_offline() {
             "Rust (programming language)",
         ],
     );
+    assert_eq!(older["schema_version"], 1);
     assert_eq!(older["format"], "wikitext");
     assert_eq!(older["content"], "== Rust ==\nA programming language.");
 
@@ -130,6 +133,7 @@ async fn captured_library_remains_readable_searchable_and_diffable_offline() {
             "1300000001",
         ],
     );
+    assert_eq!(difference["schema_version"], 1);
     assert_eq!(difference["mode"], "reading");
     assert_eq!(difference["has_changes"], true);
 

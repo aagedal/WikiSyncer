@@ -4,7 +4,7 @@
 //! identities recorded when they were captured. It does not establish that an
 //! upstream statement is true, unbiased, complete, or still publicly available.
 //! Full verification also checks reference consistency exposed by the current
-//! schema. Schema version 9 has no persistent derived-cache table, so no report from
+//! schema. Schema version 12 has no persistent derived-cache table, so no report from
 //! this version claims derived-cache inventory or cache-body verification.
 
 use std::collections::HashSet;
@@ -15,7 +15,8 @@ use std::fs;
 use ring::rand::SystemRandom;
 use ring::signature::{self, Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
-use wikisync_content::PLAIN_TEXT_TRANSFORMER_VERSION;
+use wikisync_content::{PLAIN_TEXT_TRANSFORMER_VERSION, ThumbnailLimits, validate_thumbnail};
+use wikisync_core::{MAX_THUMBNAIL_BYTES, MAX_THUMBNAIL_EDGE_PIXELS};
 use wikisync_store::{
     IntegrityMetadataIssue, IntegrityMetadataSubject, Library, ManifestId, ObjectId,
     ObjectVerificationState, StoreError, SyncRunState,
@@ -24,6 +25,7 @@ use wikisync_store::{
 const TRUSTED_HEAD_SCHEMA_VERSION: u32 = 1;
 const TRUSTED_HEAD_ALGORITHM: &str = "Ed25519";
 const TRUSTED_HEAD_DOMAIN: &[u8] = b"wikisync-trusted-manifest-head-v1\0";
+const MAX_THUMBNAIL_BYTES_PER_PIXEL: u64 = 8;
 
 /// Byte length of an Ed25519 public verification key.
 pub const ED25519_PUBLIC_KEY_BYTES: usize = 32;
@@ -161,6 +163,22 @@ pub enum VerificationFindingKind {
     SearchFtsRowMissing,
     /// A contentless FTS row had no corresponding search metadata row.
     SearchFtsRowOrphan,
+    /// Captured media metadata pointed to an absent canonical object.
+    MediaObjectUnreachable,
+    /// Captured media metadata pointed to a logical object that was not media.
+    MediaObjectKindMismatch,
+    /// Captured media metadata or its bounded passive-raster signature was inconsistent.
+    MediaMetadataMismatch,
+    /// A media-linked canonical object could not be reconstructed and hash-verified.
+    MediaObjectUnreadable,
+    /// A media placement pointed to an absent revision in its recorded wiki.
+    MediaPlacementRevisionUnreachable,
+    /// A media placement's revision pointed to an absent owning page.
+    MediaPlacementPageUnreachable,
+    /// A media placement pointed to absent media metadata in its recorded wiki.
+    MediaPlacementMediaUnreachable,
+    /// A media placement contained invalid bounded placement metadata.
+    MediaPlacementMetadataMismatch,
     /// A search document was produced by a transformer other than the current one.
     SearchTransformerVersionMismatch,
     /// The metadata-reference catalog changed during the scan.
@@ -207,12 +225,14 @@ pub struct VerificationReport {
     pub manifests_examined: u64,
     /// Manifest files whose embedded identity reproduced their canonical body.
     pub manifests_identity_verified: u64,
-    /// Revision, page, checkpoint, search-document, and FTS records present when a
-    /// full metadata-reference scan began. Quick verification leaves this zero.
+    /// Revision, page, checkpoint, search-document, FTS, media, and media-placement
+    /// records present when a full metadata-reference scan began. Quick verification
+    /// leaves this zero.
     pub metadata_records_at_start: u64,
     /// Metadata-reference records present when a full scan ended.
     pub metadata_records_at_end: u64,
-    /// Metadata-reference records examined through bounded keyset pages.
+    /// Metadata-reference records examined through bounded keyset pages, including
+    /// media metadata and revision placements in a full scan.
     pub metadata_records_examined: u64,
     /// Whether an externally supplied Ed25519 trusted head was signature-verified
     /// and matched the current local manifest head.
@@ -775,6 +795,14 @@ fn verify_metadata_references(
                 report.metadata_records_examined.checked_add(1).ok_or(
                     VerificationError::CounterOverflow("metadata records examined"),
                 )?;
+            let media_object_id = record.media_object.as_ref().map(|media| media.object_id);
+            let media_reference_is_readable = !record.issues.iter().any(|issue| {
+                matches!(
+                    issue,
+                    IntegrityMetadataIssue::MediaObjectMissing
+                        | IntegrityMetadataIssue::MediaObjectWrongKind
+                )
+            });
             for issue in record.issues {
                 let (kind, detail) = metadata_finding(issue);
                 push_finding(
@@ -782,7 +810,7 @@ fn verify_metadata_references(
                     options.max_retained_findings,
                     VerificationFinding {
                         kind,
-                        object_id: None,
+                        object_id: media_object_id,
                         manifest_sequence: None,
                         metadata_subject: Some(subject.clone()),
                         message: format!("{subject:?}: {detail}"),
@@ -806,6 +834,49 @@ fn verify_metadata_references(
                         ),
                     },
                 );
+            }
+            if media_reference_is_readable && let Some(media_object) = record.media_object {
+                match library.read_object(media_object.object_id) {
+                    Ok(bytes) => {
+                        let validation = validate_thumbnail(
+                            &bytes,
+                            &media_object.mime_type,
+                            &integrity_thumbnail_limits(),
+                        );
+                        let metadata_matches = validation.is_ok_and(|validated| {
+                            media_object.width == Some(validated.width)
+                                && media_object.height == Some(validated.height)
+                        });
+                        if !metadata_matches {
+                            push_finding(
+                                report,
+                                options.max_retained_findings,
+                                VerificationFinding {
+                                    kind: VerificationFindingKind::MediaMetadataMismatch,
+                                    object_id: Some(media_object.object_id),
+                                    manifest_sequence: None,
+                                    metadata_subject: Some(subject.clone()),
+                                    message: format!(
+                                        "{subject:?}: canonical bytes fail complete bounded passive-raster validation or disagree with recorded dimensions"
+                                    ),
+                                },
+                            );
+                        }
+                    }
+                    Err(error) => push_finding(
+                        report,
+                        options.max_retained_findings,
+                        VerificationFinding {
+                            kind: VerificationFindingKind::MediaObjectUnreadable,
+                            object_id: Some(media_object.object_id),
+                            manifest_sequence: None,
+                            metadata_subject: Some(subject.clone()),
+                            message: format!(
+                                "{subject:?}: media-linked canonical object failed verified read: {error}"
+                            ),
+                        },
+                    ),
+                }
             }
         }
     }
@@ -840,6 +911,17 @@ fn verify_metadata_references(
     Ok(())
 }
 
+fn integrity_thumbnail_limits() -> ThumbnailLimits {
+    let maximum_pixels =
+        u64::from(MAX_THUMBNAIL_EDGE_PIXELS) * u64::from(MAX_THUMBNAIL_EDGE_PIXELS);
+    ThumbnailLimits {
+        max_encoded_bytes: MAX_THUMBNAIL_BYTES,
+        max_width: MAX_THUMBNAIL_EDGE_PIXELS,
+        max_height: MAX_THUMBNAIL_EDGE_PIXELS,
+        max_pixels: maximum_pixels,
+        max_decoded_bytes: maximum_pixels * MAX_THUMBNAIL_BYTES_PER_PIXEL,
+    }
+}
 const fn metadata_finding(
     issue: IntegrityMetadataIssue,
 ) -> (VerificationFindingKind, &'static str) {
@@ -911,6 +993,34 @@ const fn metadata_finding(
         IntegrityMetadataIssue::SearchFtsRowOrphan => (
             VerificationFindingKind::SearchFtsRowOrphan,
             "FTS row has no search document",
+        ),
+        IntegrityMetadataIssue::MediaObjectMissing => (
+            VerificationFindingKind::MediaObjectUnreachable,
+            "media metadata's canonical content object is absent",
+        ),
+        IntegrityMetadataIssue::MediaObjectWrongKind => (
+            VerificationFindingKind::MediaObjectKindMismatch,
+            "media metadata points to a non-media logical object",
+        ),
+        IntegrityMetadataIssue::MediaMetadataInvalid => (
+            VerificationFindingKind::MediaMetadataMismatch,
+            "media metadata violates bounded canonical-object or thumbnail invariants",
+        ),
+        IntegrityMetadataIssue::PageMediaRevisionMissing => (
+            VerificationFindingKind::MediaPlacementRevisionUnreachable,
+            "media placement's revision is absent from its recorded wiki",
+        ),
+        IntegrityMetadataIssue::PageMediaPageMissing => (
+            VerificationFindingKind::MediaPlacementPageUnreachable,
+            "media placement's revision has no owning page in its recorded wiki",
+        ),
+        IntegrityMetadataIssue::PageMediaMediaMissing => (
+            VerificationFindingKind::MediaPlacementMediaUnreachable,
+            "media placement's immutable media version is absent from its recorded wiki",
+        ),
+        IntegrityMetadataIssue::PageMediaMetadataInvalid => (
+            VerificationFindingKind::MediaPlacementMetadataMismatch,
+            "media placement violates bounded ordering or display-metadata invariants",
         ),
     }
 }
@@ -1340,10 +1450,21 @@ mod tests {
 
     use rusqlite::params;
     use tempfile::TempDir;
-    use wikisync_core::{PageId, PageTitle, RevisionId};
-    use wikisync_store::{CurrentRevisionCapture, Library, ObjectKind, SyncRunKind};
+    use wikisync_core::{MediaId, PageId, PageTitle, RevisionId, ThumbnailPolicy};
+    use wikisync_store::{
+        CurrentRevisionCapture, Library, MediaPlacementKind, ObjectKind, RevisionMediaPlacement,
+        SyncRunKind, ThumbnailCapture, ThumbnailMimeType,
+    };
 
     use super::*;
+
+    const VALID_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5,
+        0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64,
+        0xf8, 0x0f, 0x00, 0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
 
     fn populated_library(count: usize) -> (TempDir, Library, u64) {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -1454,6 +1575,74 @@ mod tests {
             )
             .expect("FTS row");
         (directory, library)
+    }
+
+    fn media_fixture() -> (TempDir, Library, ObjectId) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut library = Library::open(directory.path()).expect("library");
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "media fixture")
+            .expect("collection");
+        let title = PageTitle::new("Media fixture page").expect("title");
+        let page_id = PageId::new(40).expect("page");
+        let revision_id = RevisionId::new(400).expect("revision");
+        library
+            .capture_current_revision(
+                wiki_id,
+                collection_id,
+                &CurrentRevisionCapture {
+                    page_id,
+                    namespace: 0,
+                    title: &title,
+                    revision_id,
+                    parent_id: None,
+                    timestamp: "2026-08-22T00:00:00Z",
+                    author: Some("Fixture author"),
+                    author_id: Some(1),
+                    comment: Some("media fixture"),
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: b"Media fixture source",
+                },
+            )
+            .expect("capture revision");
+        let file_title = PageTitle::new("File:Integrity fixture.png").expect("file title");
+        let capture = ThumbnailCapture {
+            media_id: MediaId::new(9_001).expect("media ID"),
+            file_title: &file_title,
+            source_sha1: "abcdef0123456789abcdef0123456789abcdef01",
+            original_url: "https://upload.wikimedia.org/integrity-fixture.png",
+            description_url: "https://commons.wikimedia.org/wiki/File:Integrity_fixture.png",
+            author: "Fixture photographer",
+            attribution: "Fixture photographer / Wikimedia Commons",
+            license_name: "CC BY-SA 4.0",
+            license_url: Some("https://creativecommons.org/licenses/by-sa/4.0/"),
+            width: 1,
+            height: 1,
+            mime_type: ThumbnailMimeType::Png,
+            captured_at: 1_776_000_000,
+            source: VALID_PNG,
+        };
+        let stored = library
+            .capture_revision_thumbnail(
+                wiki_id,
+                page_id,
+                revision_id,
+                ThumbnailPolicy::default(),
+                &capture,
+                RevisionMediaPlacement {
+                    index: 0,
+                    kind: MediaPlacementKind::Lead,
+                    caption: Some("Fixture caption"),
+                    alt_text: Some("Fixture alternative text"),
+                },
+            )
+            .expect("capture thumbnail");
+        (directory, library, stored.id)
     }
 
     #[test]
@@ -1875,6 +2064,260 @@ mod tests {
                 IntegrityMetadataSubject::SearchFtsRow { .. }
             ]
         ));
+    }
+
+    #[test]
+    fn full_verification_scans_valid_media_and_placements_in_bounded_pages() {
+        let (_directory, library, media_object_id) = media_fixture();
+        let report = verify_library_with_options(
+            &library,
+            VerificationOptions {
+                page_size: 1,
+                ..VerificationOptions::new(VerificationScope::Full)
+            },
+        )
+        .expect("verification");
+
+        assert_eq!(report.objects_at_start, 2);
+        assert_eq!(report.objects_verified, 2);
+        assert_eq!(report.metadata_records_at_start, 4);
+        assert_eq!(report.metadata_records_examined, 4);
+        assert_eq!(report.metadata_records_at_end, 4);
+        assert_eq!(report.finding_count, 0);
+        assert!(report.is_verified_since_capture());
+        assert_eq!(
+            library.read_object(media_object_id).expect("media object"),
+            VALID_PNG
+        );
+    }
+
+    #[test]
+    fn full_verification_rejects_malformed_media_and_out_of_contract_metadata() {
+        let (_directory, mut library, _media_object_id) = media_fixture();
+        let malformed = library
+            .put_bytes(
+                ObjectKind::Media,
+                b"\x89PNG\r\n\x1a\nstructurally incomplete raster",
+            )
+            .expect("store independently hash-valid malformed media object");
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .execute(
+                "INSERT INTO media (
+                    wiki_id, source_media_id, source_sha1, file_title, original_url,
+                    description_url, author, attribution, license_name, license_url,
+                    width, height, mime_type, captured_at, content_object_id
+                 ) VALUES (
+                    1, 9002, 'abcdefabcdefabcdefabcdefabcdefabcdefabcd',
+                    'File:Malformed.png', 'https://upload.wikimedia.org/malformed.png',
+                    'https://commons.wikimedia.org/wiki/File:Malformed.png',
+                    'Fixture author', 'Fixture attribution', 'CC0', NULL,
+                    1, 1, 'image/png', 1776000001, ?1
+                 )",
+                [malformed.id.to_string()],
+            )
+            .expect("insert corrupt fixture through raw metadata boundary");
+        connection
+            .pragma_update(None, "ignore_check_constraints", true)
+            .expect("disable fixture check constraints");
+        connection
+            .execute(
+                "UPDATE media
+                 SET author = 'control' || char(10) || 'metadata', width = 4097
+                 WHERE source_media_id = 9001",
+                [],
+            )
+            .expect("inject out-of-contract metadata");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::MediaMetadataMismatch
+                && finding.object_id == Some(malformed.id)
+                && finding
+                    .message
+                    .contains("complete bounded passive-raster validation")
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::MediaMetadataMismatch
+                && matches!(
+                    finding.metadata_subject,
+                    Some(IntegrityMetadataSubject::Media {
+                        source_media_id: 9001,
+                        ..
+                    })
+                )
+        }));
+        assert!(!report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn full_verification_reports_missing_and_wrong_kind_media_objects() {
+        let (_directory, library, media_object_id) = media_fixture();
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .expect("disable fixture foreign keys");
+        connection
+            .pragma_update(None, "ignore_check_constraints", true)
+            .expect("disable fixture check constraints");
+        let absent_object = format!("b3:{}", "00".repeat(32));
+        connection
+            .execute(
+                "UPDATE media SET content_object_id = ?1 WHERE source_media_id = 9001",
+                [&absent_object],
+            )
+            .expect("break media object pointer");
+
+        let missing = verify_library(&library, VerificationScope::Full).expect("verification");
+        assert!(missing.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::MediaObjectUnreachable
+                && finding.object_id == absent_object.parse().ok()
+                && matches!(
+                    finding.metadata_subject,
+                    Some(IntegrityMetadataSubject::Media {
+                        wiki_id: 1,
+                        source_media_id: 9001,
+                        ..
+                    })
+                )
+        }));
+
+        connection
+            .execute(
+                "UPDATE media SET content_object_id = ?1, mime_type = 'image/jpeg', width = 0
+                 WHERE source_media_id = 9001",
+                [media_object_id.to_string()],
+            )
+            .expect("restore pointer and mismatch MIME");
+        connection
+            .execute(
+                "UPDATE content_objects SET object_kind = 'wikitext' WHERE object_id = ?1",
+                [media_object_id.to_string()],
+            )
+            .expect("break media object kind");
+
+        let mismatched = verify_library(&library, VerificationScope::Full).expect("verification");
+        assert!(mismatched.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::MediaObjectKindMismatch
+                && finding.object_id == Some(media_object_id)
+        }));
+        assert!(mismatched.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::MediaMetadataMismatch
+                && finding.object_id == Some(media_object_id)
+        }));
+        assert!(!mismatched.is_verified_since_capture());
+
+        connection
+            .execute(
+                "UPDATE content_objects SET object_kind = 'media' WHERE object_id = ?1",
+                [media_object_id.to_string()],
+            )
+            .expect("restore media object kind");
+        connection
+            .execute(
+                "UPDATE media SET width = 1 WHERE source_media_id = 9001",
+                [],
+            )
+            .expect("restore dimensions while retaining mismatched MIME");
+        let signature_mismatch =
+            verify_library(&library, VerificationScope::Full).expect("verification");
+        assert!(signature_mismatch.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::MediaMetadataMismatch
+                && finding.object_id == Some(media_object_id)
+                && finding
+                    .message
+                    .contains("complete bounded passive-raster validation")
+        }));
+    }
+
+    #[test]
+    fn full_verification_reports_media_revision_page_and_metadata_ownership() {
+        let (_directory, library, _media_object_id) = media_fixture();
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .expect("disable fixture foreign keys");
+        connection
+            .pragma_update(None, "ignore_check_constraints", true)
+            .expect("disable fixture check constraints");
+        connection
+            .execute(
+                "INSERT INTO page_media (
+                    wiki_id, revision_id, placement_index, source_media_id,
+                    source_sha1, content_object_id, placement_kind, caption, alt_text
+                 ) SELECT wiki_id, 999, 1, source_media_id, source_sha1,
+                          content_object_id, placement_kind, caption, alt_text
+                   FROM page_media WHERE revision_id = 400 AND placement_index = 0",
+                [],
+            )
+            .expect("insert unreachable revision placement");
+        connection
+            .execute("DELETE FROM pages WHERE page_id = 40", [])
+            .expect("remove owning page");
+        connection
+            .execute(
+                "UPDATE page_media SET source_media_id = 9999, placement_kind = 'unexpected'
+                 WHERE revision_id = 400",
+                [],
+            )
+            .expect("break media and placement metadata");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+        let kinds = report
+            .findings
+            .iter()
+            .map(|finding| finding.kind)
+            .collect::<HashSet<_>>();
+        assert!(kinds.contains(&VerificationFindingKind::MediaPlacementRevisionUnreachable));
+        assert!(kinds.contains(&VerificationFindingKind::MediaPlacementPageUnreachable));
+        assert!(kinds.contains(&VerificationFindingKind::MediaPlacementMediaUnreachable));
+        assert!(kinds.contains(&VerificationFindingKind::MediaPlacementMetadataMismatch));
+        assert!(
+            report
+                .findings
+                .iter()
+                .filter(|finding| {
+                    matches!(
+                        finding.kind,
+                        VerificationFindingKind::MediaPlacementRevisionUnreachable
+                            | VerificationFindingKind::MediaPlacementPageUnreachable
+                            | VerificationFindingKind::MediaPlacementMediaUnreachable
+                            | VerificationFindingKind::MediaPlacementMetadataMismatch
+                    )
+                })
+                .all(|finding| {
+                    matches!(
+                        finding.metadata_subject,
+                        Some(IntegrityMetadataSubject::PageMedia { .. })
+                    )
+                })
+        );
+        assert!(!report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn full_verification_reports_media_hash_failure_with_metadata_subject() {
+        let (directory, library, media_object_id) = media_fixture();
+        let encoded = media_object_id.to_string();
+        let digest = encoded.strip_prefix("b3:").expect("object prefix");
+        let loose_path = directory
+            .path()
+            .join("objects/loose/b3")
+            .join(&digest[..2])
+            .join(&digest[2..4])
+            .join(digest);
+        fs::write(loose_path, b"tampered compressed media").expect("tamper media object");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::MediaObjectUnreadable
+                && finding.object_id == Some(media_object_id)
+                && matches!(
+                    finding.metadata_subject,
+                    Some(IntegrityMetadataSubject::Media { .. })
+                )
+        }));
+        assert!(!report.is_verified_since_capture());
     }
 
     #[test]

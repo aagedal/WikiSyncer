@@ -1,0 +1,13 @@
+{
+  "parse": {
+    "title": "Fixture article",
+    "pageid": 42,
+    "revid": 100,
+    "images": [
+      "Lead photo.JPG",
+      "Active diagram.svg",
+      "Inline figure.png",
+      "Third image.jpeg"
+    ]
+  }
+}

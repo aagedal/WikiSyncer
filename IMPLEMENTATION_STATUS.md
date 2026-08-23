@@ -1,6 +1,6 @@
 # WikiSyncer implementation status
 
-Updated: 2026-08-22
+Updated: 2026-08-23
 
 ## Completed backlog items
 
@@ -264,59 +264,128 @@ Additional stable-v1 application progress now includes:
   preserves historical scope and captured data; a separate purge command would still
   require its own bounded preview and evidence-preservation design.
 
+Stable contracts, pack tuning, and dump-import foundations now also include:
+
+- a documented stable-v1 compatibility boundary for general CLI JSON, export
+  schemas, forward-only database/configuration migration, and quiescent
+  permission-preserving whole-library directory backups. General CLI JSON responses
+  now carry `schema_version: 1`, with deterministic golden fixtures; doctor and export
+  retain their independent version identifiers;
+- schema migration 11 and deterministic pack affinity ordering by object kind,
+  wiki/page, logarithmic size class, and revision order; same-page bounded delta
+  search, periodic complete anchors, and oversized-candidate isolation. A 100-revision
+  fixture packs from 820,100 loose compressed bytes to 222,563 pack-plus-index bytes
+  while preserving a deterministic pack identity across ingestion orders; and
+- a bounded streaming current-page multistream dump reader using concatenated bzip2
+  decoding and pull-based XML parsing without whole-dump disk decompression. It has
+  explicit compressed/decompressed/page/text/XML/cardinality limits, namespace and
+  content-model filters, strict scalar/structure handling, suppressed-contributor
+  protection, and offline fixtures. Authenticated dump/index acquisition, durable
+  import/resume, selection integration, and the post-bootstrap Action API race closure
+  are not yet implemented.
+
+Optional-thumbnail foundations are implemented but do not yet form an end-to-end
+sync path:
+
+- schema migration 12 adds default-off, generation-tracked bounded thumbnail policy,
+  rendition-aware immutable media metadata, revision placements, attribution,
+  licensing, capture provenance, and canonical media-object references. Collection
+  create/edit persists the policy atomically with scope, membership, history, budgets,
+  and generation through both direct and daemon-owned paths;
+- Iced exposes default-off or bounded thumbnail limits, while daemon draft version 2
+  carries the policy within the existing frame and total-draft bounds and preserves
+  legacy draft/protocol behavior;
+- JPEG and passive PNG bytes must pass MIME/magic agreement, structural completion,
+  animation rejection, bounded full decoding, pixel/dimension/allocation ceilings,
+  and exact decoded-metadata agreement before storage. Multiple renditions are
+  retained, and a same-byte retry preserves the first capture time;
+- full verification now performs bounded stable scans of media and placement metadata,
+  verified object reads, complete raster validation, rendition/reference ownership,
+  and stable-v1 metadata bounds; and
+- MediaWiki support can discover a bounded exact-revision passive-image list, resolve
+  typed thumbnail/attribution/license/hash metadata, and download same-origin bytes
+  through the existing semaphore, DNS, redirect, retry, circuit, rate, per-image, and
+  per-run limits. Ordinary Wikimedia thumbnails normally use `upload.wikimedia.org`,
+  which remains fail-closed until an explicit source-bound CDN-origin policy exists.
+  Synchronization does not yet invoke discovery/download/validation/storage, the
+  manifest chain does not yet authenticate media inventory, and reader/export
+  rendering with attribution is not implemented.
+
 Credential-free beta packaging readiness now includes:
 
 - deterministic, bounded macOS and Linux release-candidate archives containing the
   CLI, daemon, GUI, license, operations documentation, and target service templates;
 - strict SHA-256 manifest creation/verification, canonical archive-layout validation,
   and OpenSSH Ed25519 detached-checksum signing/verification hooks with private-key
-  type, ownership, permission, and symlink checks;
-- five packaging tests covering reproducibility, tampering, unsafe paths, symlinked
-  inputs, signing, and verification; and
+  type, ownership, permission, and symlink checks. Whole-release verification
+  authenticates the checksum manifest first, rejects unsigned extra archives, and
+  binds checksum plus layout validation to one immutable archive snapshot;
+- a defined Linux upstream-archive/public-key trust model with explicit independent
+  anchor, rotation, APT/RPM repository-key, and third-party package boundaries, while
+  making clear that no production identity or native repository currently exists;
+- a credential-free macOS gate with deterministic Mach-O signing plans, structural
+  thin/fat executable validation, exact identifiers/architectures/identity inputs,
+  fail-closed Developer ID inspection, strict accepted-notarization receipt checks,
+  and signed-input-to-final-archive binding. Routine CI uses only an unmistakable
+  unprovisioned identity and all-zero fingerprint; and
+- thirteen packaging tests covering reproducibility, tampering, unsafe paths,
+  symlinked inputs, Ed25519/signature constraints, exact signed sets, path-substitution
+  races, Mach-O structure, signing policy, notarization receipts, and archive binding;
+  and
 - a native macOS/Linux CI dry run with an immutable checkout action that builds and
   verifies candidates but deliberately has no credentials, signing, publication, or
   release-write authority.
 
 Workspace formatting, warning-denied Clippy, and all workspace tests pass. The
-`cargo-deny` subcommand is unavailable in this environment. All five packaging tests,
-release-workflow YAML parsing, and a real local archive/checksum/layout dry run also
-pass. This checkpoint adds no new package version; `ring`, `serde`, and `serde_json`
-became direct integrity dependencies, `wikisync-content` became a direct workspace
-dependency there, and Tokio enabled its existing `net` feature for MediaWiki DNS.
-These packages already match the repository's source/license policy. Milestone 4
-delivery is still partial: actual Apple signing/notarization, a defined Linux
-package/repository trust model, credentialed native release validation, protected
-release identities/trust distribution, and signed artifact publication remain.
+`cargo-deny` subcommand is unavailable in this environment. All thirteen packaging
+tests, release-workflow YAML parsing, and the final packaging verification pass.
+This checkpoint adds no new package version. The dump reader adds direct `bzip2` and
+`quick-xml` dependencies; bounded raster validation adds `image` with only JPEG/PNG
+features; and store/integrity add workspace-path dependencies needed to share that
+validation and media identity policy. Their locked sources and licenses match the
+repository policy, but the unavailable `cargo-deny` executable prevented rerunning
+the automated policy audit. Milestone 4 delivery is still partial: actual Apple
+signing/notarization, production Linux/macOS identities and independent trust
+distribution, credentialed native validation, clean-system Gatekeeper assessment,
+and signed artifact publication remain.
 
 ## Plan audit notes
 
 The ordered first implementation backlog (items 1–13) is complete. The broader
 milestone delivery lists are not all closed: destructive purge is not implemented,
-credentialed platform packages remain outstanding, and optional media, dump
-bootstrap, pack tuning, stable contracts, and release acceptance remain Milestone 5
-work. Daemon-owned source administration, the planned non-destructive collection
-CLI/GUI surface, user-facing external signing/trusted-anchor workflows, historical
-export, and periodic dynamic-category membership reconciliation are implemented.
+credentialed platform packages remain outstanding, pack tuning and the initial
+stable-contract definition are implemented, and optional media plus dump bootstrap
+remain partial Milestone 5 work. Daemon-owned source administration, the planned
+non-destructive collection CLI/GUI surface, user-facing external
+signing/trusted-anchor workflows, historical export, and periodic dynamic-category
+membership reconciliation are implemented.
 Full verification now covers stable scans of every logical canonical object, the
 manifest chain and eligible-run coverage, and the current-schema metadata pointers
-listed above. A separately retained signed trusted head can authenticate the observed
-chain through the library API. The schema has no `derived_cache` inventory, contentless
-FTS permits pointer rather than indexed-body comparison, absent parent revisions can
-be valid under retention policy, and missing search documents may be pending derived
-work. Verification must not be described as source truth, universal whole-archive
-verification, or external rollback protection when the anchor is kept with and can be
-replaced alongside the library.
+listed above, including media objects and placements. A separately retained signed
+trusted head can authenticate the observed revision/manifest chain through the
+library API, but current manifests do not include media inventory and therefore do
+not authenticate media state. The schema has no `derived_cache` inventory,
+contentless FTS permits pointer rather than indexed-body comparison, absent parent
+revisions can be valid under retention policy, and missing search documents may be
+pending derived work. Verification must not be described as source truth, universal
+whole-archive verification, authenticated media history, or external rollback
+protection when the anchor is kept with and can be replaced alongside the library.
 
 ## Next checkpoint
 
-Define the Linux package/repository trust model and complete credentialed Apple
-signing/notarization, native release validation, protected release identities/trust
-distribution, and signed publication
-before calling the candidate archives signed beta packages; those credentialed
-external actions remain unauthorized/unavailable in this checkpoint. Optional
-attributed thumbnail media, current-language dump bootstrap, pack tuning, stable
-configuration/database/JSON/export/backup contracts, destructive purge design, and
-release acceptance on macOS/Ubuntu remain separately tracked Milestone 5 work.
+For locally actionable stable-v1 work, define a fail-closed source-bound Wikimedia CDN
+origin policy, then connect thumbnail discovery, download, complete validation,
+rendition storage, collection budgets, media-aware manifests, and attributed
+reader/export presentation through one fixture-backed synchronization path. Separately,
+connect the streaming dump reader to authenticated dump/index acquisition, durable
+selection-aware import/resume, and the Action API race-window closure.
+
+Credentialed Apple signing/notarization, protected production release identities and
+independent trust distribution, native release validation, clean-system assessment,
+and signed publication must still succeed before candidate archives can be called
+signed beta packages; those external actions remain unauthorized/unavailable in this
+checkpoint. Destructive purge design and release acceptance on macOS/Ubuntu also
+remain separately tracked Milestone 5 work.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening

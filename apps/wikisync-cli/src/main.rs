@@ -33,6 +33,12 @@ use wikisyncd::{
 
 use trust::{AnchorComparison, AnchorWriteMode};
 
+/// Version of the command-specific top-level objects emitted by `--json`.
+///
+/// Increment this before making an incompatible change to any documented CLI JSON
+/// shape. Export manifests and doctor bundles have their own format versions.
+const CLI_JSON_SCHEMA_VERSION: u32 = 1;
+
 const USAGE: &str = "WikiSyncer offline reader
 
 Usage:
@@ -205,6 +211,7 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                             .map_err(|error| CliError::message(error.to_string()))?;
                     if json {
                         write_json(&json!({
+                            "schema_version": CLI_JSON_SCHEMA_VERSION,
                             "previous": trusted_head_json(&summary.previous),
                             "current": trusted_head_json(&summary.current),
                             "recovery_anchor_created": true,
@@ -240,6 +247,7 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                     }
                     if json {
                         write_json(&json!({
+                            "schema_version": CLI_JSON_SCHEMA_VERSION,
                             "wiki_id": removed_wiki_id.get(),
                             "removed": true,
                         }))?;
@@ -281,6 +289,7 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                     };
                     if json {
                         write_json(&json!({
+                            "schema_version": CLI_JSON_SCHEMA_VERSION,
                             "wiki_id": wiki_id.get(),
                             "api_endpoint": api_endpoint,
                             "language_code": language_code,
@@ -441,6 +450,7 @@ fn print_anchor_inspection(
     };
     if json_output {
         write_json(&json!({
+            "schema_version": CLI_JSON_SCHEMA_VERSION,
             "comparison": comparison,
             "anchor": trusted_head_json(&inspection.anchor),
             "verification": {
@@ -480,6 +490,7 @@ fn list_sources(library: &Library, json_output: bool) -> Result<(), CliError> {
     let sources = library.wikis()?;
     if json_output {
         write_json(&json!({
+            "schema_version": CLI_JSON_SCHEMA_VERSION,
             "sources": sources
                 .iter()
                 .map(|source| json!({
@@ -555,6 +566,7 @@ fn category_preview(
 
     if json_output {
         write_json(&json!({
+            "schema_version": CLI_JSON_SCHEMA_VERSION,
             "root": preview.root.as_str(),
             "recursion_depth": preview.recursion_depth,
             "page_count": preview.pages.len(),
@@ -603,6 +615,7 @@ fn status(library: &Library, json_output: bool) -> Result<(), CliError> {
     let state = library_sync_state(&runs);
     if json_output {
         write_json(&json!({
+            "schema_version": CLI_JSON_SCHEMA_VERSION,
             "state": state,
             "checkpoints": checkpoints.iter().map(checkpoint_json).collect::<Vec<_>>(),
             "runs": runs.iter().map(sync_run_json).collect::<Vec<_>>(),
@@ -735,7 +748,10 @@ fn search(
                 })
             })
             .collect::<Vec<_>>();
-        write_json(&serde_json::Value::Array(values))?;
+        write_json(&json!({
+            "schema_version": CLI_JSON_SCHEMA_VERSION,
+            "results": values,
+        }))?;
     } else {
         for (position, (hit, excerpt)) in results.into_iter().enumerate() {
             if position > 0 {
@@ -784,6 +800,7 @@ fn show(
 
     if json_output {
         write_json(&json!({
+            "schema_version": CLI_JSON_SCHEMA_VERSION,
             "wiki_id": page.wiki_id.get(),
             "page_id": page.page_id.get(),
             "namespace": page.namespace,
@@ -824,6 +841,7 @@ fn history(
     let revisions = library.revisions_for_page(page.wiki_id, page.page_id)?;
     if json_output {
         write_json(&json!({
+            "schema_version": CLI_JSON_SCHEMA_VERSION,
             "wiki_id": page.wiki_id.get(),
             "page_id": page.page_id.get(),
             "title": page.title.as_str(),
@@ -887,6 +905,7 @@ fn revision_diff(
 
     if json_output {
         write_json(&json!({
+            "schema_version": CLI_JSON_SCHEMA_VERSION,
             "wiki_id": from_wiki.get(),
             "page_id": from.page_id.get(),
             "from_revision_id": from.revision_id.get(),

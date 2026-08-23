@@ -1,0 +1,24 @@
+{
+  "query": {
+    "pages": [
+      {
+        "pageid": 9003,
+        "ns": 6,
+        "title": "File:Incomplete.png",
+        "imageinfo": [
+          {
+            "descriptionurl": "https://commons.wikimedia.org/wiki/File:Incomplete.png",
+            "sha1": "1234567890abcdef1234567890abcdef",
+            "mime": "image/png",
+            "thumburl": "https://upload.wikimedia.org/640px-incomplete.png",
+            "thumbwidth": 640,
+            "thumbheight": 320,
+            "extmetadata": {
+              "LicenseShortName": { "value": "CC0" }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

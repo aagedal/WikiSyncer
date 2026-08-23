@@ -1,0 +1,25 @@
+{
+  "query": {
+    "pages": [
+      {
+        "pageid": 9002,
+        "ns": 6,
+        "title": "File:Disguised.png",
+        "imageinfo": [
+          {
+            "descriptionurl": "https://commons.wikimedia.org/wiki/File:Disguised.png",
+            "sha1": "1234567890abcdef1234567890abcdef",
+            "mime": "image/svg+xml",
+            "thumburl": "https://upload.wikimedia.org/640px-disguised.png",
+            "thumbwidth": 640,
+            "thumbheight": 320,
+            "extmetadata": {
+              "Artist": { "value": "Fixture artist" },
+              "LicenseShortName": { "value": "CC0" }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -42,6 +42,32 @@ Run the packaging tests without a Rust build:
 python3 -m unittest discover -s packaging/tests -v
 ```
 
+## macOS signing and notarization preparation
+
+On a native unsigned build, `macos-signing-plan` checks that the exact three inputs
+are executable, structurally bounded Mach-O containers for the requested architecture
+and emits a canonical JSON plan. It validates thin/fat headers, slice ranges, CPU types,
+and load-command bounds; Apple's native signing checks remain the authority on whether
+the binaries are signable and valid to execute. Pull-request CI uses only the explicitly
+unprovisioned dry-run identity and all-zero certificate fingerprint. That plan exercises
+no credential and proves no signature or notarization status.
+
+A protected release run supplies the exact Developer ID Application authority, Team
+ID, and nonzero certificate SHA-1 fingerprint. After the operator performs the
+planned signing with hardened runtime and a secure Apple timestamp,
+`verify-macos-signatures` fail-closed checks all three binaries with Apple's fixed
+`/usr/bin/codesign`. `validate-notarization-receipt` then checks an authorized
+notarytool JSON result against its separately recorded submission UUID and requires
+status `Accepted`. After packaging, `verify-macos-release-archive` reruns the signature
+policy and proves that the exact validated executable bytes are present in the macOS
+archive.
+
+The current `tar.gz` cannot carry a stapled notarization ticket. A ZIP, PKG, or DMG
+must be used for Apple submission, and the published tar must receive clean-system
+Gatekeeper validation before release. See
+[macOS signing and notarization gate](../docs/security/macos-signing-notarization.md)
+for the exact trust boundary and credentialed sequence.
+
 ## Detached checksum signatures
 
 The signing hook uses the OpenSSH signature format with namespace
@@ -65,8 +91,29 @@ python3 packaging/scripts/release.py verify-signature \
 The allowed-signers file is an independently obtained trust anchor in OpenSSH form,
 for example `release@wikisync ssh-ed25519 AAAA...`. Do not distribute a newly created
 allowed-signers file beside a release and treat that circular distribution as proof
-of identity. Always verify the signature before the checksums, then verify all
-checksum entries and each archive layout.
+of identity. For downloaded releases, prefer the single fail-closed command that
+verifies the signature before interpreting the manifest and rejects unmanifested
+archives:
+
+```sh
+python3 packaging/scripts/release.py verify-release \
+  --checksum-file ./release/SHA256SUMS \
+  --signature ./release/SHA256SUMS.sig \
+  --allowed-signers /trusted/wikisync-allowed-signers \
+  --signer-identity release@wikisync
+```
+
+The production release key and its independent distribution channels have not yet
+been established. Test keys and CI dry runs prove only the mechanics. See
+[Linux package and repository trust](../docs/security/linux-package-repository-trust.md)
+for the complete upstream archive, public-key rotation, APT/RPM repository, and
+third-party packaging boundaries.
+
+`verify-release` copies each bounded archive from one securely opened descriptor into
+an unlinked temporary snapshot while calculating its signed SHA-256. Archive layout is
+then checked from that same snapshot, so replacing the download path between the digest
+and layout phases cannot substitute different bytes. Verification therefore needs
+temporary storage up to the size of the largest release archive being checked.
 
 Platform release gates remain credentialed manual work:
 
@@ -74,10 +121,11 @@ Platform release gates remain credentialed manual work:
   identity, assess the signatures and hardened-runtime policy, notarize the final
   distribution artifact with protected App Store Connect credentials, staple where
   the format permits, and validate with Gatekeeper on a clean supported system.
-- On Linux, establish and document the project package-signing identity and repository
-  trust/distribution model before calling an archive a signed Linux package. The SSH
-  checksum signature authenticates the reviewed archive set; it is not an RPM/DEB
-  repository signature.
+- On Linux, provision and independently publish the project release public key before
+  calling an archive a signed Linux package. The trust model is now defined, but no
+  production identity or APT/RPM repository exists. The SSH checksum signature
+  authenticates the reviewed upstream archive set; it is not an APT/RPM repository
+  or native-package signature.
 
 Never place signing keys, notarization credentials, or generated credential files in
 the repository, ordinary CI logs, release archives, or diagnostic bundles.

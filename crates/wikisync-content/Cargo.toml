@@ -11,4 +11,5 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+image = { version = "=0.25.8", default-features = false, features = ["jpeg", "png"] }
 similar = "2.7"

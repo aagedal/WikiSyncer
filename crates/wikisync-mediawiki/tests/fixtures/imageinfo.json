@@ -1,0 +1,31 @@
+{
+  "query": {
+    "pages": [
+      {
+        "pageid": 9001,
+        "ns": 6,
+        "title": "File:Lead photo.JPG",
+        "imageinfo": [
+          {
+            "size": 123456,
+            "width": 2400,
+            "height": 1600,
+            "url": "https://upload.wikimedia.org/original.jpg",
+            "descriptionurl": "https://commons.wikimedia.org/wiki/File:Lead_photo.JPG",
+            "sha1": "abcdef0123456789abcdef0123456789",
+            "mime": "image/jpeg",
+            "thumburl": "https://upload.wikimedia.org/640px-lead.jpg",
+            "thumbwidth": 640,
+            "thumbheight": 427,
+            "extmetadata": {
+              "Artist": { "value": "Fixture photographer", "source": "commons-desc-page" },
+              "Credit": { "value": "Fixture photographer / Wikimedia Commons", "source": "commons-desc-page" },
+              "LicenseShortName": { "value": "CC BY-SA 4.0", "source": "commons-desc-page" },
+              "LicenseUrl": { "value": "https://creativecommons.org/licenses/by-sa/4.0/", "source": "commons-desc-page" }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

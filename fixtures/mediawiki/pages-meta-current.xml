@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" version="0.11" xml:lang="en">
+  <siteinfo>
+    <sitename>Fixture Wikipedia</sitename>
+    <dbname>enwiki</dbname>
+    <base>https://en.example.invalid/wiki/Main_Page</base>
+    <generator>MediaWiki 1.45-fixture</generator>
+    <case>first-letter</case>
+    <namespaces>
+      <namespace key="0" case="first-letter" />
+      <namespace key="1" case="first-letter">Talk</namespace>
+    </namespaces>
+  </siteinfo>
+  <page>
+    <title>Alpha</title>
+    <ns>0</ns>
+    <id>10</id>
+    <revision>
+      <id>100</id>
+      <parentid>99</parentid>
+      <timestamp>2026-08-20T10:00:00Z</timestamp>
+      <contributor><username>Fixture editor</username><id>42</id></contributor>
+      <minor />
+      <comment>Entity &amp; comment</comment>
+      <model>wikitext</model>
+      <format>text/x-wiki</format>
+      <text bytes="12" xml:space="preserve">Alpha &amp; beta</text>
+      <sha1>0123456789abcdefghijklmnopqrstuv</sha1>
+    </revision>
+  </page>
+  <page>
+    <title>Talk:Filtered</title>
+    <ns>1</ns>
+    <id>11</id>
+    <revision>
+      <id>101</id>
+      <timestamp>2026-08-20T10:01:00Z</timestamp>
+      <contributor><ip>192.0.2.1</ip></contributor>
+      <model>wikitext</model>
+      <format>text/x-wiki</format>
+      <text bytes="9" xml:space="preserve">Talk page</text>
+      <sha1>1123456789abcdefghijklmnopqrstuv</sha1>
+    </revision>
+  </page>
+  <page>
+    <title>Redirected</title>
+    <ns>0</ns>
+    <id>12</id>
+    <redirect title="Alpha" />
+    <revision>
+      <id>102</id>
+      <parentid>98</parentid>
+      <timestamp>2026-08-20T10:02:00Z</timestamp>
+      <contributor deleted="deleted" />
+      <comment deleted="deleted" />
+      <model>wikitext</model>
+      <format>text/x-wiki</format>
+      <text bytes="0" deleted="deleted" />
+      <sha1></sha1>
+    </revision>
+  </page>
+  <page>
+    <title>Data model</title>
+    <ns>0</ns>
+    <id>13</id>
+    <revision>
+      <id>103</id>
+      <timestamp>2026-08-20T10:03:00Z</timestamp>
+      <contributor><username>Data editor</username><id>43</id></contributor>
+      <model>json</model>
+      <format>application/json</format>
+      <text bytes="2" xml:space="preserve">{}</text>
+      <sha1>2123456789abcdefghijklmnopqrstuv</sha1>
+    </revision>
+  </page>
+</mediawiki>

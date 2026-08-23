@@ -6,6 +6,18 @@
 //! may repeat the same bounded request, but it has an explicit attempt ceiling and a
 //! shared circuit breaker for persistent retryable failures.
 
+mod dump;
+mod media;
+
+pub use dump::{
+    DumpError, DumpFilter, DumpLimits, DumpNamespace, DumpPage, DumpReader, DumpRevision,
+    DumpSiteInfo,
+};
+pub use media::{
+    MAX_REVISION_IMAGE_REFERENCES, RevisionImagePlacement, ThumbnailDownloadError,
+    ThumbnailIneligibility, ThumbnailMetadata, ThumbnailMetadataResolution, ThumbnailMimeType,
+};
+
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -1254,11 +1266,12 @@ impl MediaWikiClient {
             body.extend_from_slice(&chunk);
         }
 
-        let value: serde_json::Value =
+        // Probe only the optional top-level error field first. Unknown success fields
+        // are traversed as `IgnoredAny`, so bounded typed deserializers can reject an
+        // oversized collection before a generic JSON value allocates it.
+        let error_envelope: ApiErrorEnvelope =
             serde_json::from_slice(&body).map_err(ClientError::Decode)?;
-        if let Some(error) = value.get("error") {
-            let error: ApiErrorPayload =
-                serde_json::from_value(error.clone()).map_err(ClientError::Decode)?;
+        if let Some(error) = error_envelope.error {
             return Err(ClientError::Api(ApiError {
                 code: error.code,
                 info: error.info,
@@ -1272,7 +1285,7 @@ impl MediaWikiClient {
             });
         }
 
-        serde_json::from_value(value).map_err(ClientError::Decode)
+        serde_json::from_slice(&body).map_err(ClientError::Decode)
     }
 
     fn retry_delay(&self, retry_number: usize, retry_after: Option<Duration>) -> Duration {
@@ -1834,6 +1847,12 @@ impl TryFrom<RevisionPayload> for RevisionMetadata {
             content_model: slot_content_model.or(revision.content_model),
         })
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorEnvelope {
+    #[serde(default)]
+    error: Option<ApiErrorPayload>,
 }
 
 #[derive(Debug, Deserialize)]

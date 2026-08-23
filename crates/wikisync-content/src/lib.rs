@@ -7,8 +7,12 @@
 mod diff;
 mod inline;
 mod render;
+mod thumbnail;
 
 pub use diff::{ContentDiff, DiffLine, DiffMode, DiffSpan, DiffTag, diff};
+pub use thumbnail::{
+    ThumbnailError, ThumbnailFormat, ThumbnailLimits, ValidatedThumbnail, validate_thumbnail,
+};
 
 use std::fmt;
 

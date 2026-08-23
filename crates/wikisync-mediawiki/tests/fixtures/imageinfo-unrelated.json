@@ -1,0 +1,12 @@
+{
+  "query": {
+    "pages": [
+      {
+        "pageid": 9999,
+        "ns": 6,
+        "title": "File:Unrelated.png",
+        "missing": true
+      }
+    ]
+  }
+}

@@ -14,6 +14,7 @@ use wikisync_sync::{
     reconcile_collection_heads_with_cancellation, reconcile_dynamic_collection_membership,
 };
 
+use crate::collection::{DecodedCollectionDraft, decode_collection_draft_version};
 use crate::{
     CollectionAdminProtocolOutcome, CollectionAdminRequest, CollectionAdministration,
     HandlerStatus, MAX_COLLECTION_DRAFT_BYTES, MAX_COLLECTION_DRAFT_CHUNK_BYTES,
@@ -21,7 +22,7 @@ use crate::{
     OperationError, RequestHandler, SET_COLLECTION_SCHEDULE_EXTENSION,
     SET_NETWORK_TRANSFER_POLICY_EXTENSION, SourceAdministration, SourceAdministrationOutcome,
     administer_collection_direct, administer_source_direct, canonical_library_root,
-    decode_collection_draft, detect_metered_network, next_occurrence_after, recover,
+    detect_metered_network, next_occurrence_after, recover,
 };
 
 const BACKGROUND_RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -158,7 +159,7 @@ impl ApplicationHandler {
                 })
             }
             CollectionAdminRequest::Estimate { token } => {
-                let draft = self.complete_draft(token)?;
+                let draft = self.complete_draft(token)?.draft;
                 let outcome = administer_collection_direct(
                     &mut Library::open(&self.library_root).map_err(operation_failed)?,
                     CollectionAdministration::Estimate(draft),
@@ -166,11 +167,17 @@ impl ApplicationHandler {
                 Ok(CollectionAdminProtocolOutcome::Completed(outcome))
             }
             CollectionAdminRequest::Add { token } => {
-                let draft = self.complete_draft(token)?;
+                let decoded = self.complete_draft(token)?;
                 let mut library = Library::open(&self.library_root).map_err(operation_failed)?;
                 let outcome = administer_collection_direct(
                     &mut library,
-                    CollectionAdministration::Add(draft),
+                    match decoded.image_policy {
+                        Some(image_policy) => CollectionAdministration::AddWithImagePolicy {
+                            draft: decoded.draft,
+                            image_policy,
+                        },
+                        None => CollectionAdministration::Add(decoded.draft),
+                    },
                 )?;
                 self.consume_draft(token);
                 self.last_operation =
@@ -183,14 +190,22 @@ impl ApplicationHandler {
                 expected_generation,
             } => {
                 let collection_id = CollectionId::new(collection_id).map_err(operation_failed)?;
-                let draft = self.complete_draft(token)?;
+                let decoded = self.complete_draft(token)?;
                 let mut library = Library::open(&self.library_root).map_err(operation_failed)?;
                 let outcome = administer_collection_direct(
                     &mut library,
-                    CollectionAdministration::Edit {
-                        collection_id,
-                        expected_generation,
-                        draft,
+                    match decoded.image_policy {
+                        Some(image_policy) => CollectionAdministration::EditWithImagePolicy {
+                            collection_id,
+                            expected_generation,
+                            draft: decoded.draft,
+                            image_policy,
+                        },
+                        None => CollectionAdministration::Edit {
+                            collection_id,
+                            expected_generation,
+                            draft: decoded.draft,
+                        },
                     },
                 )?;
                 self.consume_draft(token);
@@ -230,7 +245,7 @@ impl ApplicationHandler {
         }
     }
 
-    fn complete_draft(&mut self, token: u64) -> Result<crate::CollectionDraft, OperationError> {
+    fn complete_draft(&mut self, token: u64) -> Result<DecodedCollectionDraft, OperationError> {
         let staged = self.staged_draft_mut(token)?;
         if staged.bytes.len() != staged.total_bytes as usize {
             return Err(OperationError::failed(format!(
@@ -240,7 +255,7 @@ impl ApplicationHandler {
             )));
         }
         staged.expires_at = Instant::now() + COLLECTION_DRAFT_EXPIRY;
-        decode_collection_draft(&staged.bytes)
+        decode_collection_draft_version(&staged.bytes)
     }
 
     fn consume_draft(&mut self, token: u64) {

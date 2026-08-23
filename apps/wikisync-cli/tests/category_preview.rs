@@ -33,6 +33,7 @@ fn category_preview_is_standalone_bounded_and_machine_readable() {
         .expect("run category preview");
     assert_success(&output);
     let value: Value = serde_json::from_slice(&output.stdout).expect("preview JSON");
+    assert_eq!(value["schema_version"], 1);
     assert_eq!(value["root"], "Category:Root");
     assert_eq!(value["recursion_depth"], 1);
     assert_eq!(value["page_count"], 3);

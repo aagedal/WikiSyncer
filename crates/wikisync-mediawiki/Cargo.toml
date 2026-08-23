@@ -11,6 +11,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+bzip2 = { version = "0.6", default-features = false, features = ["bzip2-sys"] }
+quick-xml = "0.41"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

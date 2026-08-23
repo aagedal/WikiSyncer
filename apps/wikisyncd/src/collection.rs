@@ -6,7 +6,8 @@ use std::num::NonZeroU64;
 
 use wikisync_core::{
     CollectionBudget, CollectionId, CollectionRemovalPolicy, CollectionRule, HistoryPolicy,
-    InclusionReason, PageId, PageTitle, TitleSelection, UnixTimestamp, WikiId,
+    ImagePolicy, InclusionReason, PageId, PageTitle, ThumbnailPolicy, TitleSelection,
+    UnixTimestamp, WikiId,
 };
 use wikisync_store::{CollectionPreviewCommit, Library, ResolvedCollectionMember};
 use wikisync_sync::CollectionSelectionPreview;
@@ -14,7 +15,8 @@ use wikisync_sync::CollectionSelectionPreview;
 use crate::{MAX_COLLECTION_DRAFT_BYTES, OperationError};
 
 const DRAFT_MAGIC: &[u8; 4] = b"WKCD";
-const DRAFT_VERSION: u16 = 1;
+const LEGACY_DRAFT_VERSION: u16 = 1;
+const DRAFT_VERSION: u16 = 2;
 const MAX_COLLECTION_NAME_BYTES: usize = 4 * 1024;
 const MAX_TITLE_BYTES: usize = 4 * 1024;
 const MAX_PREVIEW_MEMBERS: usize = 10_000;
@@ -50,6 +52,13 @@ pub enum CollectionAdministration {
     Estimate(CollectionDraft),
     /// Creates one active collection from a complete preview.
     Add(CollectionDraft),
+    /// Creates one active collection with an explicit bounded image policy.
+    AddWithImagePolicy {
+        /// Complete collection preview and non-image policies.
+        draft: CollectionDraft,
+        /// Optional bounded image acquisition policy.
+        image_policy: ImagePolicy,
+    },
     /// Replaces one active collection from a complete preview.
     Edit {
         /// Durable collection identity retained by the edit.
@@ -58,6 +67,17 @@ pub enum CollectionAdministration {
         expected_generation: u64,
         /// Complete replacement configuration and preview.
         draft: CollectionDraft,
+    },
+    /// Replaces one active collection and its bounded image policy atomically.
+    EditWithImagePolicy {
+        /// Durable collection identity retained by the edit.
+        collection_id: CollectionId,
+        /// Configuration generation observed before resolving the replacement preview.
+        expected_generation: u64,
+        /// Complete replacement configuration and preview.
+        draft: CollectionDraft,
+        /// Complete replacement image policy.
+        image_policy: ImagePolicy,
     },
     /// Tombstones a collection while retaining runs, manifests, and captured data.
     Remove { collection_id: CollectionId },
@@ -125,6 +145,30 @@ pub fn administer_collection_direct(
                 estimate,
             })
         }
+        CollectionAdministration::AddWithImagePolicy {
+            draft,
+            image_policy,
+        } => {
+            let estimate = validated_estimate(&draft)?;
+            if !estimate.fits_budget {
+                return Err(OperationError::failed(
+                    "collection preview exceeds its configured hard budget",
+                ));
+            }
+            let preview = preview_commit(&draft);
+            let (collection_id, _) = library
+                .create_collection_from_preview_with_image_policy(
+                    draft.wiki_id,
+                    &draft.name,
+                    preview,
+                    image_policy,
+                )
+                .map_err(operation_failed)?;
+            Ok(CollectionAdministrationOutcome::Added {
+                collection_id,
+                estimate,
+            })
+        }
         CollectionAdministration::Edit {
             collection_id,
             expected_generation,
@@ -159,6 +203,42 @@ pub fn administer_collection_direct(
                 estimate,
             })
         }
+        CollectionAdministration::EditWithImagePolicy {
+            collection_id,
+            expected_generation,
+            draft,
+            image_policy,
+        } => {
+            let estimate = validated_estimate(&draft)?;
+            if !estimate.fits_budget {
+                return Err(OperationError::failed(
+                    "collection preview exceeds its configured hard budget",
+                ));
+            }
+            let configuration = library
+                .collection_configuration(collection_id)
+                .map_err(operation_failed)?
+                .ok_or_else(|| OperationError::failed("collection is not configured"))?;
+            if configuration.wiki_id != draft.wiki_id {
+                return Err(OperationError::failed(
+                    "a collection edit cannot change its source wiki",
+                ));
+            }
+            let preview = preview_commit(&draft);
+            library
+                .update_collection_from_preview_with_image_policy(
+                    collection_id,
+                    expected_generation,
+                    Some(&draft.name),
+                    preview,
+                    image_policy,
+                )
+                .map_err(operation_failed)?;
+            Ok(CollectionAdministrationOutcome::Edited {
+                collection_id,
+                estimate,
+            })
+        }
         CollectionAdministration::Remove { collection_id } => {
             library
                 .tombstone_collection(collection_id)
@@ -186,10 +266,28 @@ fn validated_estimate(draft: &CollectionDraft) -> Result<CollectionDraftEstimate
     Ok(estimate)
 }
 
-/// Encodes one complete draft for bounded chunked transport.
+/// Encodes one legacy/default-off draft for bounded chunked transport.
+///
+/// Image-aware administration uses the internal draft-v2 envelope. Keeping this
+/// function on v1 preserves existing callers and makes omission mean default-off.
 pub fn encode_collection_draft(draft: &CollectionDraft) -> Result<Vec<u8>, OperationError> {
+    encode_collection_draft_version(draft, None)
+}
+
+/// Encodes a draft-v2 payload carrying an explicit bounded image policy.
+pub(crate) fn encode_collection_draft_with_image_policy(
+    draft: &CollectionDraft,
+    image_policy: ImagePolicy,
+) -> Result<Vec<u8>, OperationError> {
+    encode_collection_draft_version(draft, Some(image_policy))
+}
+
+fn encode_collection_draft_version(
+    draft: &CollectionDraft,
+    image_policy: Option<ImagePolicy>,
+) -> Result<Vec<u8>, OperationError> {
     let _ = estimate(draft)?;
-    let encoded_size = encoded_collection_draft_size(draft)?;
+    let encoded_size = encoded_collection_draft_size(draft, image_policy)?;
     if encoded_size > MAX_COLLECTION_DRAFT_BYTES {
         return Err(OperationError::failed(format!(
             "encoded collection draft is {encoded_size} bytes; maximum is {MAX_COLLECTION_DRAFT_BYTES}"
@@ -197,7 +295,14 @@ pub fn encode_collection_draft(draft: &CollectionDraft) -> Result<Vec<u8>, Opera
     }
     let mut bytes = Vec::with_capacity(encoded_size);
     bytes.extend_from_slice(DRAFT_MAGIC);
-    put_u16(&mut bytes, DRAFT_VERSION);
+    put_u16(
+        &mut bytes,
+        if image_policy.is_some() {
+            DRAFT_VERSION
+        } else {
+            LEGACY_DRAFT_VERSION
+        },
+    );
     put_u64(&mut bytes, draft.wiki_id.get());
     put_string(&mut bytes, &draft.name, MAX_COLLECTION_NAME_BYTES)?;
     encode_rule(&mut bytes, &draft.preview.rule)?;
@@ -238,11 +343,17 @@ pub fn encode_collection_draft(draft: &CollectionDraft) -> Result<Vec<u8>, Opera
             CollectionRemovalPolicy::KeepTracking => 2,
         },
     );
+    if let Some(image_policy) = image_policy {
+        encode_image_policy(&mut bytes, image_policy);
+    }
     debug_assert_eq!(bytes.len(), encoded_size);
     Ok(bytes)
 }
 
-fn encoded_collection_draft_size(draft: &CollectionDraft) -> Result<usize, OperationError> {
+fn encoded_collection_draft_size(
+    draft: &CollectionDraft,
+    image_policy: Option<ImagePolicy>,
+) -> Result<usize, OperationError> {
     let mut size = 4_usize + 2 + 8;
     add_size(&mut size, encoded_string_size(&draft.name)?)?;
     add_size(&mut size, encoded_rule_size(&draft.preview.rule)?)?;
@@ -303,6 +414,15 @@ fn encoded_collection_draft_size(draft: &CollectionDraft) -> Result<usize, Opera
         },
     )?;
     add_size(&mut size, 1)?;
+    if let Some(image_policy) = image_policy {
+        add_size(
+            &mut size,
+            match image_policy {
+                ImagePolicy::None => 1,
+                ImagePolicy::Thumbnails(_) => 1 + 4 + 4 + 8,
+            },
+        )?;
+    }
     Ok(size)
 }
 
@@ -335,8 +455,26 @@ fn add_size(total: &mut usize, additional: usize) -> Result<(), OperationError> 
     Ok(())
 }
 
-/// Decodes and validates one complete staged collection draft.
+/// Decodes and validates one legacy/default-off staged collection draft.
 pub fn decode_collection_draft(bytes: &[u8]) -> Result<CollectionDraft, OperationError> {
+    let decoded = decode_collection_draft_version(bytes)?;
+    if decoded.image_policy.is_some() {
+        return Err(OperationError::failed(
+            "image-aware collection drafts require draft-v2 administration",
+        ));
+    }
+    Ok(decoded.draft)
+}
+
+#[derive(Debug)]
+pub(crate) struct DecodedCollectionDraft {
+    pub(crate) draft: CollectionDraft,
+    pub(crate) image_policy: Option<ImagePolicy>,
+}
+
+pub(crate) fn decode_collection_draft_version(
+    bytes: &[u8],
+) -> Result<DecodedCollectionDraft, OperationError> {
     if bytes.len() > MAX_COLLECTION_DRAFT_BYTES {
         return Err(OperationError::failed(
             "staged collection draft is too large",
@@ -344,7 +482,8 @@ pub fn decode_collection_draft(bytes: &[u8]) -> Result<CollectionDraft, Operatio
     }
     let mut decoder = DraftDecoder::new(bytes);
     decoder.magic(DRAFT_MAGIC)?;
-    if decoder.u16()? != DRAFT_VERSION {
+    let version = decoder.u16()?;
+    if !matches!(version, LEGACY_DRAFT_VERSION | DRAFT_VERSION) {
         return Err(OperationError::failed(
             "unsupported collection draft encoding version",
         ));
@@ -403,6 +542,11 @@ pub fn decode_collection_draft(bytes: &[u8]) -> Result<CollectionDraft, Operatio
         2 => CollectionRemovalPolicy::KeepTracking,
         _ => return Err(OperationError::failed("invalid collection removal policy")),
     };
+    let image_policy = if version == DRAFT_VERSION {
+        Some(decode_image_policy(&mut decoder)?)
+    } else {
+        None
+    };
     decoder.finish()?;
     let draft = CollectionDraft {
         wiki_id,
@@ -419,7 +563,32 @@ pub fn decode_collection_draft(bytes: &[u8]) -> Result<CollectionDraft, Operatio
         removal_policy,
     };
     let _ = estimate(&draft)?;
-    Ok(draft)
+    Ok(DecodedCollectionDraft {
+        draft,
+        image_policy,
+    })
+}
+
+fn encode_image_policy(bytes: &mut Vec<u8>, policy: ImagePolicy) {
+    match policy {
+        ImagePolicy::None => put_u8(bytes, 0),
+        ImagePolicy::Thumbnails(policy) => {
+            put_u8(bytes, 1);
+            put_u32(bytes, policy.maximum_edge_pixels().get());
+            put_u32(bytes, policy.maximum_images_per_revision().get());
+            put_u64(bytes, policy.maximum_bytes_per_image().get());
+        }
+    }
+}
+
+fn decode_image_policy(decoder: &mut DraftDecoder<'_>) -> Result<ImagePolicy, OperationError> {
+    match decoder.u8()? {
+        0 => Ok(ImagePolicy::None),
+        1 => ThumbnailPolicy::new(decoder.u32()?, decoder.u32()?, decoder.u64()?)
+            .map(ImagePolicy::Thumbnails)
+            .map_err(operation_failed),
+        _ => Err(OperationError::failed("invalid collection image policy")),
+    }
 }
 
 fn estimate(draft: &CollectionDraft) -> Result<CollectionDraftEstimate, OperationError> {
@@ -902,7 +1071,35 @@ mod tests {
         let draft = sample_draft(WikiId::new(7).expect("wiki ID"), "Systems");
         let encoded = encode_collection_draft(&draft).expect("encode");
         assert!(encoded.len() < MAX_COLLECTION_DRAFT_BYTES);
+        assert_eq!(&encoded[4..6], &LEGACY_DRAFT_VERSION.to_be_bytes());
         assert_eq!(decode_collection_draft(&encoded).expect("decode"), draft);
+        assert_eq!(
+            decode_collection_draft_version(&encoded)
+                .expect("decode legacy draft")
+                .image_policy
+                .unwrap_or_default(),
+            ImagePolicy::None
+        );
+
+        let thumbnails = ThumbnailPolicy::new(640, 8, 1_048_576).expect("thumbnail policy");
+        let encoded =
+            encode_collection_draft_with_image_policy(&draft, ImagePolicy::Thumbnails(thumbnails))
+                .expect("encode image-aware draft");
+        assert_eq!(&encoded[4..6], &DRAFT_VERSION.to_be_bytes());
+        let decoded = decode_collection_draft_version(&encoded).expect("decode image-aware draft");
+        assert_eq!(decoded.draft, draft);
+        assert_eq!(
+            decoded.image_policy,
+            Some(ImagePolicy::Thumbnails(thumbnails))
+        );
+
+        let mut invalid =
+            encode_collection_draft_with_image_policy(&draft, ImagePolicy::None).expect("encode");
+        *invalid.last_mut().expect("policy tag") = 1;
+        put_u32(&mut invalid, wikisync_core::MAX_THUMBNAIL_EDGE_PIXELS + 1);
+        put_u32(&mut invalid, 1);
+        put_u64(&mut invalid, 1);
+        assert!(decode_collection_draft_version(&invalid).is_err());
     }
 
     #[test]
@@ -935,7 +1132,7 @@ mod tests {
             .collect();
         oversized.preview.missing_titles.clear();
         assert!(
-            encoded_collection_draft_size(&oversized).expect("preflight size")
+            encoded_collection_draft_size(&oversized, None).expect("preflight size")
                 > MAX_COLLECTION_DRAFT_BYTES
         );
         assert!(encode_collection_draft(&oversized).is_err());
@@ -948,9 +1145,14 @@ mod tests {
         let wiki_id = library
             .register_wiki("https://en.wikipedia.org/w/api.php", "en")
             .expect("source");
+        let thumbnails =
+            ThumbnailPolicy::new(800, 12, 2 * 1024 * 1024).expect("bounded thumbnail policy");
         let added = administer_collection_direct(
             &mut library,
-            CollectionAdministration::Add(sample_draft(wiki_id, "Systems")),
+            CollectionAdministration::AddWithImagePolicy {
+                draft: sample_draft(wiki_id, "Systems"),
+                image_policy: ImagePolicy::Thumbnails(thumbnails),
+            },
         )
         .expect("add");
         let CollectionAdministrationOutcome::Added {
@@ -970,15 +1172,24 @@ mod tests {
             .expect("collection")
             .expect("created")
             .generation;
+        assert_eq!(
+            library
+                .collection_configuration(collection_id)
+                .expect("configuration")
+                .expect("configured")
+                .image_policy,
+            ImagePolicy::Thumbnails(thumbnails)
+        );
 
         let mut edited = sample_draft(wiki_id, "Programming systems");
         edited.history_policy = HistoryPolicy::Complete;
         let outcome = administer_collection_direct(
             &mut library,
-            CollectionAdministration::Edit {
+            CollectionAdministration::EditWithImagePolicy {
                 collection_id,
                 expected_generation: initial_generation,
                 draft: edited,
+                image_policy: ImagePolicy::None,
             },
         )
         .expect("edit");
@@ -996,13 +1207,15 @@ mod tests {
         assert_eq!(configuration.name, "Programming systems");
         assert_eq!(configuration.history_policy, HistoryPolicy::Complete);
         assert_eq!(configuration.generation, initial_generation + 1);
+        assert_eq!(configuration.image_policy, ImagePolicy::None);
 
         let stale = administer_collection_direct(
             &mut library,
-            CollectionAdministration::Edit {
+            CollectionAdministration::EditWithImagePolicy {
                 collection_id,
                 expected_generation: initial_generation,
                 draft: sample_draft(wiki_id, "Stale replacement"),
+                image_policy: ImagePolicy::Thumbnails(thumbnails),
             },
         )
         .expect_err("stale preview must be rejected");
@@ -1017,6 +1230,7 @@ mod tests {
             .expect("configured");
         assert_eq!(unchanged.name, "Programming systems");
         assert_eq!(unchanged.generation, initial_generation + 1);
+        assert_eq!(unchanged.image_policy, ImagePolicy::None);
 
         administer_collection_direct(
             &mut library,

@@ -20,9 +20,11 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 use serde::{Deserialize, Serialize};
+use wikisync_content::{ThumbnailLimits, validate_thumbnail};
 use wikisync_core::{
     CollectionBudget, CollectionId, CollectionRemovalPolicy, CollectionRule, HistoryPolicy,
-    InclusionReason, PageId, PageTitle, RevisionId, TitleSelection, UnixTimestamp, WikiId,
+    ImagePolicy, InclusionReason, MAX_THUMBNAILS_PER_REVISION, MediaId, PageId, PageTitle,
+    RevisionId, ThumbnailPolicy, TitleSelection, UnixTimestamp, WikiId,
 };
 
 const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
@@ -35,6 +37,8 @@ const MIGRATION_7: &str = include_str!("../migrations/0007_schedules.sql");
 const MIGRATION_8: &str = include_str!("../migrations/0008_manifest_configuration.sql");
 const MIGRATION_9: &str = include_str!("../migrations/0009_network_transfer_policy.sql");
 const MIGRATION_10: &str = include_str!("../migrations/0010_collection_status.sql");
+const MIGRATION_11: &str = include_str!("../migrations/0011_pack_affinity.sql");
+const MIGRATION_12: &str = include_str!("../migrations/0012_thumbnail_media.sql");
 const OBJECT_DOMAIN: &[u8] = b"wikisync-object-v1\0";
 const DATABASE_NAME: &str = "library.sqlite3";
 const MANIFEST_DOMAIN: &[u8] = b"wikisync-manifest-v1\0";
@@ -56,8 +60,13 @@ const PACK_ENCODING_DELTA: u8 = 2;
 const DELTA_HEADER_LENGTH: usize = 16;
 const MAX_DELTA_DEPTH: u16 = 8;
 const DELTA_CANDIDATE_WINDOW: usize = 16;
+const FULL_ENTRY_INTERVAL: usize = 16;
+const MAX_DELTA_SIZE_RATIO: u64 = 2;
 const MIN_DELTA_SAVINGS: usize = 16;
 const MAX_SUPPORTED_PACK_OBJECTS: u32 = 1_000_000;
+const MAX_MEDIA_METADATA_TEXT_BYTES: usize = 16 * 1024;
+const MAX_MEDIA_SOURCE_HASH_BYTES: usize = 128;
+const MAX_THUMBNAIL_BYTES_PER_PIXEL: u64 = 8;
 
 /// Default upper bound for one uncompressed canonical object (64 MiB).
 pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
@@ -501,6 +510,10 @@ type ManifestConfigurationRow = (
     Option<i64>,
     Option<i64>,
     String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
 );
 
 /// Metadata returned after an object is durably installed.
@@ -512,6 +525,160 @@ pub struct StoredObject {
     pub kind: ObjectKind,
     /// Length of the canonical, uncompressed bytes.
     pub uncompressed_length: u64,
+}
+
+/// Raster formats accepted for stable-v1 thumbnail capture.
+///
+/// Active source formats such as SVG are intentionally absent. A source adapter
+/// must rasterize them before this storage boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThumbnailMimeType {
+    /// JPEG raster bytes.
+    Jpeg,
+    /// PNG raster bytes.
+    Png,
+}
+
+impl ThumbnailMimeType {
+    /// Returns the stable MIME value stored in SQLite.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Jpeg => "image/jpeg",
+            Self::Png => "image/png",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "image/jpeg" => Ok(Self::Jpeg),
+            "image/png" => Ok(Self::Png),
+            _ => Err(StoreError::CorruptMetadata(
+                "unknown stored thumbnail MIME type",
+            )),
+        }
+    }
+}
+
+/// Semantic placement of a captured thumbnail within one article revision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaPlacementKind {
+    /// The revision's lead/representative image.
+    Lead,
+    /// An image referenced within article content.
+    Inline,
+}
+
+impl MediaPlacementKind {
+    /// Returns the stable lowercase value stored in SQLite.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lead => "lead",
+            Self::Inline => "inline",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "lead" => Ok(Self::Lead),
+            "inline" => Ok(Self::Inline),
+            _ => Err(StoreError::CorruptMetadata(
+                "unknown stored media placement kind",
+            )),
+        }
+    }
+}
+
+/// Canonical raster bytes and immutable source metadata for one file version.
+#[derive(Clone, Debug)]
+pub struct ThumbnailCapture<'a> {
+    /// Stable MediaWiki file-page identity.
+    pub media_id: MediaId,
+    /// Canonical source file title.
+    pub file_title: &'a PageTitle,
+    /// Exact upstream SHA-1 metadata for this file version.
+    pub source_sha1: &'a str,
+    /// URL from which the raster bytes were observed.
+    pub original_url: &'a str,
+    /// Human-facing source description page used for attribution.
+    pub description_url: &'a str,
+    /// Upstream author/creator attribution.
+    pub author: &'a str,
+    /// Complete display-ready attribution text.
+    pub attribution: &'a str,
+    /// Upstream license name or identifier.
+    pub license_name: &'a str,
+    /// Upstream license URL, when one was supplied.
+    pub license_url: Option<&'a str>,
+    /// Raster width in pixels.
+    pub width: u32,
+    /// Raster height in pixels.
+    pub height: u32,
+    /// Validated passive raster MIME type.
+    pub mime_type: ThumbnailMimeType,
+    /// Local Unix capture time.
+    pub captured_at: u64,
+    /// Exact canonical raster bytes.
+    pub source: &'a [u8],
+}
+
+/// Revision-specific caption, alternative text, and ordering for one thumbnail.
+#[derive(Clone, Copy, Debug)]
+pub struct RevisionMediaPlacement<'a> {
+    /// Zero-based stable placement index within the revision.
+    pub index: u32,
+    /// Lead or inline placement.
+    pub kind: MediaPlacementKind,
+    /// Revision-specific visible caption.
+    pub caption: Option<&'a str>,
+    /// Revision-specific alternative text.
+    pub alt_text: Option<&'a str>,
+}
+
+/// One immutable media version with its revision-specific placement metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredRevisionMedia {
+    /// Source wiki identity.
+    pub wiki_id: WikiId,
+    /// Owning article revision.
+    pub revision_id: RevisionId,
+    /// Zero-based placement index within the revision.
+    pub placement_index: u32,
+    /// Lead or inline placement.
+    pub placement_kind: MediaPlacementKind,
+    /// Revision-specific caption.
+    pub caption: Option<String>,
+    /// Revision-specific alternative text.
+    pub alt_text: Option<String>,
+    /// Stable MediaWiki file-page identity.
+    pub media_id: MediaId,
+    /// Canonical source file title.
+    pub file_title: PageTitle,
+    /// Upstream SHA-1 metadata for this file version.
+    pub source_sha1: String,
+    /// URL from which the raster bytes were observed.
+    pub original_url: String,
+    /// Human-facing source description URL.
+    pub description_url: String,
+    /// Upstream author/creator attribution.
+    pub author: String,
+    /// Complete display-ready attribution text.
+    pub attribution: String,
+    /// Upstream license name or identifier.
+    pub license_name: String,
+    /// Upstream license URL, when supplied.
+    pub license_url: Option<String>,
+    /// Raster width in pixels.
+    pub width: u32,
+    /// Raster height in pixels.
+    pub height: u32,
+    /// Passive raster MIME type.
+    pub mime_type: ThumbnailMimeType,
+    /// Local Unix capture time.
+    pub captured_at: u64,
+    /// Stable BLAKE3 logical content identity.
+    pub content_object_id: ObjectId,
 }
 
 /// Result of durably building, verifying, and activating one immutable pack.
@@ -706,6 +873,8 @@ pub struct StoredCollectionConfiguration {
     pub budget: CollectionBudget,
     /// Non-destructive behavior for pages removed by a dynamic rule.
     pub removal_policy: CollectionRemovalPolicy,
+    /// Optional bounded raster-thumbnail capture policy.
+    pub image_policy: ImagePolicy,
 }
 
 /// One stable page identity returned by a completed collection-rule preview.
@@ -892,6 +1061,21 @@ pub enum IntegrityMetadataSubject {
     SearchDocument { search_id: u64 },
     /// One contentless FTS row pointer.
     SearchFtsRow { row_id: i64 },
+    /// One immutable captured media version, ordered by its stable SQLite row ID.
+    Media {
+        row_id: i64,
+        wiki_id: i64,
+        source_media_id: i64,
+        /// Bounded prefix of the recorded upstream source hash.
+        source_hash_prefix: String,
+    },
+    /// One ordered media placement on a captured revision.
+    PageMedia {
+        row_id: i64,
+        wiki_id: i64,
+        revision_id: i64,
+        placement_index: i64,
+    },
 }
 
 /// Metadata-reference invariant violated by a persisted record.
@@ -914,6 +1098,25 @@ pub enum IntegrityMetadataIssue {
     SearchRevisionNotCurrent,
     SearchFtsRowMissing,
     SearchFtsRowOrphan,
+    MediaObjectMissing,
+    MediaObjectWrongKind,
+    MediaMetadataInvalid,
+    PageMediaRevisionMissing,
+    PageMediaPageMissing,
+    PageMediaMediaMissing,
+    PageMediaMetadataInvalid,
+}
+
+/// Canonical-object reference exposed for bounded media byte verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IntegrityMediaObject {
+    pub object_id: ObjectId,
+    /// Bounded MIME type recorded by the media metadata row.
+    pub mime_type: String,
+    /// Recorded decoded width, if it fits the stable-v1 representation.
+    pub width: Option<u32>,
+    /// Recorded decoded height, if it fits the stable-v1 representation.
+    pub height: Option<u32>,
 }
 
 /// One bounded metadata record and every pointer inconsistency visible in the
@@ -924,6 +1127,8 @@ pub struct IntegrityMetadataRecord {
     pub issues: Vec<IntegrityMetadataIssue>,
     /// Transformer version persisted for a search document, absent for other kinds.
     pub search_transformer_version: Option<String>,
+    /// Parsed media-object candidate, absent for non-media or malformed references.
+    pub media_object: Option<IntegrityMediaObject>,
 }
 
 /// Opaque keyset cursor for [`Library::integrity_metadata_records_after`].
@@ -952,6 +1157,8 @@ impl IntegrityMetadataRecord {
                 (3, to_sql_integer(search_id)?, 0)
             }
             IntegrityMetadataSubject::SearchFtsRow { row_id } => (4, row_id, 0),
+            IntegrityMetadataSubject::Media { row_id, .. } => (5, row_id, 0),
+            IntegrityMetadataSubject::PageMedia { row_id, .. } => (6, row_id, 0),
         };
         Ok(IntegrityMetadataCursor {
             category,
@@ -1228,6 +1435,41 @@ struct PreparedPackEntry {
     record_length: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PackAffinity {
+    wiki_id: u64,
+    page_id: u64,
+}
+
+#[derive(Debug)]
+struct PackSource {
+    id: ObjectId,
+    kind: ObjectKind,
+    bytes: Vec<u8>,
+    affinity: Option<PackAffinity>,
+    revision_order: Option<u64>,
+    stable_order: u64,
+}
+
+impl PackSource {
+    fn sort_key(&self) -> (u8, bool, u64, u64, u32, u64, u64, ObjectId) {
+        let affinity = self.affinity.unwrap_or(PackAffinity {
+            wiki_id: 0,
+            page_id: 0,
+        });
+        (
+            self.kind.identity_tag(),
+            self.affinity.is_none(),
+            affinity.wiki_id,
+            affinity.page_id,
+            object_size_class(self.bytes.len() as u64),
+            self.revision_order.unwrap_or(0),
+            self.stable_order,
+            self.id,
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PackIndexEntry {
     id: ObjectId,
@@ -1260,6 +1502,42 @@ struct PackLocation {
     index_path: Option<String>,
     pack_checksum: Option<String>,
     index_checksum: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct MediaMetadataRow {
+    file_title: String,
+    original_url: String,
+    description_url: String,
+    author: String,
+    attribution: String,
+    license_name: String,
+    license_url: Option<String>,
+    width: i64,
+    height: i64,
+    mime_type: String,
+}
+
+#[derive(Debug)]
+struct RevisionMediaRow {
+    placement_index: i64,
+    placement_kind: String,
+    caption: Option<String>,
+    alt_text: Option<String>,
+    source_media_id: i64,
+    source_sha1: String,
+    file_title: String,
+    original_url: String,
+    description_url: String,
+    author: String,
+    attribution: String,
+    license_name: String,
+    license_url: Option<String>,
+    width: i64,
+    height: i64,
+    mime_type: String,
+    captured_at: i64,
+    content_object_id: String,
 }
 
 #[derive(Debug)]
@@ -1780,6 +2058,26 @@ impl Library {
         name: &str,
         preview: CollectionPreviewCommit<'_>,
     ) -> Result<(CollectionId, MembershipCommit), StoreError> {
+        self.create_collection_from_preview_with_image_policy(
+            wiki_id,
+            name,
+            preview,
+            ImagePolicy::None,
+        )
+    }
+
+    /// Creates a collection and atomically commits its complete preview and image
+    /// policy in one generation.
+    ///
+    /// This is the image-aware counterpart to [`Self::create_collection_from_preview`].
+    /// The older method remains explicitly default-off for source compatibility.
+    pub fn create_collection_from_preview_with_image_policy(
+        &mut self,
+        wiki_id: WikiId,
+        name: &str,
+        preview: CollectionPreviewCommit<'_>,
+        image_policy: ImagePolicy,
+    ) -> Result<(CollectionId, MembershipCommit), StoreError> {
         self.ensure_writable()?;
         validate_collection_name(name)?;
         validate_preview_commit(preview)?;
@@ -1804,8 +2102,14 @@ impl Library {
              ) VALUES (?1, 'manual', NULL, 0, 0, NULL, NULL, ?2)",
             params![raw_collection_id, now],
         )?;
-        let membership =
-            commit_preview_transaction(&transaction, raw_collection_id, raw_wiki_id, preview, now)?;
+        let membership = commit_preview_transaction(
+            &transaction,
+            raw_collection_id,
+            raw_wiki_id,
+            preview,
+            image_policy,
+            now,
+        )?;
         transaction.commit()?;
         Ok((collection_id, membership))
     }
@@ -1823,6 +2127,45 @@ impl Library {
         name: Option<&str>,
         preview: CollectionPreviewCommit<'_>,
     ) -> Result<MembershipCommit, StoreError> {
+        self.update_collection_from_preview_internal(
+            collection_id,
+            expected_generation,
+            name,
+            preview,
+            None,
+        )
+    }
+
+    /// Atomically replaces an active collection's complete preview and image policy.
+    ///
+    /// The expected generation is checked once and a successful transaction advances
+    /// it exactly once. The older [`Self::update_collection_from_preview`] preserves
+    /// the current image policy for source compatibility.
+    pub fn update_collection_from_preview_with_image_policy(
+        &mut self,
+        collection_id: CollectionId,
+        expected_generation: u64,
+        name: Option<&str>,
+        preview: CollectionPreviewCommit<'_>,
+        image_policy: ImagePolicy,
+    ) -> Result<MembershipCommit, StoreError> {
+        self.update_collection_from_preview_internal(
+            collection_id,
+            expected_generation,
+            name,
+            preview,
+            Some(image_policy),
+        )
+    }
+
+    fn update_collection_from_preview_internal(
+        &mut self,
+        collection_id: CollectionId,
+        expected_generation: u64,
+        name: Option<&str>,
+        preview: CollectionPreviewCommit<'_>,
+        image_policy: Option<ImagePolicy>,
+    ) -> Result<MembershipCommit, StoreError> {
         self.ensure_writable()?;
         if let Some(name) = name {
             validate_collection_name(name)?;
@@ -1839,6 +2182,10 @@ impl Library {
             [raw_collection_id],
             |row| row.get(0),
         )?;
+        let image_policy = match image_policy {
+            Some(image_policy) => image_policy,
+            None => stored_collection_image_policy(&transaction, collection_id, raw_collection_id)?,
+        };
         let changed = transaction.execute(
             "UPDATE collections
              SET name = COALESCE(?3, name), generation = generation + 1
@@ -1861,8 +2208,14 @@ impl Library {
                 actual: sql_u64(actual, "invalid collection generation")?,
             });
         }
-        let membership =
-            commit_preview_transaction(&transaction, raw_collection_id, raw_wiki_id, preview, now)?;
+        let membership = commit_preview_transaction(
+            &transaction,
+            raw_collection_id,
+            raw_wiki_id,
+            preview,
+            image_policy,
+            now,
+        )?;
         transaction.commit()?;
         Ok(membership)
     }
@@ -1963,7 +2316,10 @@ impl Library {
                         config.rule_kind, config.category_title,
                         config.category_recursion_depth, config.history_kind,
                         config.history_value, config.maximum_pages,
-                        config.maximum_bytes, config.removal_policy
+                        config.maximum_bytes, config.removal_policy,
+                        config.image_policy, config.thumbnail_max_edge_pixels,
+                        config.thumbnail_max_images_per_revision,
+                        config.thumbnail_max_bytes_per_image
                  FROM collections
                  JOIN collection_configuration AS config USING (collection_id)
                  WHERE collections.collection_id = ?1",
@@ -1982,6 +2338,10 @@ impl Library {
                         row.get::<_, Option<i64>>(9)?,
                         row.get::<_, Option<i64>>(10)?,
                         row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, Option<i64>>(13)?,
+                        row.get::<_, Option<i64>>(14)?,
+                        row.get::<_, Option<i64>>(15)?,
                     ))
                 },
             )
@@ -1999,6 +2359,10 @@ impl Library {
             maximum_pages,
             maximum_bytes,
             removal_policy,
+            image_policy,
+            thumbnail_max_edge_pixels,
+            thumbnail_max_images_per_revision,
+            thumbnail_max_bytes_per_image,
         )) = row
         else {
             return Ok(None);
@@ -2022,7 +2386,61 @@ impl Library {
             history_policy: stored_history_policy(&history_kind, history_value)?,
             budget: stored_collection_budget(maximum_pages, maximum_bytes)?,
             removal_policy: stored_removal_policy(&removal_policy)?,
+            image_policy: stored_image_policy(
+                &image_policy,
+                thumbnail_max_edge_pixels,
+                thumbnail_max_images_per_revision,
+                thumbnail_max_bytes_per_image,
+            )?,
         }))
+    }
+
+    /// Atomically replaces an active collection's optional image policy.
+    ///
+    /// Existing captured media is retained when the policy is disabled or reduced.
+    /// The collection generation advances so stale administrative previews cannot
+    /// silently overwrite this configuration change.
+    pub fn set_collection_image_policy(
+        &mut self,
+        collection_id: CollectionId,
+        image_policy: ImagePolicy,
+    ) -> Result<(), StoreError> {
+        self.ensure_writable()?;
+        let raw_collection_id = to_sql_integer(collection_id.get())?;
+        let (kind, maximum_edge, maximum_images, maximum_bytes) = image_policy_values(image_policy);
+        let now = unix_time()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_collection_active(&transaction, collection_id, raw_collection_id)?;
+        let configured = transaction.execute(
+            "UPDATE collection_configuration
+             SET image_policy = ?2, thumbnail_max_edge_pixels = ?3,
+                 thumbnail_max_images_per_revision = ?4,
+                 thumbnail_max_bytes_per_image = ?5, updated_at = ?6
+             WHERE collection_id = ?1",
+            params![
+                raw_collection_id,
+                kind,
+                maximum_edge,
+                maximum_images,
+                maximum_bytes,
+                now,
+            ],
+        )?;
+        if configured != 1 {
+            return Err(StoreError::CollectionNotConfigured(collection_id));
+        }
+        let changed = transaction.execute(
+            "UPDATE collections SET generation = generation + 1
+             WHERE collection_id = ?1 AND status = 'active'",
+            [raw_collection_id],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::CollectionTombstoned(collection_id));
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     fn stored_collection_rule(
@@ -3725,6 +4143,228 @@ impl Library {
         Ok(object)
     }
 
+    /// Durably captures one passive raster thumbnail and atomically links it to a
+    /// previously captured article revision.
+    ///
+    /// The article revision must already be durable. Validation and metadata
+    /// conflicts are checked before object installation where possible, and any
+    /// media failure leaves the text revision and its current-page state unchanged.
+    /// Repeating the same rendition and immutable metadata is idempotent even when
+    /// the retry supplies a later capture time; the first durable time is retained.
+    pub fn capture_revision_thumbnail(
+        &mut self,
+        wiki_id: WikiId,
+        page_id: PageId,
+        revision_id: RevisionId,
+        policy: ThumbnailPolicy,
+        capture: &ThumbnailCapture<'_>,
+        placement: RevisionMediaPlacement<'_>,
+    ) -> Result<StoredObject, StoreError> {
+        self.ensure_writable()?;
+        validate_thumbnail_capture(policy, capture, placement)?;
+        let raw_wiki_id = to_sql_integer(wiki_id.get())?;
+        let raw_page_id = to_sql_integer(page_id.get())?;
+        let raw_revision_id = to_sql_integer(revision_id.get())?;
+        let raw_media_id = to_sql_integer(capture.media_id.get())?;
+        let raw_placement_index = i64::from(placement.index);
+        let revision_page: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT page_id FROM revisions WHERE wiki_id = ?1 AND revision_id = ?2",
+                params![raw_wiki_id, raw_revision_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match revision_page {
+            None => return Err(StoreError::RevisionNotFound(revision_id)),
+            Some(stored_page_id) if stored_page_id != raw_page_id => {
+                return Err(StoreError::RevisionPageMismatch {
+                    revision_id,
+                    page_id,
+                });
+            }
+            Some(_) => {}
+        }
+
+        let object_id = ObjectId::for_bytes(ObjectKind::Media, capture.source);
+        let expected_metadata = expected_media_metadata(capture);
+        if let Some(existing) = query_media_metadata(
+            &self.connection,
+            raw_wiki_id,
+            raw_media_id,
+            capture.source_sha1,
+            object_id,
+        )? && existing != expected_metadata
+        {
+            return Err(StoreError::ConflictingMedia(capture.media_id));
+        }
+        if let Some(existing) = query_media_placement(
+            &self.connection,
+            raw_wiki_id,
+            raw_revision_id,
+            raw_placement_index,
+        )? && existing
+            != (
+                raw_media_id,
+                capture.source_sha1.to_owned(),
+                object_id.to_string(),
+                placement.kind.as_str().to_owned(),
+                placement.caption.map(str::to_owned),
+                placement.alt_text.map(str::to_owned),
+            )
+        {
+            return Err(StoreError::ConflictingMediaPlacement {
+                revision_id,
+                placement_index: placement.index,
+            });
+        }
+
+        let object = self.put_bytes(ObjectKind::Media, capture.source)?;
+        if object.id != object_id {
+            return Err(StoreError::HashMismatch(object_id));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction_page: Option<i64> = transaction
+            .query_row(
+                "SELECT page_id FROM revisions WHERE wiki_id = ?1 AND revision_id = ?2",
+                params![raw_wiki_id, raw_revision_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if transaction_page != Some(raw_page_id) {
+            return Err(StoreError::RevisionPageMismatch {
+                revision_id,
+                page_id,
+            });
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO media (
+                wiki_id, source_media_id, source_sha1, file_title,
+                original_url, description_url, author, attribution,
+                license_name, license_url, width, height, mime_type,
+                captured_at, content_object_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                       ?11, ?12, ?13, ?14, ?15)",
+            params![
+                raw_wiki_id,
+                raw_media_id,
+                capture.source_sha1,
+                capture.file_title.as_str(),
+                capture.original_url,
+                capture.description_url,
+                capture.author,
+                capture.attribution,
+                capture.license_name,
+                capture.license_url,
+                i64::from(capture.width),
+                i64::from(capture.height),
+                capture.mime_type.as_str(),
+                to_sql_integer(capture.captured_at)?,
+                object.id.to_string(),
+            ],
+        )?;
+        let stored_metadata = query_media_metadata(
+            &transaction,
+            raw_wiki_id,
+            raw_media_id,
+            capture.source_sha1,
+            object_id,
+        )?
+        .ok_or(StoreError::CorruptMetadata(
+            "captured media metadata is absent",
+        ))?;
+        if stored_metadata != expected_metadata {
+            return Err(StoreError::ConflictingMedia(capture.media_id));
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO page_media (
+                wiki_id, revision_id, placement_index, source_media_id,
+                source_sha1, content_object_id, placement_kind, caption, alt_text
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                raw_wiki_id,
+                raw_revision_id,
+                raw_placement_index,
+                raw_media_id,
+                capture.source_sha1,
+                object.id.to_string(),
+                placement.kind.as_str(),
+                placement.caption,
+                placement.alt_text,
+            ],
+        )?;
+        let stored_placement = query_media_placement(
+            &transaction,
+            raw_wiki_id,
+            raw_revision_id,
+            raw_placement_index,
+        )?
+        .ok_or(StoreError::CorruptMetadata(
+            "captured media placement is absent",
+        ))?;
+        let expected_placement = (
+            raw_media_id,
+            capture.source_sha1.to_owned(),
+            object.id.to_string(),
+            placement.kind.as_str().to_owned(),
+            placement.caption.map(str::to_owned),
+            placement.alt_text.map(str::to_owned),
+        );
+        if stored_placement != expected_placement {
+            return Err(StoreError::ConflictingMediaPlacement {
+                revision_id,
+                placement_index: placement.index,
+            });
+        }
+        transaction.commit()?;
+        Ok(object)
+    }
+
+    /// Returns every captured thumbnail placement for one revision in stable order.
+    ///
+    /// The schema and capture API cap the result at
+    /// [`MAX_THUMBNAILS_PER_REVISION`]. Canonical bytes remain in the object store
+    /// and are read separately through [`Self::read_object`].
+    pub fn revision_media(
+        &self,
+        wiki_id: WikiId,
+        revision_id: RevisionId,
+    ) -> Result<Vec<StoredRevisionMedia>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT placements.placement_index, placements.placement_kind,
+                    placements.caption, placements.alt_text,
+                    media.source_media_id, media.source_sha1, media.file_title,
+                    media.original_url, media.description_url, media.author,
+                    media.attribution, media.license_name, media.license_url,
+                    media.width, media.height, media.mime_type, media.captured_at,
+                    media.content_object_id
+             FROM page_media AS placements
+             JOIN media
+               ON media.wiki_id = placements.wiki_id
+              AND media.source_media_id = placements.source_media_id
+              AND media.source_sha1 = placements.source_sha1
+              AND media.content_object_id = placements.content_object_id
+             WHERE placements.wiki_id = ?1 AND placements.revision_id = ?2
+             ORDER BY placements.placement_index
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                to_sql_integer(wiki_id.get())?,
+                to_sql_integer(revision_id.get())?,
+                i64::from(MAX_THUMBNAILS_PER_REVISION),
+            ],
+            revision_media_row,
+        )?;
+        let mut media = Vec::new();
+        for row in rows {
+            media.push(stored_revision_media(wiki_id, revision_id, row?)?);
+        }
+        Ok(media)
+    }
+
     /// Looks up a captured page by stable remote identity.
     pub fn page(&self, wiki_id: WikiId, page_id: PageId) -> Result<Option<StoredPage>, StoreError> {
         self.connection
@@ -4461,55 +5101,99 @@ impl Library {
     ///
     /// The pack and its separate index are made durable and every entry is
     /// reconstructed and hash-verified before one SQLite transaction exposes any
-    /// packed location. Existing loose representations remain available until an
-    /// explicit pruning pass marks them obsolete.
+    /// packed location. Candidates are ordered deterministically by object kind,
+    /// captured page affinity, and logarithmic size class before bounded delta
+    /// selection. A loose object larger than the per-pack input limit remains loose
+    /// without blocking smaller eligible objects. Existing loose representations
+    /// remain available until an explicit pruning pass marks them obsolete.
     pub fn pack_loose_objects(&mut self) -> Result<Option<PackSummary>, StoreError> {
         self.ensure_writable()?;
-        let candidate_ids = {
+        let candidates = {
             let mut statement = self.connection.prepare(
-                "SELECT loose.object_id
-                 FROM object_locations AS loose
-                 WHERE loose.storage_kind = 'loose'
-                   AND loose.encoding = 'zstd'
-                   AND loose.verification_state = 'verified'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM object_locations AS packed
-                       JOIN packs ON packs.pack_id = packed.pack_id
-                       WHERE packed.object_id = loose.object_id
-                         AND packed.storage_kind = 'pack'
-                         AND packed.verification_state = 'verified'
-                         AND packs.state = 'verified'
-                   )
-                 GROUP BY loose.object_id
-                 ORDER BY MIN(loose.location_id)
-                 LIMIT ?1",
+                "WITH candidates AS (
+                    SELECT loose.object_id, MIN(loose.location_id) AS stable_order
+                    FROM object_locations AS loose
+                    JOIN content_objects AS objects USING (object_id)
+                    WHERE loose.storage_kind = 'loose'
+                      AND loose.encoding = 'zstd'
+                      AND loose.verification_state = 'verified'
+                      AND objects.uncompressed_length <= ?2
+                      AND NOT EXISTS (
+                          SELECT 1 FROM object_locations AS packed
+                          JOIN packs ON packs.pack_id = packed.pack_id
+                          WHERE packed.object_id = loose.object_id
+                            AND packed.storage_kind = 'pack'
+                            AND packed.verification_state = 'verified'
+                            AND packs.state = 'verified'
+                      )
+                    GROUP BY loose.object_id
+                    ORDER BY stable_order
+                    LIMIT ?1
+                 )
+                 SELECT candidates.object_id, candidates.stable_order,
+                        affinity.wiki_id, affinity.page_id, affinity.revision_id
+                 FROM candidates
+                 LEFT JOIN revisions AS affinity ON affinity.rowid = (
+                     SELECT revision.rowid
+                     FROM revisions AS revision
+                     WHERE revision.content_object_id = candidates.object_id
+                     ORDER BY revision.wiki_id, revision.page_id, revision.revision_id
+                     LIMIT 1
+                 )
+                 ORDER BY candidates.stable_order",
             )?;
             statement
-                .query_map([i64::from(self.config.max_pack_objects)], |row| {
-                    row.get::<_, String>(0)
-                })?
+                .query_map(
+                    params![
+                        i64::from(self.config.max_pack_objects),
+                        self.config.max_pack_input_bytes.min(i64::MAX as u64) as i64,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                        ))
+                    },
+                )?
                 .collect::<Result<Vec<_>, _>>()?
         };
 
-        let mut sources = Vec::with_capacity(candidate_ids.len());
-        let mut total_input = 0_u64;
-        for raw_id in candidate_ids {
+        let mut sources = Vec::with_capacity(candidates.len());
+        for (raw_id, stable_order, raw_wiki_id, raw_page_id, raw_revision_id) in candidates {
             let id = raw_id
                 .parse::<ObjectId>()
                 .map_err(|_| StoreError::CorruptMetadata("invalid stored object ID"))?;
-            let (kind, expected_length, bytes) = self.read_loose_object(id)?;
-            let next_total = total_input
-                .checked_add(expected_length)
-                .ok_or(StoreError::PackLimitExceeded)?;
-            if next_total > self.config.max_pack_input_bytes {
-                if sources.is_empty() {
-                    return Err(StoreError::PackLimitExceeded);
-                }
-                break;
-            }
-            total_input = next_total;
-            sources.push((id, kind, bytes));
+            let (kind, _, bytes) = self.read_loose_object(id)?;
+            let (affinity, revision_order) =
+                pack_affinity(raw_wiki_id, raw_page_id, raw_revision_id)?;
+            sources.push(PackSource {
+                id,
+                kind,
+                bytes,
+                affinity,
+                revision_order,
+                stable_order: sql_u64(stable_order, "invalid loose location order")?,
+            });
         }
+        if sources.is_empty() {
+            return Ok(None);
+        }
+        sources.sort_by_key(PackSource::sort_key);
+        let mut total_input = 0_u64;
+        sources.retain(|source| {
+            let Some(next_total) = total_input.checked_add(source.bytes.len() as u64) else {
+                return false;
+            };
+            if next_total > self.config.max_pack_input_bytes {
+                false
+            } else {
+                total_input = next_total;
+                true
+            }
+        });
         if sources.is_empty() {
             return Ok(None);
         }
@@ -4517,7 +5201,7 @@ impl Library {
         self.activate_pack_sources(&sources).map(Some)
     }
 
-    /// Rewrites one verified pack's objects into a fresh generation.
+    /// Rewrites one verified pack's objects into a freshly tuned generation.
     /// The previous representation remains active until [`Self::retire_pack`] is
     /// called, so interruption cannot strand an object between generations.
     pub fn repack_pack(&mut self, pack_id: &str) -> Result<PackSummary, StoreError> {
@@ -4526,19 +5210,37 @@ impl Library {
         if recorded.object_count > u64::from(self.config.max_pack_objects) {
             return Err(StoreError::PackLimitExceeded);
         }
-        let candidate_ids = {
+        let candidates = {
             let mut statement = self.connection.prepare(
-                "SELECT object_id FROM object_locations
-                 WHERE pack_id = ?1 AND verification_state = 'verified'
-                 ORDER BY pack_offset",
+                "SELECT locations.object_id, locations.pack_offset,
+                        affinity.wiki_id, affinity.page_id, affinity.revision_id
+                 FROM object_locations AS locations
+                 LEFT JOIN revisions AS affinity ON affinity.rowid = (
+                     SELECT revision.rowid
+                     FROM revisions AS revision
+                     WHERE revision.content_object_id = locations.object_id
+                     ORDER BY revision.wiki_id, revision.page_id, revision.revision_id
+                     LIMIT 1
+                 )
+                 WHERE locations.pack_id = ?1
+                   AND locations.verification_state = 'verified'
+                 ORDER BY locations.pack_offset",
             )?;
             statement
-                .query_map([pack_id], |row| row.get::<_, String>(0))?
+                .query_map([pack_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                })?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let mut sources = Vec::with_capacity(candidate_ids.len());
+        let mut sources = Vec::with_capacity(candidates.len());
         let mut total_input = 0_u64;
-        for raw_id in candidate_ids {
+        for (raw_id, stable_order, raw_wiki_id, raw_page_id, raw_revision_id) in candidates {
             let id = raw_id
                 .parse::<ObjectId>()
                 .map_err(|_| StoreError::CorruptMetadata("invalid stored object ID"))?;
@@ -4547,27 +5249,31 @@ impl Library {
                 .checked_add(expected_length)
                 .ok_or(StoreError::PackLimitExceeded)?;
             if next_total > self.config.max_pack_input_bytes {
-                if sources.is_empty() {
-                    return Err(StoreError::PackLimitExceeded);
-                }
-                break;
+                return Err(StoreError::PackLimitExceeded);
             }
             let bytes = self.read_object(id)?;
+            let (affinity, revision_order) =
+                pack_affinity(raw_wiki_id, raw_page_id, raw_revision_id)?;
             total_input = next_total;
-            sources.push((id, kind, bytes));
+            sources.push(PackSource {
+                id,
+                kind,
+                bytes,
+                affinity,
+                revision_order,
+                stable_order: sql_u64(stable_order, "invalid pack offset")?,
+            });
         }
         if sources.len() as u64 != recorded.object_count {
             return Err(StoreError::CorruptMetadata(
                 "pack object count disagrees with locations",
             ));
         }
+        sources.sort_by_key(PackSource::sort_key);
         self.activate_pack_sources(&sources)
     }
 
-    fn activate_pack_sources(
-        &mut self,
-        sources: &[(ObjectId, ObjectKind, Vec<u8>)],
-    ) -> Result<PackSummary, StoreError> {
+    fn activate_pack_sources(&mut self, sources: &[PackSource]) -> Result<PackSummary, StoreError> {
         self.ensure_writable()?;
         let raw_generation: i64 = self.connection.query_row(
             "SELECT COALESCE(MAX(generation), 0) + 1 FROM packs",
@@ -4931,8 +5637,8 @@ impl Library {
             .collect()
     }
 
-    /// Returns the number of revision, page, checkpoint, search-document, and FTS
-    /// pointer records covered by the current full metadata-integrity scan.
+    /// Returns the number of records covered by the current full metadata-integrity
+    /// scan, including canonical media metadata and revision media placements.
     pub fn integrity_metadata_record_count(&self) -> Result<u64, StoreError> {
         let count: i64 = self.connection.query_row(
             "SELECT
@@ -4940,7 +5646,9 @@ impl Library {
               + (SELECT COUNT(*) FROM pages)
               + (SELECT COUNT(*) FROM sync_checkpoints)
               + (SELECT COUNT(*) FROM search_documents)
-              + (SELECT COUNT(*) FROM search_fts)",
+              + (SELECT COUNT(*) FROM search_fts)
+              + (SELECT COUNT(*) FROM media)
+              + (SELECT COUNT(*) FROM page_media)",
             [],
             |row| row.get(0),
         )?;
@@ -4977,7 +5685,7 @@ impl Library {
         let mut second_key = after.map_or(-1, |cursor| cursor.second_key);
         let mut records = Vec::with_capacity(limit as usize);
 
-        while records.len() < limit as usize && category <= 4 {
+        while records.len() < limit as usize && category <= 6 {
             let remaining = i64::from(limit) - records.len() as i64;
             let before = records.len();
             match category {
@@ -5042,6 +5750,7 @@ impl Library {
                             },
                             issues,
                             search_transformer_version: None,
+                            media_object: None,
                         });
                     }
                 }
@@ -5088,6 +5797,7 @@ impl Library {
                             },
                             issues,
                             search_transformer_version: None,
+                            media_object: None,
                         });
                     }
                 }
@@ -5159,6 +5869,7 @@ impl Library {
                             },
                             issues,
                             search_transformer_version: None,
+                            media_object: None,
                         });
                     }
                 }
@@ -5229,6 +5940,7 @@ impl Library {
                             },
                             issues,
                             search_transformer_version: Some(version),
+                            media_object: None,
                         });
                     }
                 }
@@ -5255,6 +5967,228 @@ impl Library {
                                 vec![IntegrityMetadataIssue::SearchFtsRowOrphan]
                             },
                             search_transformer_version: None,
+                            media_object: None,
+                        });
+                    }
+                }
+                5 => {
+                    let mut statement = self.connection.prepare(
+                        "WITH RECURSIVE control_codes(code) AS (
+                             SELECT 0
+                             UNION ALL SELECT code + 1 FROM control_codes WHERE code < 31
+                             UNION ALL SELECT 127 FROM control_codes WHERE code = 31
+                             UNION ALL SELECT code + 1 FROM control_codes
+                                       WHERE code BETWEEN 127 AND 158
+                         )
+                         SELECT media.rowid, media.wiki_id, media.source_media_id,
+                                substr(media.source_sha1, 1, 129),
+                                length(CAST(media.source_sha1 AS BLOB)) BETWEEN 1 AND 128
+                                  AND media.source_sha1 NOT GLOB '*[^A-Za-z0-9]*',
+                                media.wiki_id > 0 AND media.source_media_id > 0
+                                  AND length(CAST(media.file_title AS BLOB)) BETWEEN 1 AND 16384
+                                  AND length(CAST(media.original_url AS BLOB)) BETWEEN 1 AND 16384
+                                  AND length(CAST(media.description_url AS BLOB)) BETWEEN 1 AND 16384
+                                  AND length(CAST(media.author AS BLOB)) BETWEEN 1 AND 16384
+                                  AND length(CAST(media.attribution AS BLOB)) BETWEEN 1 AND 16384
+                                  AND length(CAST(media.license_name AS BLOB)) BETWEEN 1 AND 16384
+                                  AND (media.license_url IS NULL OR
+                                       length(CAST(media.license_url AS BLOB)) BETWEEN 1 AND 16384)
+                                  AND NOT EXISTS (
+                                      SELECT 1 FROM control_codes
+                                      WHERE instr(media.file_title, char(code)) > 0
+                                         OR instr(media.original_url, char(code)) > 0
+                                         OR instr(media.description_url, char(code)) > 0
+                                         OR instr(media.author, char(code)) > 0
+                                         OR instr(media.attribution, char(code)) > 0
+                                         OR instr(media.license_name, char(code)) > 0
+                                         OR (media.license_url IS NOT NULL
+                                             AND instr(media.license_url, char(code)) > 0)
+                                  ),
+                                media.width BETWEEN 1 AND 4096
+                                  AND media.height BETWEEN 1 AND 4096,
+                                media.width, media.height,
+                                substr(media.mime_type, 1, 32),
+                                media.captured_at >= 0,
+                                substr(media.content_object_id, 1, 128),
+                                length(CAST(media.content_object_id AS BLOB)) <= 128,
+                                object.object_id IS NOT NULL,
+                                object.object_kind IS 'media',
+                                object.media_type IS 'application/octet-stream'
+                                  AND object.uncompressed_length BETWEEN 1 AND 67108864
+                         FROM media
+                         LEFT JOIN content_objects AS object
+                           ON object.object_id = media.content_object_id
+                         WHERE media.rowid > ?1
+                         ORDER BY media.rowid LIMIT ?2",
+                    )?;
+                    let rows = statement.query_map(params![first_key, remaining], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, bool>(4)?,
+                            row.get::<_, bool>(5)?,
+                            row.get::<_, bool>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, String>(9)?,
+                            row.get::<_, bool>(10)?,
+                            row.get::<_, String>(11)?,
+                            row.get::<_, bool>(12)?,
+                            row.get::<_, bool>(13)?,
+                            row.get::<_, bool>(14)?,
+                            row.get::<_, bool>(15)?,
+                        ))
+                    })?;
+                    for row in rows {
+                        let (
+                            row_id,
+                            wiki_id,
+                            source_media_id,
+                            source_hash_prefix,
+                            source_hash_valid,
+                            text_metadata_valid,
+                            dimensions_valid,
+                            width,
+                            height,
+                            mime_type,
+                            captured_at_valid,
+                            object_id_text,
+                            object_id_bounded,
+                            object_exists,
+                            object_kind_valid,
+                            object_metadata_valid,
+                        ) = row?;
+                        let object_id = object_id_bounded
+                            .then(|| object_id_text.parse::<ObjectId>().ok())
+                            .flatten();
+                        let mut issues = Vec::new();
+                        if !object_exists {
+                            issues.push(IntegrityMetadataIssue::MediaObjectMissing);
+                        } else if !object_kind_valid {
+                            issues.push(IntegrityMetadataIssue::MediaObjectWrongKind);
+                        }
+                        if !source_hash_valid
+                            || !text_metadata_valid
+                            || !dimensions_valid
+                            || !matches!(mime_type.as_str(), "image/jpeg" | "image/png")
+                            || !captured_at_valid
+                            || object_id.is_none()
+                            || (object_exists && !object_metadata_valid)
+                        {
+                            issues.push(IntegrityMetadataIssue::MediaMetadataInvalid);
+                        }
+                        let media_object = object_id.map(|object_id| IntegrityMediaObject {
+                            object_id,
+                            mime_type,
+                            width: u32::try_from(width).ok(),
+                            height: u32::try_from(height).ok(),
+                        });
+                        records.push(IntegrityMetadataRecord {
+                            subject: IntegrityMetadataSubject::Media {
+                                row_id,
+                                wiki_id,
+                                source_media_id,
+                                source_hash_prefix,
+                            },
+                            issues,
+                            search_transformer_version: None,
+                            media_object,
+                        });
+                    }
+                }
+                6 => {
+                    let mut statement = self.connection.prepare(
+                        "WITH RECURSIVE control_codes(code) AS (
+                             SELECT 0
+                             UNION ALL SELECT code + 1 FROM control_codes WHERE code < 31
+                             UNION ALL SELECT 127 FROM control_codes WHERE code = 31
+                             UNION ALL SELECT code + 1 FROM control_codes
+                                       WHERE code BETWEEN 127 AND 158
+                         )
+                         SELECT placement.rowid, placement.wiki_id,
+                                placement.revision_id, placement.placement_index,
+                                placement.wiki_id > 0 AND placement.revision_id > 0
+                                  AND placement.placement_index BETWEEN 0 AND 255
+                                  AND placement.source_media_id > 0
+                                  AND length(CAST(placement.source_sha1 AS BLOB)) BETWEEN 1 AND 128
+                                  AND placement.source_sha1 NOT GLOB '*[^A-Za-z0-9]*'
+                                  AND placement.placement_kind IN ('lead', 'inline')
+                                  AND (placement.caption IS NULL OR
+                                       length(CAST(placement.caption AS BLOB)) BETWEEN 1 AND 16384)
+                                  AND (placement.alt_text IS NULL OR
+                                       length(CAST(placement.alt_text AS BLOB)) BETWEEN 1 AND 16384)
+                                  AND NOT EXISTS (
+                                      SELECT 1 FROM control_codes
+                                      WHERE (placement.caption IS NOT NULL
+                                             AND instr(placement.caption, char(code)) > 0)
+                                         OR (placement.alt_text IS NOT NULL
+                                             AND instr(placement.alt_text, char(code)) > 0)
+                                  ),
+                                revision.revision_id IS NOT NULL,
+                                page.page_id IS NOT NULL,
+                                media.source_media_id IS NOT NULL
+                         FROM page_media AS placement
+                         LEFT JOIN revisions AS revision
+                           ON revision.wiki_id = placement.wiki_id
+                          AND revision.revision_id = placement.revision_id
+                         LEFT JOIN pages AS page
+                           ON page.wiki_id = revision.wiki_id
+                          AND page.page_id = revision.page_id
+                         LEFT JOIN media
+                          ON media.wiki_id = placement.wiki_id
+                          AND media.source_media_id = placement.source_media_id
+                          AND media.source_sha1 = placement.source_sha1
+                          AND media.content_object_id = placement.content_object_id
+                         WHERE placement.rowid > ?1
+                         ORDER BY placement.rowid LIMIT ?2",
+                    )?;
+                    let rows = statement.query_map(params![first_key, remaining], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, bool>(4)?,
+                            row.get::<_, bool>(5)?,
+                            row.get::<_, bool>(6)?,
+                            row.get::<_, bool>(7)?,
+                        ))
+                    })?;
+                    for row in rows {
+                        let (
+                            row_id,
+                            wiki_id,
+                            revision_id,
+                            placement_index,
+                            metadata_valid,
+                            revision_exists,
+                            page_exists,
+                            media_exists,
+                        ) = row?;
+                        let mut issues = Vec::new();
+                        if !metadata_valid {
+                            issues.push(IntegrityMetadataIssue::PageMediaMetadataInvalid);
+                        }
+                        if !revision_exists {
+                            issues.push(IntegrityMetadataIssue::PageMediaRevisionMissing);
+                        } else if !page_exists {
+                            issues.push(IntegrityMetadataIssue::PageMediaPageMissing);
+                        }
+                        if !media_exists {
+                            issues.push(IntegrityMetadataIssue::PageMediaMediaMissing);
+                        }
+                        records.push(IntegrityMetadataRecord {
+                            subject: IntegrityMetadataSubject::PageMedia {
+                                row_id,
+                                wiki_id,
+                                revision_id,
+                                placement_index,
+                            },
+                            issues,
+                            search_transformer_version: None,
+                            media_object: None,
                         });
                     }
                 }
@@ -5792,6 +6726,238 @@ fn validate_sync_text(value: &str, label: &'static str) -> Result<(), StoreError
     Ok(())
 }
 
+fn validate_thumbnail_capture(
+    policy: ThumbnailPolicy,
+    capture: &ThumbnailCapture<'_>,
+    placement: RevisionMediaPlacement<'_>,
+) -> Result<(), StoreError> {
+    for (value, label) in [
+        (capture.file_title.as_str(), "media file title"),
+        (capture.source_sha1, "media source hash"),
+        (capture.original_url, "media original URL"),
+        (capture.description_url, "media description URL"),
+        (capture.author, "media author"),
+        (capture.attribution, "media attribution"),
+        (capture.license_name, "media license"),
+    ] {
+        validate_media_text(value, label)?;
+    }
+    if capture.source_sha1.len() > MAX_MEDIA_SOURCE_HASH_BYTES
+        || !capture
+            .source_sha1
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err(StoreError::InvalidMediaMetadata(
+            "media source hash must be bounded and alphanumeric",
+        ));
+    }
+    if let Some(value) = capture.license_url {
+        validate_media_text(value, "media license URL")?;
+    }
+    if let Some(value) = placement.caption {
+        validate_media_text(value, "media caption")?;
+    }
+    if let Some(value) = placement.alt_text {
+        validate_media_text(value, "media alternative text")?;
+    }
+    let maximum_edge = policy.maximum_edge_pixels().get();
+    if capture.width == 0
+        || capture.height == 0
+        || capture.width > maximum_edge
+        || capture.height > maximum_edge
+    {
+        return Err(StoreError::InvalidMediaMetadata(
+            "media dimensions exceed the thumbnail policy",
+        ));
+    }
+    if placement.index >= policy.maximum_images_per_revision().get() {
+        return Err(StoreError::InvalidMediaMetadata(
+            "media placement exceeds the thumbnail-count policy",
+        ));
+    }
+    let validated = validate_thumbnail(
+        capture.source,
+        capture.mime_type.as_str(),
+        &thumbnail_limits(policy),
+    )
+    .map_err(|_| {
+        StoreError::InvalidMediaMetadata(
+            "thumbnail failed complete bounded passive-raster validation",
+        )
+    })?;
+    if validated.width != capture.width || validated.height != capture.height {
+        return Err(StoreError::InvalidMediaMetadata(
+            "decoded thumbnail dimensions disagree with media metadata",
+        ));
+    }
+    to_sql_integer(capture.captured_at)?;
+    Ok(())
+}
+
+fn thumbnail_limits(policy: ThumbnailPolicy) -> ThumbnailLimits {
+    let maximum_edge = policy.maximum_edge_pixels().get();
+    let maximum_pixels = u64::from(maximum_edge) * u64::from(maximum_edge);
+    ThumbnailLimits {
+        max_encoded_bytes: policy.maximum_bytes_per_image().get(),
+        max_width: maximum_edge,
+        max_height: maximum_edge,
+        max_pixels: maximum_pixels,
+        max_decoded_bytes: maximum_pixels * MAX_THUMBNAIL_BYTES_PER_PIXEL,
+    }
+}
+
+fn validate_media_text(value: &str, _label: &'static str) -> Result<(), StoreError> {
+    if value.is_empty()
+        || value.len() > MAX_MEDIA_METADATA_TEXT_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(StoreError::InvalidMediaMetadata(
+            "media text must be non-empty, bounded, and contain no controls",
+        ));
+    }
+    Ok(())
+}
+
+fn expected_media_metadata(capture: &ThumbnailCapture<'_>) -> MediaMetadataRow {
+    MediaMetadataRow {
+        file_title: capture.file_title.as_str().to_owned(),
+        original_url: capture.original_url.to_owned(),
+        description_url: capture.description_url.to_owned(),
+        author: capture.author.to_owned(),
+        attribution: capture.attribution.to_owned(),
+        license_name: capture.license_name.to_owned(),
+        license_url: capture.license_url.map(str::to_owned),
+        width: i64::from(capture.width),
+        height: i64::from(capture.height),
+        mime_type: capture.mime_type.as_str().to_owned(),
+    }
+}
+
+fn query_media_metadata(
+    connection: &Connection,
+    wiki_id: i64,
+    media_id: i64,
+    source_sha1: &str,
+    object_id: ObjectId,
+) -> Result<Option<MediaMetadataRow>, StoreError> {
+    connection
+        .query_row(
+            "SELECT file_title, original_url, description_url, author,
+                    attribution, license_name, license_url, width, height,
+                    mime_type
+             FROM media
+             WHERE wiki_id = ?1 AND source_media_id = ?2 AND source_sha1 = ?3
+               AND content_object_id = ?4",
+            params![wiki_id, media_id, source_sha1, object_id.to_string()],
+            |row| {
+                Ok(MediaMetadataRow {
+                    file_title: row.get(0)?,
+                    original_url: row.get(1)?,
+                    description_url: row.get(2)?,
+                    author: row.get(3)?,
+                    attribution: row.get(4)?,
+                    license_name: row.get(5)?,
+                    license_url: row.get(6)?,
+                    width: row.get(7)?,
+                    height: row.get(8)?,
+                    mime_type: row.get(9)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::from)
+}
+
+type MediaPlacementRow = (i64, String, String, String, Option<String>, Option<String>);
+
+fn query_media_placement(
+    connection: &Connection,
+    wiki_id: i64,
+    revision_id: i64,
+    placement_index: i64,
+) -> Result<Option<MediaPlacementRow>, StoreError> {
+    connection
+        .query_row(
+            "SELECT source_media_id, source_sha1, content_object_id,
+                    placement_kind, caption, alt_text
+             FROM page_media
+             WHERE wiki_id = ?1 AND revision_id = ?2 AND placement_index = ?3",
+            params![wiki_id, revision_id, placement_index],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::from)
+}
+
+fn revision_media_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RevisionMediaRow> {
+    Ok(RevisionMediaRow {
+        placement_index: row.get(0)?,
+        placement_kind: row.get(1)?,
+        caption: row.get(2)?,
+        alt_text: row.get(3)?,
+        source_media_id: row.get(4)?,
+        source_sha1: row.get(5)?,
+        file_title: row.get(6)?,
+        original_url: row.get(7)?,
+        description_url: row.get(8)?,
+        author: row.get(9)?,
+        attribution: row.get(10)?,
+        license_name: row.get(11)?,
+        license_url: row.get(12)?,
+        width: row.get(13)?,
+        height: row.get(14)?,
+        mime_type: row.get(15)?,
+        captured_at: row.get(16)?,
+        content_object_id: row.get(17)?,
+    })
+}
+
+fn stored_revision_media(
+    wiki_id: WikiId,
+    revision_id: RevisionId,
+    row: RevisionMediaRow,
+) -> Result<StoredRevisionMedia, StoreError> {
+    Ok(StoredRevisionMedia {
+        wiki_id,
+        revision_id,
+        placement_index: u32::try_from(row.placement_index)
+            .map_err(|_| StoreError::CorruptMetadata("invalid media placement index"))?,
+        placement_kind: MediaPlacementKind::from_database(&row.placement_kind)?,
+        caption: row.caption,
+        alt_text: row.alt_text,
+        media_id: sql_id(row.source_media_id, "invalid stored media ID")?,
+        file_title: PageTitle::new(row.file_title)
+            .map_err(|_| StoreError::CorruptMetadata("invalid stored media title"))?,
+        source_sha1: row.source_sha1,
+        original_url: row.original_url,
+        description_url: row.description_url,
+        author: row.author,
+        attribution: row.attribution,
+        license_name: row.license_name,
+        license_url: row.license_url,
+        width: u32::try_from(row.width)
+            .map_err(|_| StoreError::CorruptMetadata("invalid stored media width"))?,
+        height: u32::try_from(row.height)
+            .map_err(|_| StoreError::CorruptMetadata("invalid stored media height"))?,
+        mime_type: ThumbnailMimeType::from_database(&row.mime_type)?,
+        captured_at: sql_u64(row.captured_at, "invalid media capture time")?,
+        content_object_id: row
+            .content_object_id
+            .parse()
+            .map_err(|_| StoreError::CorruptMetadata("invalid media content object ID"))?,
+    })
+}
+
 fn validate_mediawiki_timestamp(value: &str) -> Result<(), StoreError> {
     const ERROR: StoreError = StoreError::InvalidConfig(
         "MediaWiki timestamp must be a valid UTC value in YYYY-MM-DDTHH:MM:SSZ form",
@@ -5980,39 +7146,48 @@ fn object_hasher(kind: ObjectKind, length: u64) -> blake3::Hasher {
 }
 
 fn prepare_pack_entries(
-    sources: &[(ObjectId, ObjectKind, Vec<u8>)],
+    sources: &[PackSource],
     compression_level: i32,
 ) -> Result<Vec<PreparedPackEntry>, StoreError> {
     let mut entries: Vec<PreparedPackEntry> = Vec::with_capacity(sources.len());
-    for (index, (id, kind, bytes)) in sources.iter().enumerate() {
-        let full_payload = zstd::stream::encode_all(bytes.as_slice(), compression_level)?;
+    for (index, source) in sources.iter().enumerate() {
+        let full_payload = zstd::stream::encode_all(source.bytes.as_slice(), compression_level)?;
         let mut selected = (PackEncoding::Full, None, 0_u16, full_payload);
         let candidate_start = index.saturating_sub(DELTA_CANDIDATE_WINDOW);
-        for candidate_index in candidate_start..index {
-            let (base_id, base_kind, base_bytes) = &sources[candidate_index];
-            let base_entry = &entries[candidate_index];
-            if base_kind != kind || base_entry.delta_depth >= MAX_DELTA_DEPTH {
-                continue;
-            }
-            let delta = create_delta(base_bytes, bytes);
-            let payload = zstd::stream::encode_all(delta.as_slice(), compression_level)?;
-            if payload
-                .len()
-                .checked_add(MIN_DELTA_SAVINGS)
-                .is_some_and(|length| length < selected.3.len())
-            {
-                selected = (
-                    PackEncoding::Delta,
-                    Some(*base_id),
-                    base_entry.delta_depth + 1,
-                    payload,
-                );
+        let starts_affinity_group = index == 0
+            || sources[index - 1].kind != source.kind
+            || sources[index - 1].affinity != source.affinity;
+        if !starts_affinity_group && index % FULL_ENTRY_INTERVAL != 0 {
+            for candidate_index in candidate_start..index {
+                let base = &sources[candidate_index];
+                let base_entry = &entries[candidate_index];
+                if base.kind != source.kind
+                    || base.affinity != source.affinity
+                    || base_entry.delta_depth >= MAX_DELTA_DEPTH
+                    || !delta_sizes_are_similar(base.bytes.len() as u64, source.bytes.len() as u64)
+                {
+                    continue;
+                }
+                let delta = create_delta(&base.bytes, &source.bytes);
+                let payload = zstd::stream::encode_all(delta.as_slice(), compression_level)?;
+                if payload
+                    .len()
+                    .checked_add(MIN_DELTA_SAVINGS)
+                    .is_some_and(|length| length < selected.3.len())
+                {
+                    selected = (
+                        PackEncoding::Delta,
+                        Some(base.id),
+                        base_entry.delta_depth + 1,
+                        payload,
+                    );
+                }
             }
         }
         entries.push(PreparedPackEntry {
-            id: *id,
-            kind: *kind,
-            uncompressed_length: bytes.len() as u64,
+            id: source.id,
+            kind: source.kind,
+            uncompressed_length: source.bytes.len() as u64,
             encoding: selected.0,
             base_id: selected.1,
             delta_depth: selected.2,
@@ -6022,6 +7197,39 @@ fn prepare_pack_entries(
         });
     }
     Ok(entries)
+}
+
+fn object_size_class(length: u64) -> u32 {
+    u64::BITS - length.max(1).leading_zeros() - 1
+}
+
+fn delta_sizes_are_similar(left: u64, right: u64) -> bool {
+    let (smaller, larger) = if left <= right {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    larger <= smaller.saturating_mul(MAX_DELTA_SIZE_RATIO)
+}
+
+fn pack_affinity(
+    wiki_id: Option<i64>,
+    page_id: Option<i64>,
+    revision_id: Option<i64>,
+) -> Result<(Option<PackAffinity>, Option<u64>), StoreError> {
+    match (wiki_id, page_id, revision_id) {
+        (Some(wiki_id), Some(page_id), Some(revision_id)) => Ok((
+            Some(PackAffinity {
+                wiki_id: sql_u64(wiki_id, "invalid pack-affinity wiki ID")?,
+                page_id: sql_u64(page_id, "invalid pack-affinity page ID")?,
+            }),
+            Some(sql_u64(revision_id, "invalid pack-affinity revision ID")?),
+        )),
+        (None, None, None) => Ok((None, None)),
+        _ => Err(StoreError::CorruptMetadata(
+            "pack affinity metadata is incomplete",
+        )),
+    }
 }
 
 fn create_delta(base: &[u8], target: &[u8]) -> Vec<u8> {
@@ -6612,6 +7820,7 @@ fn commit_preview_transaction(
     raw_collection_id: i64,
     raw_wiki_id: i64,
     preview: CollectionPreviewCommit<'_>,
+    image_policy: ImagePolicy,
     now: i64,
 ) -> Result<MembershipCommit, StoreError> {
     let (rule_kind, category_title, category_depth) = collection_rule_values(preview.rule);
@@ -6626,12 +7835,17 @@ fn commit_preview_transaction(
         .maximum_bytes()
         .map(|value| to_sql_integer(value.get()))
         .transpose()?;
+    let (image_kind, thumbnail_edge, thumbnail_count, thumbnail_bytes) =
+        image_policy_values(image_policy);
     transaction.execute(
         "INSERT INTO collection_configuration (
             collection_id, rule_kind, category_title, category_recursion_depth,
             history_kind, history_value, maximum_pages, maximum_bytes,
-            removal_policy, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            removal_policy, image_policy, thumbnail_max_edge_pixels,
+            thumbnail_max_images_per_revision, thumbnail_max_bytes_per_image,
+            updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                   ?11, ?12, ?13, ?14)
          ON CONFLICT(collection_id) DO UPDATE SET
             rule_kind = excluded.rule_kind,
             category_title = excluded.category_title,
@@ -6641,6 +7855,10 @@ fn commit_preview_transaction(
             maximum_pages = excluded.maximum_pages,
             maximum_bytes = excluded.maximum_bytes,
             removal_policy = excluded.removal_policy,
+            image_policy = excluded.image_policy,
+            thumbnail_max_edge_pixels = excluded.thumbnail_max_edge_pixels,
+            thumbnail_max_images_per_revision = excluded.thumbnail_max_images_per_revision,
+            thumbnail_max_bytes_per_image = excluded.thumbnail_max_bytes_per_image,
             updated_at = excluded.updated_at",
         params![
             raw_collection_id,
@@ -6652,6 +7870,10 @@ fn commit_preview_transaction(
             maximum_pages,
             maximum_bytes,
             removal_policy_value(preview.removal_policy),
+            image_kind,
+            thumbnail_edge,
+            thumbnail_count,
+            thumbnail_bytes,
             now,
         ],
     )?;
@@ -6880,6 +8102,75 @@ fn stored_collection_budget(
     Ok(budget)
 }
 
+fn image_policy_values(
+    policy: ImagePolicy,
+) -> (&'static str, Option<i64>, Option<i64>, Option<i64>) {
+    match policy {
+        ImagePolicy::None => ("none", None, None, None),
+        ImagePolicy::Thumbnails(policy) => (
+            "thumbnails",
+            Some(i64::from(policy.maximum_edge_pixels().get())),
+            Some(i64::from(policy.maximum_images_per_revision().get())),
+            Some(policy.maximum_bytes_per_image().get() as i64),
+        ),
+    }
+}
+
+fn stored_image_policy(
+    kind: &str,
+    maximum_edge_pixels: Option<i64>,
+    maximum_images_per_revision: Option<i64>,
+    maximum_bytes_per_image: Option<i64>,
+) -> Result<ImagePolicy, StoreError> {
+    match (
+        kind,
+        maximum_edge_pixels,
+        maximum_images_per_revision,
+        maximum_bytes_per_image,
+    ) {
+        ("none", None, None, None) => Ok(ImagePolicy::None),
+        ("thumbnails", Some(edge), Some(images), Some(bytes)) => {
+            let policy = ThumbnailPolicy::new(
+                u32::try_from(edge)
+                    .map_err(|_| StoreError::CorruptMetadata("invalid thumbnail edge bound"))?,
+                u32::try_from(images)
+                    .map_err(|_| StoreError::CorruptMetadata("invalid thumbnail count bound"))?,
+                sql_u64(bytes, "invalid thumbnail byte bound")?,
+            )
+            .map_err(|_| StoreError::CorruptMetadata("invalid thumbnail policy bounds"))?;
+            Ok(ImagePolicy::Thumbnails(policy))
+        }
+        _ => Err(StoreError::CorruptMetadata(
+            "invalid stored collection image policy",
+        )),
+    }
+}
+
+fn stored_collection_image_policy(
+    connection: &Connection,
+    collection_id: CollectionId,
+    raw_collection_id: i64,
+) -> Result<ImagePolicy, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT image_policy, thumbnail_max_edge_pixels,
+                    thumbnail_max_images_per_revision, thumbnail_max_bytes_per_image
+             FROM collection_configuration WHERE collection_id = ?1",
+            [raw_collection_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(StoreError::CollectionNotConfigured(collection_id))?;
+    stored_image_policy(&row.0, row.1, row.2, row.3)
+}
+
 const fn removal_policy_value(policy: CollectionRemovalPolicy) -> &'static str {
     match policy {
         CollectionRemovalPolicy::StopTrackingRetainHistory => "stop-tracking-retain-history",
@@ -7045,7 +8336,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
          ) STRICT;",
     )?;
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > 10 {
+    if version > 12 {
         return Err(StoreError::UnsupportedSchemaVersion(version));
     }
     if version == 0 {
@@ -7165,6 +8456,30 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
             [unix_time()?],
         )?;
         transaction.pragma_update(None, "user_version", 10)?;
+        transaction.commit()?;
+    }
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 10 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(MIGRATION_11)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (11, 'pack-affinity', ?1)",
+            [unix_time()?],
+        )?;
+        transaction.pragma_update(None, "user_version", 11)?;
+        transaction.commit()?;
+    }
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 11 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(MIGRATION_12)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (12, 'thumbnail-media', ?1)",
+            [unix_time()?],
+        )?;
+        transaction.pragma_update(None, "user_version", 12)?;
         transaction.commit()?;
     }
     Ok(())
@@ -7533,7 +8848,7 @@ fn manifest_configuration_hash_for(
     collection_id: Option<CollectionId>,
 ) -> Result<String, StoreError> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"wikisync-manifest-configuration-v3\0");
+    hasher.update(b"wikisync-manifest-configuration-v4\0");
     hash_manifest_field(&mut hasher, &wiki_id.get().to_string());
     if let Some(collection_id) = collection_id {
         hash_manifest_field(&mut hasher, &collection_id.get().to_string());
@@ -7541,7 +8856,8 @@ fn manifest_configuration_hash_for(
             "SELECT collections.generation,
                     config.rule_kind, config.category_title, config.category_recursion_depth,
                     history_kind, history_value, maximum_pages, maximum_bytes,
-                    removal_policy
+                    removal_policy, image_policy, thumbnail_max_edge_pixels,
+                    thumbnail_max_images_per_revision, thumbnail_max_bytes_per_image
              FROM collection_configuration AS config
              JOIN collections USING (collection_id)
              WHERE collection_id = ?1",
@@ -7557,6 +8873,10 @@ fn manifest_configuration_hash_for(
                     row.get(6)?,
                     row.get(7)?,
                     row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
                 ))
             },
         )?;
@@ -7570,6 +8890,10 @@ fn manifest_configuration_hash_for(
             configuration.6.map(|value| value.to_string()),
             configuration.7.map(|value| value.to_string()),
             Some(configuration.8),
+            Some(configuration.9),
+            configuration.10.map(|value| value.to_string()),
+            configuration.11.map(|value| value.to_string()),
+            configuration.12.map(|value| value.to_string()),
         ] {
             hash_manifest_optional_field(&mut hasher, field.as_deref());
         }
@@ -7731,8 +9055,26 @@ pub enum StoreError {
     },
     /// A page head referred to a revision that is not durable locally.
     RevisionNotFound(RevisionId),
+    /// A media placement named a revision owned by a different page.
+    RevisionPageMismatch {
+        /// Captured revision identity.
+        revision_id: RevisionId,
+        /// Incorrect requested page identity.
+        page_id: PageId,
+    },
     /// An existing remote revision was observed with different immutable identity data.
     ConflictingRevision(RevisionId),
+    /// Thumbnail metadata or passive-format validation failed.
+    InvalidMediaMetadata(&'static str),
+    /// An immutable source file version was observed with conflicting metadata.
+    ConflictingMedia(MediaId),
+    /// One revision placement index was reused for different media or display metadata.
+    ConflictingMediaPlacement {
+        /// Revision containing the placement.
+        revision_id: RevisionId,
+        /// Zero-based conflicting placement index.
+        placement_index: u32,
+    },
     /// A checkpoint boundary preceded the required overlap-window start.
     InvalidCheckpointCandidate {
         /// Existing durable source boundary.
@@ -7889,9 +9231,30 @@ impl fmt::Display for StoreError {
             Self::RevisionNotFound(revision_id) => {
                 write!(formatter, "revision {revision_id} is not captured")
             }
+            Self::RevisionPageMismatch {
+                revision_id,
+                page_id,
+            } => write!(
+                formatter,
+                "revision {revision_id} does not belong to page {page_id}"
+            ),
             Self::ConflictingRevision(revision_id) => write!(
                 formatter,
                 "revision {revision_id} conflicts with its previously captured identity"
+            ),
+            Self::InvalidMediaMetadata(message) => {
+                write!(formatter, "invalid thumbnail metadata: {message}")
+            }
+            Self::ConflictingMedia(media_id) => write!(
+                formatter,
+                "media {media_id} conflicts with its previously captured source version"
+            ),
+            Self::ConflictingMediaPlacement {
+                revision_id,
+                placement_index,
+            } => write!(
+                formatter,
+                "revision {revision_id} media placement {placement_index} conflicts with its previously captured value"
             ),
             Self::InvalidCheckpointCandidate {
                 committed_through,
@@ -7992,6 +9355,21 @@ impl From<rusqlite::Error> for StoreError {
 mod tests {
     use super::*;
 
+    const VALID_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5,
+        0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64,
+        0xf8, 0x0f, 0x00, 0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+    const SECOND_VALID_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0xf4,
+        0x22, 0x7f, 0x8a, 0x00, 0x00, 0x00, 0x0e, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8,
+        0xcf, 0xc0, 0xf0, 0x1f, 0x04, 0x01, 0x10, 0xf8, 0x03, 0xfd, 0x4e, 0x95, 0xc1, 0x6f, 0x00,
+        0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
     fn test_library() -> (tempfile::TempDir, Library) {
         let directory = tempfile::tempdir().expect("temporary library");
         let library = Library::open(directory.path()).expect("open library");
@@ -8029,6 +9407,58 @@ mod tests {
                 },
             )
             .expect("capture fixture page");
+    }
+
+    fn integrity_media_fixture() -> (tempfile::TempDir, Library, ObjectId) {
+        let (directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Integrity media fixture")
+            .expect("create collection");
+        capture_test_page(
+            &mut library,
+            wiki_id,
+            collection_id,
+            41,
+            410,
+            "2026-08-22T10:00:00Z",
+            "Integrity media article",
+        );
+        let file_title = PageTitle::new("File:Integrity.png").expect("file title");
+        let capture = ThumbnailCapture {
+            media_id: MediaId::new(9001).expect("media ID"),
+            file_title: &file_title,
+            source_sha1: "abcdef0123456789abcdef0123456789",
+            original_url: "https://upload.wikimedia.org/integrity.png",
+            description_url: "https://commons.wikimedia.org/wiki/File:Integrity.png",
+            author: "Fixture photographer",
+            attribution: "Fixture photographer / Wikimedia Commons",
+            license_name: "CC BY-SA 4.0",
+            license_url: Some("https://creativecommons.org/licenses/by-sa/4.0/"),
+            width: 1,
+            height: 1,
+            mime_type: ThumbnailMimeType::Png,
+            captured_at: 1_776_000_000,
+            source: VALID_PNG,
+        };
+        let object = library
+            .capture_revision_thumbnail(
+                wiki_id,
+                PageId::new(41).expect("page ID"),
+                RevisionId::new(410).expect("revision ID"),
+                ThumbnailPolicy::new(640, 8, 1024).expect("thumbnail policy"),
+                &capture,
+                RevisionMediaPlacement {
+                    index: 0,
+                    kind: MediaPlacementKind::Lead,
+                    caption: Some("Fixture caption"),
+                    alt_text: Some("Fixture alternative"),
+                },
+            )
+            .expect("capture thumbnail");
+        (directory, library, object.id)
     }
 
     fn filesystem_snapshot(root: &Path) -> Vec<(PathBuf, bool, u32, [u8; 32])> {
@@ -8156,7 +9586,7 @@ mod tests {
         let before = filesystem_snapshot(directory.path());
 
         let mut library = Library::open_read_only(directory.path()).expect("read-only library");
-        assert_eq!(library.schema_version().expect("schema version"), 10);
+        assert_eq!(library.schema_version().expect("schema version"), 12);
         assert_eq!(library.wikis().expect("wikis")[0].wiki_id, wiki_id);
         assert_eq!(library.logical_object_count().expect("object count"), 1);
         assert_eq!(
@@ -8258,13 +9688,13 @@ mod tests {
     #[test]
     fn migration_is_applied_once_and_keeps_locations_separate() {
         let (directory, library) = test_library();
-        assert_eq!(library.schema_version().expect("schema version"), 10);
-        assert_eq!(migration_count(&library), 10);
+        assert_eq!(library.schema_version().expect("schema version"), 12);
+        assert_eq!(migration_count(&library), 12);
 
         drop(library);
         let reopened = Library::open(directory.path()).expect("reopen library");
-        assert_eq!(reopened.schema_version().expect("schema version"), 10);
-        assert_eq!(migration_count(&reopened), 10);
+        assert_eq!(reopened.schema_version().expect("schema version"), 12);
+        assert_eq!(migration_count(&reopened), 12);
 
         let logical_columns: Vec<String> = reopened
             .connection()
@@ -8437,20 +9867,29 @@ mod tests {
             .expect("open database for version-eight fixture");
         connection
             .execute_batch(
-                "DROP TABLE network_transfer_policy;
+                "DROP TABLE page_media;
+                 DROP TABLE media;
+                 DROP TRIGGER collection_configuration_image_policy_insert;
+                 DROP TRIGGER collection_configuration_image_policy_update;
+                 ALTER TABLE collection_configuration DROP COLUMN thumbnail_max_bytes_per_image;
+                 ALTER TABLE collection_configuration DROP COLUMN thumbnail_max_images_per_revision;
+                 ALTER TABLE collection_configuration DROP COLUMN thumbnail_max_edge_pixels;
+                 ALTER TABLE collection_configuration DROP COLUMN image_policy;
+                 DROP INDEX revisions_by_content_affinity;
+                 DROP TABLE network_transfer_policy;
                  DROP INDEX collections_by_status_name;
                  ALTER TABLE collections DROP COLUMN status;
                  ALTER TABLE collections DROP COLUMN generation;
                  ALTER TABLE collections DROP COLUMN tombstoned_at;
-                 DELETE FROM schema_migrations WHERE version IN (9, 10);
+                 DELETE FROM schema_migrations WHERE version IN (9, 10, 11, 12);
                  PRAGMA user_version = 8;",
             )
             .expect("downgrade fixture metadata");
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade version eight library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 10);
-        assert_eq!(migration_count(&upgraded), 10);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 12);
+        assert_eq!(migration_count(&upgraded), 12);
         assert_eq!(
             upgraded
                 .network_transfer_policy()
@@ -8481,19 +9920,28 @@ mod tests {
             .expect("open database for version-nine fixture");
         connection
             .execute_batch(
-                "DROP INDEX collections_by_status_name;
+                "DROP TABLE page_media;
+                 DROP TABLE media;
+                 DROP TRIGGER collection_configuration_image_policy_insert;
+                 DROP TRIGGER collection_configuration_image_policy_update;
+                 ALTER TABLE collection_configuration DROP COLUMN thumbnail_max_bytes_per_image;
+                 ALTER TABLE collection_configuration DROP COLUMN thumbnail_max_images_per_revision;
+                 ALTER TABLE collection_configuration DROP COLUMN thumbnail_max_edge_pixels;
+                 ALTER TABLE collection_configuration DROP COLUMN image_policy;
+                 DROP INDEX revisions_by_content_affinity;
+                 DROP INDEX collections_by_status_name;
                  ALTER TABLE collections DROP COLUMN status;
                  ALTER TABLE collections DROP COLUMN generation;
                  ALTER TABLE collections DROP COLUMN tombstoned_at;
-                 DELETE FROM schema_migrations WHERE version = 10;
+                 DELETE FROM schema_migrations WHERE version IN (10, 11, 12);
                  PRAGMA user_version = 9;",
             )
             .expect("downgrade fixture metadata");
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade version nine fixture");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 10);
-        assert_eq!(migration_count(&upgraded), 10);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 12);
+        assert_eq!(migration_count(&upgraded), 12);
         let collection = upgraded
             .collection(collection_id)
             .expect("collection lookup")
@@ -8509,6 +9957,69 @@ mod tests {
                 .collection_id,
             Some(collection_id)
         );
+    }
+
+    #[test]
+    fn version_eleven_library_adds_default_off_media_schema_without_data_loss() {
+        let directory = tempfile::tempdir().expect("temporary library");
+        let mut library = Library::open(directory.path()).expect("create current library");
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let rule = CollectionRule::ExplicitTitles(
+            TitleSelection::new([PageTitle::new("Migration fixture").expect("fixture title")])
+                .expect("fixture selection"),
+        );
+        let collection_id = library
+            .create_collection(
+                wiki_id,
+                "Version eleven fixture",
+                &rule,
+                HistoryPolicy::CurrentAndFuture,
+                CollectionBudget::unlimited(),
+                CollectionRemovalPolicy::StopTrackingRetainHistory,
+            )
+            .expect("create fixture collection");
+        let object = library
+            .put_bytes(ObjectKind::Wikitext, b"pre-media canonical object")
+            .expect("store pre-media object");
+        drop(library);
+
+        let connection = Connection::open(directory.path().join(DATABASE_NAME))
+            .expect("open database for version-eleven fixture");
+        connection
+            .execute_batch(
+                "DROP TABLE page_media;
+                 DROP TABLE media;
+                 DROP TRIGGER collection_configuration_image_policy_insert;
+                 DROP TRIGGER collection_configuration_image_policy_update;
+                 ALTER TABLE collection_configuration DROP COLUMN thumbnail_max_bytes_per_image;
+                 ALTER TABLE collection_configuration DROP COLUMN thumbnail_max_images_per_revision;
+                 ALTER TABLE collection_configuration DROP COLUMN thumbnail_max_edge_pixels;
+                 ALTER TABLE collection_configuration DROP COLUMN image_policy;
+                 DELETE FROM schema_migrations WHERE version = 12;
+                 PRAGMA user_version = 11;",
+            )
+            .expect("downgrade fixture metadata");
+        drop(connection);
+
+        let upgraded = Library::open(directory.path()).expect("upgrade version eleven library");
+        assert_eq!(upgraded.schema_version().expect("schema version"), 12);
+        assert_eq!(migration_count(&upgraded), 12);
+        assert_eq!(
+            upgraded
+                .collection_configuration(collection_id)
+                .expect("read upgraded collection")
+                .expect("configured collection")
+                .image_policy,
+            ImagePolicy::None
+        );
+        assert_eq!(
+            upgraded.read_object(object.id).expect("retained object"),
+            b"pre-media canonical object"
+        );
+        assert_eq!(table_count(&upgraded, "media"), 0);
+        assert_eq!(table_count(&upgraded, "page_media"), 0);
     }
 
     #[test]
@@ -8554,8 +10065,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 10);
-        assert_eq!(migration_count(&upgraded), 10);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 12);
+        assert_eq!(migration_count(&upgraded), 12);
         assert_eq!(table_count(&upgraded, "revisions"), 0);
     }
 
@@ -8591,8 +10102,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 10);
-        assert_eq!(migration_count(&upgraded), 10);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 12);
+        assert_eq!(migration_count(&upgraded), 12);
         assert_eq!(table_count(&upgraded, "search_documents"), 0);
         let fts_definition: String = upgraded
             .connection()
@@ -9051,6 +10562,211 @@ mod tests {
                 .resolved_collection_members(collection_id)
                 .expect("members"),
             before_members
+        );
+    }
+
+    #[test]
+    fn image_policy_preview_create_and_edit_are_atomic_and_generation_safe() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let first_title = PageTitle::new("Image policy first").expect("first title");
+        let second_title = PageTitle::new("Image policy second").expect("second title");
+        let rule = CollectionRule::ExplicitTitles(
+            TitleSelection::new([first_title.clone(), second_title.clone()]).expect("selection"),
+        );
+        let first_member = ResolvedCollectionMember {
+            page_id: PageId::new(71).expect("first page ID"),
+            namespace: 0,
+            title: first_title.clone(),
+            inclusion_reason: InclusionReason::ExplicitTitle(first_title),
+        };
+        let second_member = ResolvedCollectionMember {
+            page_id: PageId::new(72).expect("second page ID"),
+            namespace: 0,
+            title: second_title.clone(),
+            inclusion_reason: InclusionReason::ExplicitTitle(second_title),
+        };
+        let first_members = [first_member.clone()];
+        let second_members = [second_member.clone()];
+        let initial = CollectionPreviewCommit {
+            rule: &rule,
+            history_policy: HistoryPolicy::CurrentAndFuture,
+            budget: CollectionBudget::unlimited(),
+            removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            members: &first_members,
+            missing_titles: &[],
+            predicted_canonical_bytes: Some(100),
+        };
+        let thumbnails = ThumbnailPolicy::new(800, 12, 2 * 1024 * 1024).expect("thumbnail policy");
+
+        library
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER reject_atomic_thumbnail_create
+                 BEFORE INSERT ON collection_configuration
+                 WHEN NEW.image_policy = 'thumbnails'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'fixture image policy failure');
+                 END;",
+            )
+            .expect("install create failure trigger");
+        assert!(matches!(
+            library.create_collection_from_preview_with_image_policy(
+                wiki_id,
+                "Rejected image policy",
+                initial,
+                ImagePolicy::Thumbnails(thumbnails),
+            ),
+            Err(StoreError::Sqlite(_))
+        ));
+        library
+            .connection()
+            .execute_batch("DROP TRIGGER reject_atomic_thumbnail_create;")
+            .expect("remove create failure trigger");
+        assert!(
+            library
+                .collections()
+                .expect("no partial collection")
+                .is_empty()
+        );
+
+        let (collection_id, membership) = library
+            .create_collection_from_preview_with_image_policy(
+                wiki_id,
+                "Atomic image policy",
+                initial,
+                ImagePolicy::Thumbnails(thumbnails),
+            )
+            .expect("create with image policy");
+        assert_eq!(membership.active_members, 1);
+        let created = library
+            .collection_configuration(collection_id)
+            .expect("created configuration")
+            .expect("configured collection");
+        assert_eq!(created.generation, 1);
+        assert_eq!(created.image_policy, ImagePolicy::Thumbnails(thumbnails));
+
+        let legacy_edit = CollectionPreviewCommit {
+            members: &second_members,
+            predicted_canonical_bytes: Some(200),
+            ..initial
+        };
+        library
+            .update_collection_from_preview(
+                collection_id,
+                created.generation,
+                Some("Legacy edit preserves images"),
+                legacy_edit,
+            )
+            .expect("legacy image-preserving edit");
+        let after_legacy = library
+            .collection_configuration(collection_id)
+            .expect("legacy configuration")
+            .expect("configured collection");
+        assert_eq!(after_legacy.generation, created.generation + 1);
+        assert_eq!(
+            after_legacy.image_policy,
+            ImagePolicy::Thumbnails(thumbnails)
+        );
+
+        library
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER reject_atomic_image_policy_edit
+                 BEFORE UPDATE ON collection_configuration
+                 WHEN NEW.image_policy = 'none'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'fixture image policy failure');
+                 END;",
+            )
+            .expect("install edit failure trigger");
+        let failed_edit = CollectionPreviewCommit {
+            members: &first_members,
+            predicted_canonical_bytes: Some(300),
+            ..initial
+        };
+        assert!(matches!(
+            library.update_collection_from_preview_with_image_policy(
+                collection_id,
+                after_legacy.generation,
+                Some("Must roll back"),
+                failed_edit,
+                ImagePolicy::None,
+            ),
+            Err(StoreError::Sqlite(_))
+        ));
+        library
+            .connection()
+            .execute_batch("DROP TRIGGER reject_atomic_image_policy_edit;")
+            .expect("remove edit failure trigger");
+        assert_eq!(
+            library
+                .collection_configuration(collection_id)
+                .expect("configuration after rollback")
+                .expect("configured collection"),
+            after_legacy
+        );
+        assert_eq!(
+            library
+                .resolved_collection_members(collection_id)
+                .expect("members after rollback"),
+            second_members
+        );
+        assert_eq!(
+            library
+                .collection(collection_id)
+                .expect("collection after rollback")
+                .expect("present")
+                .name,
+            "Legacy edit preserves images"
+        );
+
+        library
+            .update_collection_from_preview_with_image_policy(
+                collection_id,
+                after_legacy.generation,
+                Some("Images disabled atomically"),
+                failed_edit,
+                ImagePolicy::None,
+            )
+            .expect("atomic image-policy edit");
+        let durable = library
+            .collection_configuration(collection_id)
+            .expect("durable configuration")
+            .expect("configured collection");
+        assert_eq!(durable.generation, after_legacy.generation + 1);
+        assert_eq!(durable.image_policy, ImagePolicy::None);
+        assert_eq!(
+            library
+                .resolved_collection_members(collection_id)
+                .expect("durable members"),
+            first_members
+        );
+
+        assert!(matches!(
+            library.update_collection_from_preview_with_image_policy(
+                collection_id,
+                after_legacy.generation,
+                Some("Stale image policy"),
+                legacy_edit,
+                ImagePolicy::Thumbnails(thumbnails),
+            ),
+            Err(StoreError::StaleCollectionGeneration {
+                collection_id: stale_id,
+                expected,
+                actual,
+            }) if stale_id == collection_id
+                && expected == after_legacy.generation
+                && actual == durable.generation
+        ));
+        assert_eq!(
+            library
+                .collection_configuration(collection_id)
+                .expect("configuration after stale edit")
+                .expect("configured collection"),
+            durable
         );
     }
 
@@ -9791,6 +11507,200 @@ mod tests {
         stored
     }
 
+    fn pack_revision_bytes(page_id: u64, version: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(8 * 1024);
+        let mut state = (page_id as u32).wrapping_mul(0x9e37_79b9);
+        for _ in 0..8 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            bytes.push(state as u8);
+        }
+        for edit in 1..=version {
+            let offset = 256 + edit * 337;
+            for (index, byte) in bytes[offset..offset + 32].iter_mut().enumerate() {
+                *byte = (page_id as u8)
+                    .wrapping_add((edit as u8).wrapping_mul(17))
+                    .wrapping_add(index as u8);
+            }
+        }
+        bytes
+    }
+
+    fn capture_interleaved_pack_fixture(
+        library: &mut Library,
+        page_order: &[u64],
+        versions: usize,
+    ) {
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register pack fixture wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Pack fixture")
+            .expect("create pack fixture collection");
+        for &page in page_order {
+            let title =
+                PageTitle::new(format!("Pack fixture page {page}")).expect("pack fixture title");
+            let source = pack_revision_bytes(page, 0);
+            library
+                .capture_current_revision(
+                    wiki_id,
+                    collection_id,
+                    &CurrentRevisionCapture {
+                        page_id: PageId::new(page).expect("pack fixture page ID"),
+                        namespace: 0,
+                        title: &title,
+                        revision_id: RevisionId::new(page * 100).expect("pack fixture revision ID"),
+                        parent_id: None,
+                        timestamp: "2026-08-01T00:00:00Z",
+                        author: None,
+                        author_id: None,
+                        comment: None,
+                        minor: false,
+                        upstream_sha1: None,
+                        content_model: "wikitext",
+                        source: &source,
+                    },
+                )
+                .expect("capture pack fixture head");
+        }
+        for version in 1..versions {
+            let timestamp = format!("2026-08-{:02}T00:00:00Z", version + 1);
+            for &page in page_order {
+                let source = pack_revision_bytes(page, version);
+                library
+                    .capture_revision(
+                        wiki_id,
+                        PageId::new(page).expect("pack fixture page ID"),
+                        &RevisionCapture {
+                            revision_id: RevisionId::new(page * 100 + version as u64)
+                                .expect("pack fixture revision ID"),
+                            parent_id: Some(
+                                RevisionId::new(page * 100 + version as u64 - 1)
+                                    .expect("pack fixture parent revision ID"),
+                            ),
+                            timestamp: &timestamp,
+                            author: None,
+                            author_id: None,
+                            comment: None,
+                            minor: false,
+                            upstream_sha1: None,
+                            content_model: "wikitext",
+                            source: &source,
+                        },
+                    )
+                    .expect("capture pack fixture history");
+            }
+        }
+    }
+
+    #[test]
+    fn pack_tuning_groups_page_history_and_reduces_fixture_storage() {
+        let (_directory, mut library) = test_library();
+        let pages = (1..=20).collect::<Vec<_>>();
+        capture_interleaved_pack_fixture(&mut library, &pages, 5);
+        let loose_bytes: u64 = library
+            .connection()
+            .query_row(
+                "SELECT SUM(compressed_length) FROM object_locations
+                 WHERE storage_kind = 'loose' AND verification_state = 'verified'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("loose fixture bytes");
+
+        let summary = library
+            .pack_loose_objects()
+            .expect("pack tuned fixture")
+            .expect("nonempty tuned pack");
+        assert_eq!(summary.object_count, 100);
+        assert!(summary.full_entries >= pages.len() as u64);
+        assert!(summary.delta_entries >= 75);
+        assert!(summary.pack_bytes + summary.index_bytes < loose_bytes / 2);
+
+        let physical_pages = library
+            .connection()
+            .prepare(
+                "SELECT revisions.page_id
+                 FROM object_locations AS locations
+                 JOIN revisions ON revisions.content_object_id = locations.object_id
+                 WHERE locations.pack_id = ?1
+                 ORDER BY locations.pack_offset",
+            )
+            .expect("prepare physical page order")
+            .query_map([&summary.pack_id], |row| row.get::<_, u64>(0))
+            .expect("query physical page order")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect physical page order");
+        let mut completed_pages = HashSet::new();
+        for pair in physical_pages.windows(2) {
+            if pair[0] != pair[1] {
+                assert!(completed_pages.insert(pair[0]));
+                assert!(!completed_pages.contains(&pair[1]));
+            }
+        }
+    }
+
+    #[test]
+    fn pack_layout_is_deterministic_across_ingestion_orders() {
+        let first_directory = tempfile::tempdir().expect("first pack library");
+        let second_directory = tempfile::tempdir().expect("second pack library");
+        let mut first = Library::open(first_directory.path()).expect("open first pack library");
+        let mut second = Library::open(second_directory.path()).expect("open second pack library");
+        capture_interleaved_pack_fixture(&mut first, &[1, 2, 3, 4], 5);
+        capture_interleaved_pack_fixture(&mut second, &[4, 2, 1, 3], 5);
+
+        let first_summary = first
+            .pack_loose_objects()
+            .expect("pack first order")
+            .expect("first pack");
+        let second_summary = second
+            .pack_loose_objects()
+            .expect("pack second order")
+            .expect("second pack");
+        assert_eq!(first_summary.pack_id, second_summary.pack_id);
+        assert_eq!(first_summary.pack_bytes, second_summary.pack_bytes);
+        assert_eq!(first_summary.index_bytes, second_summary.index_bytes);
+        assert_eq!(first_summary.full_entries, second_summary.full_entries);
+        assert_eq!(first_summary.delta_entries, second_summary.delta_entries);
+    }
+
+    #[test]
+    fn oversized_loose_object_does_not_block_smaller_pack_candidates() {
+        let directory = tempfile::tempdir().expect("temporary library");
+        let config = StoreConfig::default()
+            .with_max_pack_input_bytes(256)
+            .expect("small pack input bound");
+        let mut library =
+            Library::open_with_config(directory.path(), config).expect("open bounded library");
+        let oversized = library
+            .put_bytes(ObjectKind::Wikitext, &vec![0x55; 512])
+            .expect("store oversized pack candidate");
+        let eligible = library
+            .put_bytes(ObjectKind::Wikitext, &[0x33; 128])
+            .expect("store eligible pack candidate");
+
+        let summary = library
+            .pack_loose_objects()
+            .expect("pack smaller candidate")
+            .expect("eligible pack");
+        assert_eq!(summary.object_count, 1);
+        assert_eq!(
+            library.read_object(oversized.id).expect("read oversized"),
+            vec![0x55; 512]
+        );
+        assert_eq!(
+            library.read_object(eligible.id).expect("read eligible"),
+            vec![0x33; 128]
+        );
+        assert!(
+            library
+                .pack_loose_objects()
+                .expect("repeat pack scan")
+                .is_none()
+        );
+    }
+
     #[test]
     fn verified_pack_round_trips_full_and_bounded_delta_entries_after_pruning() {
         let (directory, mut library) = test_library();
@@ -10131,6 +12041,537 @@ mod tests {
                 .read_object(revision.content_object_id)
                 .expect("canonical source"),
             capture.source
+        );
+    }
+
+    #[test]
+    fn integrity_metadata_scan_pages_media_subjects_in_stable_bounded_order() {
+        let (_directory, library, media_object_id) = integrity_media_fixture();
+        assert_eq!(library.integrity_metadata_record_count().expect("count"), 4);
+        assert!(matches!(
+            library.integrity_metadata_records_after(None, 0),
+            Err(StoreError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            library.integrity_metadata_records_after(None, MAX_INTEGRITY_METADATA_PAGE_SIZE + 1),
+            Err(StoreError::InvalidConfig(_))
+        ));
+
+        let mut cursor = None;
+        let mut records = Vec::new();
+        loop {
+            let page = library
+                .integrity_metadata_records_after(cursor, 1)
+                .expect("bounded metadata page");
+            let Some(record) = page.into_iter().next() else {
+                break;
+            };
+            cursor = Some(record.cursor().expect("record cursor"));
+            records.push(record);
+        }
+
+        assert_eq!(records.len(), 4);
+        assert!(records.iter().all(|record| record.issues.is_empty()));
+        assert!(matches!(
+            records.as_slice(),
+            [
+                IntegrityMetadataRecord {
+                    subject: IntegrityMetadataSubject::Revision { .. },
+                    ..
+                },
+                IntegrityMetadataRecord {
+                    subject: IntegrityMetadataSubject::Page { .. },
+                    ..
+                },
+                IntegrityMetadataRecord {
+                    subject: IntegrityMetadataSubject::Media {
+                        wiki_id: 1,
+                        source_media_id: 9001,
+                        ..
+                    },
+                    media_object: Some(IntegrityMediaObject {
+                        object_id,
+                        mime_type,
+                        ..
+                    }),
+                    ..
+                },
+                IntegrityMetadataRecord {
+                    subject: IntegrityMetadataSubject::PageMedia {
+                        wiki_id: 1,
+                        revision_id: 410,
+                        placement_index: 0,
+                        ..
+                    },
+                    ..
+                }
+            ] if *object_id == media_object_id && mime_type == "image/png"
+        ));
+    }
+
+    #[test]
+    fn integrity_metadata_scan_classifies_corrupt_media_references() {
+        let (_directory, library, media_object_id) = integrity_media_fixture();
+        library
+            .connection()
+            .pragma_update(None, "foreign_keys", false)
+            .expect("disable fixture foreign keys");
+        library
+            .connection()
+            .pragma_update(None, "ignore_check_constraints", true)
+            .expect("disable fixture check constraints");
+        library
+            .connection()
+            .execute(
+                "UPDATE content_objects SET object_kind = 'wikitext' WHERE object_id = ?1",
+                [media_object_id.to_string()],
+            )
+            .expect("break media object kind");
+        library
+            .connection()
+            .execute(
+                "UPDATE media SET width = 0 WHERE source_media_id = 9001",
+                [],
+            )
+            .expect("break media dimensions");
+        library
+            .connection()
+            .execute(
+                "UPDATE revisions SET page_id = 999 WHERE revision_id = 410",
+                [],
+            )
+            .expect("remove placement page ownership");
+        library
+            .connection()
+            .execute(
+                "UPDATE page_media SET source_media_id = 9999,
+                                       placement_kind = 'unexpected'",
+                [],
+            )
+            .expect("break placement metadata and media pointer");
+        library
+            .connection()
+            .execute(
+                "INSERT INTO page_media (
+                    wiki_id, revision_id, placement_index, source_media_id,
+                    source_sha1, content_object_id, placement_kind, caption, alt_text
+                 ) SELECT wiki_id, 999, 1, source_media_id, source_sha1,
+                          content_object_id, 'inline', caption, alt_text
+                   FROM page_media WHERE revision_id = 410",
+                [],
+            )
+            .expect("insert missing-revision placement");
+
+        let records = library
+            .integrity_metadata_records_after(None, 100)
+            .expect("corrupt metadata scan");
+        let media = records
+            .iter()
+            .find(|record| matches!(record.subject, IntegrityMetadataSubject::Media { .. }))
+            .expect("media record");
+        assert!(
+            media
+                .issues
+                .contains(&IntegrityMetadataIssue::MediaObjectWrongKind)
+        );
+        assert!(
+            media
+                .issues
+                .contains(&IntegrityMetadataIssue::MediaMetadataInvalid)
+        );
+        assert_eq!(
+            media.media_object.as_ref().map(|media| media.object_id),
+            Some(media_object_id)
+        );
+
+        let placement_issues = records
+            .iter()
+            .filter_map(|record| match record.subject {
+                IntegrityMetadataSubject::PageMedia { .. } => Some(&record.issues),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(placement_issues.contains(&IntegrityMetadataIssue::PageMediaMetadataInvalid));
+        assert!(placement_issues.contains(&IntegrityMetadataIssue::PageMediaRevisionMissing));
+        assert!(placement_issues.contains(&IntegrityMetadataIssue::PageMediaPageMissing));
+        assert!(placement_issues.contains(&IntegrityMetadataIssue::PageMediaMediaMissing));
+    }
+
+    #[test]
+    fn thumbnail_policy_is_durable_generation_tracked_and_defaults_off() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let rule = CollectionRule::ExplicitTitles(
+            TitleSelection::new([PageTitle::new("Media policy page").expect("policy title")])
+                .expect("policy selection"),
+        );
+        let collection_id = library
+            .create_collection(
+                wiki_id,
+                "Media policy fixture",
+                &rule,
+                HistoryPolicy::CurrentAndFuture,
+                CollectionBudget::unlimited(),
+                CollectionRemovalPolicy::StopTrackingRetainHistory,
+            )
+            .expect("create collection");
+        let initial = library
+            .collection_configuration(collection_id)
+            .expect("read initial configuration")
+            .expect("configured collection");
+        assert_eq!(initial.image_policy, ImagePolicy::None);
+        let initial_hash =
+            manifest_configuration_hash_for(library.connection(), wiki_id, Some(collection_id))
+                .expect("initial configuration hash");
+
+        let thumbnails =
+            ThumbnailPolicy::new(800, 12, 2 * 1024 * 1024).expect("bounded thumbnail policy");
+        library
+            .set_collection_image_policy(collection_id, ImagePolicy::Thumbnails(thumbnails))
+            .expect("enable thumbnails");
+        let configured = library
+            .collection_configuration(collection_id)
+            .expect("read thumbnail configuration")
+            .expect("configured collection");
+        assert_eq!(configured.image_policy, ImagePolicy::Thumbnails(thumbnails));
+        assert_eq!(configured.generation, initial.generation + 1);
+        assert_ne!(
+            manifest_configuration_hash_for(library.connection(), wiki_id, Some(collection_id),)
+                .expect("thumbnail configuration hash"),
+            initial_hash
+        );
+
+        library
+            .set_collection_image_policy(collection_id, ImagePolicy::None)
+            .expect("disable thumbnails");
+        assert_eq!(
+            library
+                .collection_configuration(collection_id)
+                .expect("read disabled policy")
+                .expect("configured collection")
+                .image_policy,
+            ImagePolicy::None
+        );
+        library
+            .tombstone_collection(collection_id)
+            .expect("tombstone collection");
+        assert!(matches!(
+            library.set_collection_image_policy(
+                collection_id,
+                ImagePolicy::Thumbnails(thumbnails)
+            ),
+            Err(StoreError::CollectionTombstoned(id)) if id == collection_id
+        ));
+    }
+
+    #[test]
+    fn thumbnail_capture_round_trips_complete_attribution_and_survives_tombstone() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Media fixture")
+            .expect("create collection");
+        capture_test_page(
+            &mut library,
+            wiki_id,
+            collection_id,
+            41,
+            410,
+            "2026-08-22T10:00:00Z",
+            "Media fixture article",
+        );
+        let page_id = PageId::new(41).expect("page ID");
+        let revision_id = RevisionId::new(410).expect("revision ID");
+        let file_title = PageTitle::new("File:Fixture.png").expect("file title");
+        let bytes = VALID_PNG;
+        let capture = ThumbnailCapture {
+            media_id: MediaId::new(9001).expect("media ID"),
+            file_title: &file_title,
+            source_sha1: "abcdef0123456789abcdef0123456789",
+            original_url: "https://upload.wikimedia.org/fixture.png",
+            description_url: "https://commons.wikimedia.org/wiki/File:Fixture.png",
+            author: "Fixture photographer",
+            attribution: "Fixture photographer / Wikimedia Commons",
+            license_name: "CC BY-SA 4.0",
+            license_url: Some("https://creativecommons.org/licenses/by-sa/4.0/"),
+            width: 1,
+            height: 1,
+            mime_type: ThumbnailMimeType::Png,
+            captured_at: 1_776_000_000,
+            source: bytes,
+        };
+        let placement = RevisionMediaPlacement {
+            index: 0,
+            kind: MediaPlacementKind::Lead,
+            caption: Some("A complete fixture caption"),
+            alt_text: Some("A descriptive fixture alternative"),
+        };
+        let policy = ThumbnailPolicy::new(640, 8, 1024).expect("thumbnail policy");
+
+        let first = library
+            .capture_revision_thumbnail(wiki_id, page_id, revision_id, policy, &capture, placement)
+            .expect("capture thumbnail");
+        let retry = ThumbnailCapture {
+            captured_at: capture.captured_at + 60,
+            ..capture.clone()
+        };
+        let second = library
+            .capture_revision_thumbnail(wiki_id, page_id, revision_id, policy, &retry, placement)
+            .expect("repeat thumbnail capture");
+        assert_eq!(first, second);
+        assert_eq!(first.kind, ObjectKind::Media);
+        assert_eq!(
+            library.read_object(first.id).expect("read thumbnail"),
+            bytes
+        );
+
+        let stored = library
+            .revision_media(wiki_id, revision_id)
+            .expect("read revision media");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].placement_kind, MediaPlacementKind::Lead);
+        assert_eq!(stored[0].caption.as_deref(), placement.caption);
+        assert_eq!(stored[0].alt_text.as_deref(), placement.alt_text);
+        assert_eq!(stored[0].media_id, capture.media_id);
+        assert_eq!(stored[0].author, capture.author);
+        assert_eq!(stored[0].attribution, capture.attribution);
+        assert_eq!(stored[0].license_name, capture.license_name);
+        assert_eq!(stored[0].license_url.as_deref(), capture.license_url);
+        assert_eq!((stored[0].width, stored[0].height), (1, 1));
+        assert_eq!(stored[0].mime_type, ThumbnailMimeType::Png);
+        assert_eq!(stored[0].content_object_id, first.id);
+        assert_eq!(stored[0].captured_at, capture.captured_at);
+
+        let larger_rendition = ThumbnailCapture {
+            original_url: "https://upload.wikimedia.org/fixture-2px.png",
+            width: 2,
+            captured_at: capture.captured_at + 120,
+            source: SECOND_VALID_PNG,
+            ..capture.clone()
+        };
+        let larger = library
+            .capture_revision_thumbnail(
+                wiki_id,
+                page_id,
+                revision_id,
+                policy,
+                &larger_rendition,
+                RevisionMediaPlacement {
+                    index: 1,
+                    kind: MediaPlacementKind::Inline,
+                    caption: Some("A second rendition"),
+                    alt_text: placement.alt_text,
+                },
+            )
+            .expect("capture second rendition of one source version");
+        assert_ne!(larger.id, first.id);
+        let renditions = library
+            .revision_media(wiki_id, revision_id)
+            .expect("read both renditions");
+        assert_eq!(renditions.len(), 2);
+        assert_eq!(renditions[0].content_object_id, first.id);
+        assert_eq!(renditions[1].content_object_id, larger.id);
+        assert_eq!((renditions[1].width, renditions[1].height), (2, 1));
+
+        let conflicting_metadata = ThumbnailCapture {
+            author: "Different author",
+            ..capture.clone()
+        };
+        assert!(matches!(
+            library.capture_revision_thumbnail(
+                wiki_id,
+                page_id,
+                revision_id,
+                policy,
+                &conflicting_metadata,
+                RevisionMediaPlacement {
+                    index: 2,
+                    kind: MediaPlacementKind::Inline,
+                    caption: None,
+                    alt_text: None,
+                },
+            ),
+            Err(StoreError::ConflictingMedia(id)) if id == capture.media_id
+        ));
+        assert!(matches!(
+            library.capture_revision_thumbnail(
+                wiki_id,
+                page_id,
+                revision_id,
+                policy,
+                &capture,
+                RevisionMediaPlacement {
+                    caption: Some("Conflicting caption"),
+                    ..placement
+                },
+            ),
+            Err(StoreError::ConflictingMediaPlacement {
+                revision_id: id,
+                placement_index: 0,
+            }) if id == revision_id
+        ));
+        assert_eq!(
+            library
+                .revision_media(wiki_id, revision_id)
+                .expect("unchanged media after conflicts"),
+            renditions
+        );
+
+        library
+            .tombstone_collection(collection_id)
+            .expect("stop tracking collection");
+        assert_eq!(
+            library
+                .revision_media(wiki_id, revision_id)
+                .expect("retained media after tombstone"),
+            renditions
+        );
+        assert_eq!(
+            library
+                .read_object(first.id)
+                .expect("retained thumbnail bytes"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn media_failure_never_changes_durable_text_or_existing_placement() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Media failure fixture")
+            .expect("create collection");
+        capture_test_page(
+            &mut library,
+            wiki_id,
+            collection_id,
+            51,
+            510,
+            "2026-08-22T11:00:00Z",
+            "Durable text before media",
+        );
+        let page_id = PageId::new(51).expect("page ID");
+        let revision_id = RevisionId::new(510).expect("revision ID");
+        let text_object = library
+            .revision(wiki_id, revision_id)
+            .expect("read revision")
+            .expect("captured revision")
+            .content_object_id;
+        let object_count_before = library.logical_object_count().expect("object count");
+        let file_title = PageTitle::new("File:Unsafe.svg").expect("file title");
+        let invalid = ThumbnailCapture {
+            media_id: MediaId::new(9002).expect("media ID"),
+            file_title: &file_title,
+            source_sha1: "1234567890abcdef1234567890abcdef",
+            original_url: "https://upload.wikimedia.org/unsafe.svg",
+            description_url: "https://commons.wikimedia.org/wiki/File:Unsafe.svg",
+            author: "Fixture author",
+            attribution: "Fixture attribution",
+            license_name: "CC0",
+            license_url: Some("https://creativecommons.org/publicdomain/zero/1.0/"),
+            width: 100,
+            height: 100,
+            mime_type: ThumbnailMimeType::Png,
+            captured_at: 1_776_000_001,
+            source: b"<svg><script>unsafe()</script></svg>",
+        };
+        let policy = ThumbnailPolicy::new(640, 2, 1024).expect("thumbnail policy");
+        assert!(matches!(
+            library.capture_revision_thumbnail(
+                wiki_id,
+                page_id,
+                revision_id,
+                policy,
+                &invalid,
+                RevisionMediaPlacement {
+                    index: 0,
+                    kind: MediaPlacementKind::Inline,
+                    caption: Some("Unsafe source"),
+                    alt_text: None,
+                },
+            ),
+            Err(StoreError::InvalidMediaMetadata(_))
+        ));
+
+        let malformed = b"\x89PNG\r\n\x1a\ntruncated".to_vec();
+        let mut animated = VALID_PNG.to_vec();
+        let animation_offset = animated.len() - 12;
+        let mut animation_chunk = Vec::new();
+        animation_chunk.extend_from_slice(&8_u32.to_be_bytes());
+        animation_chunk.extend_from_slice(b"acTL");
+        animation_chunk.extend_from_slice(&1_u32.to_be_bytes());
+        animation_chunk.extend_from_slice(&0_u32.to_be_bytes());
+        animation_chunk.extend_from_slice(&0_u32.to_be_bytes());
+        animated.splice(animation_offset..animation_offset, animation_chunk);
+        let mut dimension_bomb = VALID_PNG.to_vec();
+        dimension_bomb[16..20].copy_from_slice(&100_000_u32.to_be_bytes());
+        dimension_bomb[20..24].copy_from_slice(&100_000_u32.to_be_bytes());
+
+        for (source, width, height, mime_type) in [
+            (malformed, 1, 1, ThumbnailMimeType::Png),
+            (animated, 1, 1, ThumbnailMimeType::Png),
+            (dimension_bomb, 1, 1, ThumbnailMimeType::Png),
+            (VALID_PNG.to_vec(), 2, 1, ThumbnailMimeType::Png),
+            (VALID_PNG.to_vec(), 1, 1, ThumbnailMimeType::Jpeg),
+        ] {
+            let rejected = ThumbnailCapture {
+                media_id: MediaId::new(9003).expect("adversarial media ID"),
+                file_title: &file_title,
+                source_sha1: "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                original_url: "https://upload.wikimedia.org/adversarial.png",
+                description_url: "https://commons.wikimedia.org/wiki/File:Adversarial.png",
+                author: "Fixture author",
+                attribution: "Fixture attribution",
+                license_name: "CC0",
+                license_url: None,
+                width,
+                height,
+                mime_type,
+                captured_at: 1_776_000_002,
+                source: &source,
+            };
+            assert!(matches!(
+                library.capture_revision_thumbnail(
+                    wiki_id,
+                    page_id,
+                    revision_id,
+                    policy,
+                    &rejected,
+                    RevisionMediaPlacement {
+                        index: 0,
+                        kind: MediaPlacementKind::Inline,
+                        caption: None,
+                        alt_text: None,
+                    },
+                ),
+                Err(StoreError::InvalidMediaMetadata(_))
+            ));
+        }
+        assert_eq!(
+            library
+                .logical_object_count()
+                .expect("unchanged object count"),
+            object_count_before
+        );
+        assert!(
+            library
+                .revision_media(wiki_id, revision_id)
+                .expect("unchanged placements")
+                .is_empty()
+        );
+        assert_eq!(
+            library
+                .read_object(text_object)
+                .expect("durable text remains"),
+            b"Durable text before media"
         );
     }
 

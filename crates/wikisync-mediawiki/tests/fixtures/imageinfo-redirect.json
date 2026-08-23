@@ -1,0 +1,18 @@
+{
+  "query": {
+    "redirects": [
+      {
+        "from": "File:Lead photo.JPG",
+        "to": "File:Redirect target.JPG"
+      }
+    ],
+    "pages": [
+      {
+        "pageid": 9002,
+        "ns": 6,
+        "title": "File:Redirect target.JPG",
+        "missing": true
+      }
+    ]
+  }
+}
