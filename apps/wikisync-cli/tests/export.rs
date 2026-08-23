@@ -3,10 +3,20 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use serde_json::Value;
-use wikisync_core::{PageId, PageTitle, RevisionId};
-use wikisync_store::{CurrentRevisionCapture, Library, RevisionCapture};
+use wikisync_core::{MediaId, PageId, PageTitle, RevisionId, ThumbnailPolicy};
+use wikisync_store::{
+    CurrentRevisionCapture, Library, MediaPlacementKind, RevisionCapture, RevisionMediaPlacement,
+    ThumbnailCapture, ThumbnailMimeType,
+};
 
 const ARTICLE_SOURCE: &str = include_str!("../../../fixtures/content/article.wiki");
+const VALID_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5, 0x1c, 0x0c,
+    0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64, 0xf8, 0x0f, 0x00,
+    0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+    0xae, 0x42, 0x60, 0x82,
+];
 
 #[test]
 fn exports_current_collection_offline_with_stable_provenance_files() {
@@ -37,6 +47,12 @@ fn exports_current_collection_offline_with_stable_provenance_files() {
         "source_url: \"https://example.invalid/w/index.php?title=Rust%20Memory%20Safety&oldid=100\""
     ));
     assert!(article.contains("## Source and attribution"));
+    assert!(article.contains("## Captured media"));
+    assert!(article.contains("Offline export caption"));
+    assert!(article.contains("Fixture photographer / Wikimedia Commons"));
+    assert!(article.contains("CC BY-SA 4.0"));
+    assert!(article.contains("../media/b3-"));
+    assert!(!article.contains("![Offline export caption](https://"));
     assert!(article.contains("Revision author: Fixture editor."));
     assert!(article.contains("license metadata is not available"));
 
@@ -50,15 +66,33 @@ fn exports_current_collection_offline_with_stable_provenance_files() {
     assert_eq!(index["revision_id"], 100);
     assert_eq!(index["author"], "Fixture editor");
     assert_eq!(index["transformer_version"], "wikitext-markdown-v1");
+    assert_eq!(index["media"].as_array().unwrap().len(), 1);
+    assert_eq!(index["media"][0]["caption"], "Offline export caption");
+    assert_eq!(index["media"][0]["alt_text"], Value::Null);
+    let media_relative_path = index["media"][0]["relative_path"]
+        .as_str()
+        .expect("media path");
+    assert_eq!(
+        fs::read(current.join(media_relative_path)).unwrap(),
+        VALID_PNG
+    );
 
     let manifest_bytes = fs::read(current.join("manifest.json")).expect("manifest");
     let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("manifest JSON");
-    assert_eq!(manifest["schema"], "wikisync-current-export-v1");
+    assert_eq!(manifest["schema"], "wikisync-current-export-v2");
+    assert_eq!(manifest["schema_predecessor"], "wikisync-current-export-v1");
+    assert_eq!(
+        manifest["schema_evolution"],
+        "v2-additive-attributed-local-media"
+    );
     assert_eq!(manifest["format"], "markdown");
     assert_eq!(manifest["scope"]["kind"], "collection");
     assert_eq!(manifest["scope"]["collection_id"], collection_id);
     assert_eq!(manifest["article_count"], 1);
     assert_eq!(manifest["uncaptured_page_count"], 0);
+    assert_eq!(manifest["media_object_count"], 1);
+    assert_eq!(manifest["media_placement_count"], 1);
+    assert_eq!(manifest["media_bytes"], VALID_PNG.len());
 
     let second = run(
         root,
@@ -90,6 +124,8 @@ fn exports_current_collection_offline_with_stable_provenance_files() {
     let text_article = fs::read_to_string(current.join("articles/10-rust-memory-safety.txt"))
         .expect("text article");
     assert!(text_article.contains("SOURCE AND ATTRIBUTION"));
+    assert!(text_article.contains("CAPTURED MEDIA"));
+    assert!(text_article.contains("Alternative text: Offline export caption"));
     assert!(text_article.contains("Content hash: b3:"));
     assert_eq!(
         serde_json::from_slice::<Value>(&fs::read(current.join("manifest.json")).unwrap()).unwrap()
@@ -129,7 +165,11 @@ fn historical_time_slice_selects_each_pages_newest_eligible_revision() {
     assert!(second.contains("Second page initial."));
     let manifest: Value =
         serde_json::from_slice(&fs::read(historical.join("manifest.json")).unwrap()).unwrap();
-    assert_eq!(manifest["schema"], "wikisync-historical-export-v1");
+    assert_eq!(manifest["schema"], "wikisync-historical-export-v2");
+    assert_eq!(
+        manifest["schema_predecessor"],
+        "wikisync-historical-export-v1"
+    );
     assert_eq!(manifest["at"]["kind"], "timestamp");
     assert_eq!(manifest["at"]["requested"], "2026-08-19T12:15:00Z");
     assert_eq!(manifest["article_count"], 2);
@@ -346,6 +386,37 @@ fn seed_library(root: &Path) -> u64 {
             },
         )
         .expect("capture");
+    let file_title = PageTitle::new("File:Offline export.png").expect("file title");
+    library
+        .capture_revision_thumbnail(
+            wiki_id,
+            PageId::new(10).unwrap(),
+            RevisionId::new(100).unwrap(),
+            ThumbnailPolicy::new(640, 8, 1024).expect("thumbnail policy"),
+            &ThumbnailCapture {
+                media_id: MediaId::new(9001).expect("media ID"),
+                file_title: &file_title,
+                source_sha1: "abcdef0123456789abcdef0123456789",
+                original_url: "https://upload.wikimedia.org/offline-export.png",
+                description_url: "https://commons.wikimedia.org/wiki/File:Offline_export.png",
+                author: "Fixture photographer",
+                attribution: "Fixture photographer / Wikimedia Commons",
+                license_name: "CC BY-SA 4.0",
+                license_url: Some("https://creativecommons.org/licenses/by-sa/4.0/"),
+                width: 1,
+                height: 1,
+                mime_type: ThumbnailMimeType::Png,
+                captured_at: 1_776_000_000,
+                source: VALID_PNG,
+            },
+            RevisionMediaPlacement {
+                index: 0,
+                kind: MediaPlacementKind::Lead,
+                caption: Some("Offline export caption"),
+                alt_text: None,
+            },
+        )
+        .expect("capture thumbnail");
     collection_id.get()
 }
 
@@ -492,8 +563,7 @@ fn only_file_below(root: &Path) -> std::path::PathBuf {
             }
         }
     }
-    assert_eq!(files.len(), 1, "fixture should create one loose object");
-    files.pop().unwrap()
+    files.pop().expect("fixture should create a loose object")
 }
 
 fn assert_success(output: &Output) {

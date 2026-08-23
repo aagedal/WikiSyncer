@@ -305,16 +305,22 @@ dimensions, or misleading link destinations.
 
 **Present resistance.** Raw tags do not pass through as active article HTML; generated
 values are escaped or emitted through the Markdown event renderer; URL schemes are
-restricted; article images become inert placeholders; CSP blocks scripts, network
-connections, remote styles/fonts, and framing; reader assets are bundled.
+restricted; CSP blocks scripts, network connections, remote styles/fonts, and
+framing; reader assets are bundled. Optional media is default-off and accepts only
+bounded, completely decoded passive JPEG/PNG bytes with MIME/magic agreement,
+dimension/pixel/allocation ceilings and APNG rejection. Wikimedia CDN downloads use
+one explicit source-derived HTTPS origin with the same DNS/rebinding controls as API
+requests. Reader/export access re-verifies the content hash and raster before serving
+or writing a fixed MIME type with `nosniff`; remote URLs are user-clicked attribution
+links, never resource loads. Media inventory and placements are included in new
+predecessor-linked manifests.
 
-**Residual risk and action.** Keep media disabled for beta unless a separate bounded
-pipeline validates MIME by bytes, rejects or safely rasterizes active formats, caps
-compressed bytes, decoded bytes, dimensions, frame count, and CPU, and serves content
-with fixed safe types plus `nosniff`. Add corpus and property tests for markup/link
-edge cases. External links are an intentional user-initiated escape from offline mode
-and must be visually identifiable; consider an interstitial or opt-in policy where
-privacy expectations require it.
+**Residual risk and action.** Continue malicious image corpus/property testing and
+measure decoder CPU under maximum permitted inputs. External links are an intentional
+user-initiated escape from offline mode and must be visually identifiable; consider
+an interstitial or opt-in policy where privacy expectations require it. Third-party
+cross-origin media CDNs remain fail-closed until they have an equally explicit
+source-bound policy.
 
 ### Local unprivileged users and filesystem manipulation
 
@@ -432,21 +438,21 @@ recoverability from packs/backups.
 | Requirement | State at review | Evidence / remaining work |
 | --- | --- | --- |
 | No telemetry or external reader assets | **Present for tested reader path** | Bundled CSS, restrictive CSP, and in-process outbound-resource crawl; add release-level outbound test and audit diagnostics/updater behavior |
-| Explicit source allowlist | **Present for direct configured source origin** | Each client derives an explicit normalized host allowlist from its selected endpoint, disables ambient proxies, rejects unsafe literal destinations and entire unsafe/mixed/empty/over-32 DNS answers, and gives only vetted addresses to the connector. New connections revalidate DNS; redirects must remain on the exact scheme/host/effective-port origin and cross-origin destinations fail before contact. Loopback HTTP enables a loopback-only fixture exception |
+| Explicit source allowlist | **Present for configured source and bounded Wikimedia CDN origins** | Each client derives exact normalized origins from its selected endpoint, plus only `https://upload.wikimedia.org:443` for recognized standard-port Wikimedia project sources; third-party/nonstandard/loopback sources remain exact-origin. Ambient proxies are disabled, unsafe literal and whole DNS answers are rejected, new connections revalidate DNS, and redirects must remain on an approved exact origin. Loopback HTTP enables a loopback-only fixture exception |
 | HTTPS through Rustls | **Present** | `wikisync-mediawiki` disables reqwest defaults and enables `rustls-tls`; loopback HTTP is fixture-only by validation |
 | Application User-Agent and operator contact | **Partial** | Non-empty controlled User-Agent and `maxlag` exist; configuration/UI contract for operator contact remains |
 | Response, timeout, parser, redirect, and decompression bounds | **Partial** | Request/connect timeout, per-response and aggregate run-byte limits, clone-shared concurrency and byte-rate shaping, redirect count/origin policy, object/pack and inline-depth limits exist; decompression-ratio coverage, broader parser/allocation budgets, and fuzzing remain |
 | Sanitized HTML and restrictive CSP | **Present for text reader** | Raw HTML events become text, links/images are rewritten, headers are tested; continue adversarial corpus testing |
 | User-restricted data-directory permissions | **Present on Unix core paths** | Directories including manifests/exports are `0700`; SQLite/WAL/SHM and created manifest/export files are `0600`; extend release auditing to logs, IPC, and backups |
-| BLAKE3 identities for canonical text/media | **Present for object abstraction** | Domain-separated text/media object kinds and verified reads exist; media ingestion is not implemented |
-| Predecessor-linked manifests | **Present, optionally head-authenticated** | Bounded canonical JSON, BLAKE3 body identity, immutable run configuration snapshots, strict predecessor/sequence checks, atomic durable append, bounded crash-gap repair, catalog-difference revisions, resulting heads, and tamper tests are implemented. A signature covers a validated chain head rather than modifying every manifest file |
+| BLAKE3 identities for canonical text/media | **Present** | Domain-separated text/media object kinds, bounded validated ingestion, and verified reader/export reads are implemented |
+| Predecessor-linked manifests | **Present, optionally head-authenticated** | Bounded canonical JSON, BLAKE3 body identity, immutable run configuration snapshots, strict predecessor/sequence checks, atomic durable append, bounded crash-gap repair, catalog-difference revisions, resulting heads, deterministic media inventory/placements, and tamper tests are implemented. Schema-v1 manifests remain readable and explicitly report no media coverage. A signature covers a validated chain head rather than modifying every manifest file |
 | Optional Ed25519 signatures and external trust anchor | **Present for explicit external Unix paths** | CLI generation, validation, create-new import, verified anchor export/explicit refresh, comparison, and recovery-preserving rotation are tested. The GUI generates/validates keys, verifies against an anchor, and retains a changed previous anchor during refresh. Keys and anchors must use explicit paths outside the library in private operator-owned storage; revocation and broader trust distribution remain policy work |
-| Full verify contract | **Partial** | Loose/pack/delta objects, manifest identity/chain/run coverage, revision/page/object reachability, page heads, checkpoint run/scope/boundary, search/FTS pointers, and search transformer versions are checked with bounded stable scans. An exact external head comparison detects a different restored head. The current schema has no derived-cache table; contentless FTS bodies, full revision-chain policy completeness, manifest-to-database snapshot reachability, and broader database truncation detection remain limited |
+| Full verify contract | **Partial** | Loose/pack/delta objects, manifest identity/chain/run coverage, revision/page/object/media reachability, authenticated v2 media inventory/placements, page heads, checkpoint run/scope/boundary, search/FTS pointers, and search transformer versions are checked with bounded stable scans. An exact external head comparison detects a different restored head. The current schema has no derived-cache table; contentless FTS bodies, full revision-chain policy completeness, older v1 media coverage, and broader database truncation detection remain limited |
 | Loopback-only read-only reader | **Present, confidentiality gap** | Non-loopback addresses are rejected and only GET routes exist; localhost is unauthenticated and not an OS-user boundary |
 | Daemon single-writer authorization | **Partial** | Versioned bounded Unix IPC, `0600` sockets inside the private library, cooperative writer leases, scheduling, signal cancellation, advisory-lock stale-socket recovery, GUI/CLI forwarding, and exclusion/recovery tests exist; peer-credential review and hostile same-UID analysis remain |
 | Locked/audited dependencies | **Partial** | Lockfile, cargo-deny policy, locked CI tests; formal audit response, immutable CI action pins, SBOM/provenance remain |
 | Signed beta packages | **Credential-free substrate present; credentialed release pending** | Deterministic bounded macOS/Linux candidate archives, exact signed-set verification, detached OpenSSH Ed25519 checksum-signing hooks, a defined Linux archive/repository/key-distribution trust model, deterministic macOS Mach-O/signing plans, fail-closed Developer ID/receipt/final-archive validation, eleven packaging tests, and a no-secret/no-publish native CI dry run are present. Real Apple Developer ID signing, timestamping, notarization and clean-host Gatekeeper evidence; protected release identities and independent trust-anchor distribution; credentialed native validation; and signed publication remain |
-| Safe optional media | **Deferred / disabled** | Image placeholders only; do not enable capture until bounded validation, attribution, licensing, and safe serving land |
+| Safe optional media | **Present, default-off** | Bounded discovery/download, source-bound CDN policy, passive-raster validation, hard collection budgets, immutable attribution/licensing metadata, media-aware manifests/full verification, local-only reader serving, and attributed deterministic exports are fixture-tested. Higher-resolution/active media remain unsupported |
 | At-rest confidentiality | **External control** | Recommend full-disk encryption; application-managed encryption is intentionally deferred |
 
 ## Beta security exit checks

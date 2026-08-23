@@ -240,8 +240,11 @@ selected wikis. A single-collection selection resolves cross-wiki revision-ID
 ambiguity.
 
 Historical output uses a deterministic, selector/format/scope-specific directory
-below `exports/` and schema `wikisync-historical-export-v1`; it does not replace
-`exports/current`, whose schema is `wikisync-current-export-v1`. Repeating the same
+below `exports/` and schema `wikisync-historical-export-v2`; it does not replace
+`exports/current`, whose schema is `wikisync-current-export-v2`. The v2 schemas add
+an optional hash-addressed `media/` directory, per-article media metadata and
+attribution sections, and manifest media counts; their manifests identify the v1
+predecessor explicitly. Repeating the same
 selection atomically replaces that same export directory after staging succeeds.
 Exports are bounded and private on Unix, but they can contain authors and material
 later removed upstream. They are not canonical evidence, a complete-library backup,

@@ -284,8 +284,7 @@ Stable contracts, pack tuning, and dump-import foundations now also include:
   import/resume, selection integration, and the post-bootstrap Action API race closure
   are not yet implemented.
 
-Optional-thumbnail foundations are implemented but do not yet form an end-to-end
-sync path:
+Optional-thumbnail capture now forms an end-to-end, default-off stable-v1 path:
 
 - schema migration 12 adds default-off, generation-tracked bounded thumbnail policy,
   rendition-aware immutable media metadata, revision placements, attribution,
@@ -305,11 +304,28 @@ sync path:
 - MediaWiki support can discover a bounded exact-revision passive-image list, resolve
   typed thumbnail/attribution/license/hash metadata, and download same-origin bytes
   through the existing semaphore, DNS, redirect, retry, circuit, rate, per-image, and
-  per-run limits. Ordinary Wikimedia thumbnails normally use `upload.wikimedia.org`,
-  which remains fail-closed until an explicit source-bound CDN-origin policy exists.
-  Synchronization does not yet invoke discovery/download/validation/storage, the
-  manifest chain does not yet authenticate media inventory, and reader/export
-  rendering with attribution is not implemented.
+  per-run limits;
+- recognized standard-port HTTPS Wikimedia project sources derive exactly one
+  additional `https://upload.wikimedia.org:443` origin. Third-party, loopback, and
+  nonstandard sources remain exact-origin; approved CDN connections retain whole-
+  answer public DNS validation, new-connection revalidation, proxy exclusion, and
+  exact-origin redirect enforcement;
+- bootstrap, historical-policy capture, and long-gap reconciliation discover media
+  only after canonical text is durable, reuse existing placements, download and fully
+  validate missing renditions, enforce distinct-object collection byte budgets, and
+  attach immutable attribution/licensing metadata. Optional per-image failures are
+  reported by stage without invalidating captured text, while local catalog/I/O
+  failures still stop the operation;
+- manifest schema 2 deterministically authenticates media inventory and revision
+  placements, including metadata, rendition identity, captions/alternative text, and
+  capture provenance. Schema-1 manifests remain readable with explicit no-media
+  coverage, and full verification reports media deletion, addition, tampering,
+  placement swaps, and concurrent inventory changes; and
+- current and historical reader pages serve only hash-verified, fully revalidated
+  local JPEG/PNG bytes through bounded routes and display source, author/credit,
+  license, dimensions, capture time, upstream hash, and local identity. Current,
+  historical, and collection exports use explicit v2 schemas with deterministic
+  attributed media sections and deduplicated hash-addressed private media files.
 
 Credential-free beta packaging readiness now includes:
 
@@ -353,18 +369,18 @@ and signed artifact publication remain.
 
 The ordered first implementation backlog (items 1–13) is complete. The broader
 milestone delivery lists are not all closed: destructive purge is not implemented,
-credentialed platform packages remain outstanding, pack tuning and the initial
-stable-contract definition are implemented, and optional media plus dump bootstrap
-remain partial Milestone 5 work. Daemon-owned source administration, the planned
+credentialed platform packages remain outstanding, pack tuning, the initial
+stable-contract definition, and optional thumbnail media are implemented, while dump
+bootstrap remains partial Milestone 5 work. Daemon-owned source administration, the planned
 non-destructive collection CLI/GUI surface, user-facing external
 signing/trusted-anchor workflows, historical export, and periodic dynamic-category
 membership reconciliation are implemented.
 Full verification now covers stable scans of every logical canonical object, the
 manifest chain and eligible-run coverage, and the current-schema metadata pointers
 listed above, including media objects and placements. A separately retained signed
-trusted head can authenticate the observed revision/manifest chain through the
-library API, but current manifests do not include media inventory and therefore do
-not authenticate media state. The schema has no `derived_cache` inventory,
+trusted head can authenticate the observed revision/manifest chain and schema-2 media
+snapshot through the library API; schema-1 manifests explicitly provide no media
+coverage. The schema has no `derived_cache` inventory,
 contentless FTS permits pointer rather than indexed-body comparison, absent parent
 revisions can be valid under retention policy, and missing search documents may be
 pending derived work. Verification must not be described as source truth, universal
@@ -373,12 +389,11 @@ protection when the anchor is kept with and can be replaced alongside the librar
 
 ## Next checkpoint
 
-For locally actionable stable-v1 work, define a fail-closed source-bound Wikimedia CDN
-origin policy, then connect thumbnail discovery, download, complete validation,
-rendition storage, collection budgets, media-aware manifests, and attributed
-reader/export presentation through one fixture-backed synchronization path. Separately,
-connect the streaming dump reader to authenticated dump/index acquisition, durable
-selection-aware import/resume, and the Action API race-window closure.
+For locally actionable stable-v1 work, connect the streaming dump reader to
+authenticated dump/index acquisition, durable selection-aware import/resume, and the
+Action API race-window closure. Keep acquisition bounded and restartable, authenticate
+the dump/index before import, preserve canonical object identity and hard collection
+budgets, and use fixture-backed tests rather than live Wikimedia services.
 
 Credentialed Apple signing/notarization, protected production release identities and
 independent trust distribution, native release validation, clean-system assessment,

@@ -44,6 +44,20 @@ const DEFAULT_CATEGORY_MEMBERS_PER_REQUEST: usize = 500;
 const DEFAULT_RETRY_ATTEMPTS: usize = 4;
 const DEFAULT_CIRCUIT_FAILURE_THRESHOLD: usize = 3;
 const MAX_RESOLVED_DESTINATIONS: usize = 32;
+const WIKIMEDIA_UPLOAD_HOST: &str = "upload.wikimedia.org";
+const WIKIMEDIA_PROJECT_DOMAINS: [&str; 11] = [
+    "mediawiki.org",
+    "wikibooks.org",
+    "wikidata.org",
+    "wikimedia.org",
+    "wikinews.org",
+    "wikipedia.org",
+    "wikiquote.org",
+    "wikisource.org",
+    "wikiversity.org",
+    "wikivoyage.org",
+    "wiktionary.org",
+];
 
 static NEXT_JITTER_SEED: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
 
@@ -137,6 +151,7 @@ impl Default for RetryPolicy {
 pub struct ClientConfig {
     endpoint: Url,
     allowed_source_hosts: Vec<String>,
+    allowed_origins: Vec<AllowedOrigin>,
     destination_policy: DestinationPolicy,
     user_agent: String,
     request_timeout: Duration,
@@ -169,13 +184,15 @@ impl ClientConfig {
             return Err(ConfigError::InvalidUserAgent);
         }
 
+        let allowed_origins = allowed_origins_for_endpoint(&endpoint);
+        let allowed_source_hosts = allowed_origins
+            .iter()
+            .map(|origin| origin.host.clone())
+            .collect();
+
         Ok(Self {
-            allowed_source_hosts: vec![
-                endpoint
-                    .host_str()
-                    .expect("validated endpoint has a host")
-                    .to_ascii_lowercase(),
-            ],
+            allowed_source_hosts,
+            allowed_origins,
             destination_policy: DestinationPolicy::for_endpoint(&endpoint),
             endpoint,
             user_agent,
@@ -253,10 +270,12 @@ impl ClientConfig {
         Ok(self)
     }
 
-    /// Returns the normalized singleton source-host allowlist.
+    /// Returns the normalized source-host allowlist.
     ///
-    /// Redirects must remain on the endpoint's complete origin in addition to
-    /// matching this allowlist; a same-host scheme or port change is rejected.
+    /// This always contains the configured API host. Ordinary HTTPS Wikimedia
+    /// project endpoints also derive the exact `upload.wikimedia.org` thumbnail
+    /// origin. Third-party and loopback fixture endpoints remain singleton. Scheme
+    /// and effective-port checks are enforced separately against exact origins.
     pub fn allowed_source_hosts(&self) -> impl ExactSizeIterator<Item = &str> {
         self.allowed_source_hosts.iter().map(String::as_str)
     }
@@ -342,6 +361,65 @@ fn validate_endpoint(endpoint: &Url) -> Result<(), ConfigError> {
         "http" if is_loopback(endpoint) => Ok(()),
         _ => Err(ConfigError::HttpsRequired),
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AllowedOrigin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+impl AllowedOrigin {
+    fn from_url(url: &Url) -> Self {
+        Self {
+            scheme: url.scheme().to_owned(),
+            host: url
+                .host_str()
+                .expect("validated origin URL has a host")
+                .to_ascii_lowercase(),
+            port: url
+                .port_or_known_default()
+                .expect("validated HTTP(S) origin has an effective port"),
+        }
+    }
+
+    fn matches(&self, url: &Url) -> bool {
+        url.scheme() == self.scheme
+            && url
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case(&self.host))
+            && url.port_or_known_default() == Some(self.port)
+    }
+}
+
+fn allowed_origins_for_endpoint(endpoint: &Url) -> Vec<AllowedOrigin> {
+    let api_origin = AllowedOrigin::from_url(endpoint);
+    let mut origins = vec![api_origin];
+    if endpoint.scheme() == "https"
+        && endpoint.port_or_known_default() == Some(443)
+        && endpoint.host_str().is_some_and(is_wikimedia_project_host)
+        && !origins
+            .iter()
+            .any(|origin| origin.host == WIKIMEDIA_UPLOAD_HOST)
+    {
+        origins.push(AllowedOrigin {
+            scheme: "https".to_owned(),
+            host: WIKIMEDIA_UPLOAD_HOST.to_owned(),
+            port: 443,
+        });
+    }
+    origins
+}
+
+fn is_wikimedia_project_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    WIKIMEDIA_PROJECT_DOMAINS.iter().any(|domain| {
+        host == *domain
+            || host
+                .strip_suffix(domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
 }
 
 fn endpoint_host_is_statically_unsafe(endpoint: &Url) -> bool {
@@ -494,15 +572,15 @@ impl Resolve for SystemResolver {
 }
 
 struct DestinationResolver {
-    source_host: String,
+    source_hosts: Vec<String>,
     policy: DestinationPolicy,
     inner: Arc<dyn Resolve>,
 }
 
 impl DestinationResolver {
-    fn system(source_host: String, policy: DestinationPolicy) -> Self {
+    fn system(source_hosts: Vec<String>, policy: DestinationPolicy) -> Self {
         Self {
-            source_host,
+            source_hosts,
             policy,
             inner: Arc::new(SystemResolver),
         }
@@ -510,12 +588,12 @@ impl DestinationResolver {
 
     #[cfg(test)]
     fn with_inner(
-        source_host: impl Into<String>,
+        source_hosts: impl IntoIterator<Item = impl Into<String>>,
         policy: DestinationPolicy,
         inner: Arc<dyn Resolve>,
     ) -> Self {
         Self {
-            source_host: source_host.into(),
+            source_hosts: source_hosts.into_iter().map(Into::into).collect(),
             policy,
             inner,
         }
@@ -524,9 +602,13 @@ impl DestinationResolver {
 
 impl Resolve for DestinationResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        if !name.as_str().eq_ignore_ascii_case(&self.source_host) {
+        if !self
+            .source_hosts
+            .iter()
+            .any(|host| name.as_str().eq_ignore_ascii_case(host))
+        {
             return Box::pin(std::future::ready(Err(dns_policy_error(
-                "refused DNS resolution outside the configured source host",
+                "refused DNS resolution outside the approved source hosts",
             ))));
         }
 
@@ -842,15 +924,10 @@ impl MediaWikiClient {
     /// Builds a client with redirects, TLS, timeouts, and a fixed User-Agent policy.
     pub fn new(config: ClientConfig) -> Result<Self, ClientError> {
         let https_only = config.endpoint.scheme() == "https";
-        let redirect_endpoint = config.endpoint.clone();
-        let redirect_allowed_hosts = config.allowed_source_hosts.clone();
+        let redirect_allowed_origins = config.allowed_origins.clone();
         let max_redirects = config.max_redirects;
         let resolver = DestinationResolver::system(
-            config
-                .endpoint
-                .host_str()
-                .expect("validated endpoint has a host")
-                .to_ascii_lowercase(),
+            config.allowed_source_hosts.clone(),
             config.destination_policy,
         );
         let http = reqwest::Client::builder()
@@ -865,11 +942,7 @@ impl MediaWikiClient {
                 if attempt.previous().len() > max_redirects {
                     return attempt.error("MediaWiki redirect limit exceeded");
                 }
-                if !redirect_destination_allowed(
-                    attempt.url(),
-                    &redirect_endpoint,
-                    &redirect_allowed_hosts,
-                ) {
+                if !redirect_destination_allowed(attempt.url(), &redirect_allowed_origins) {
                     return attempt
                         .error("MediaWiki redirect left the explicitly allowed source origin");
                 }
@@ -1573,11 +1646,7 @@ impl fmt::Display for ClientError {
     }
 }
 
-fn redirect_destination_allowed(
-    destination: &Url,
-    endpoint: &Url,
-    allowed_source_hosts: &[String],
-) -> bool {
+fn redirect_destination_allowed(destination: &Url, allowed_origins: &[AllowedOrigin]) -> bool {
     if !destination.username().is_empty()
         || destination.password().is_some()
         || destination.fragment().is_some()
@@ -1585,26 +1654,11 @@ fn redirect_destination_allowed(
         return false;
     }
 
-    let Some(host) = destination.host_str() else {
-        return false;
-    };
-    if !allowed_source_hosts
+    allowed_origins
         .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(host))
-    {
-        return false;
-    }
-    if destination.scheme() != endpoint.scheme()
-        || !endpoint
-            .host_str()
-            .is_some_and(|endpoint_host| endpoint_host.eq_ignore_ascii_case(host))
-        || destination.port_or_known_default() != endpoint.port_or_known_default()
-    {
-        return false;
-    }
-
-    matches!(destination.scheme(), "https")
-        || (destination.scheme() == "http" && is_loopback(destination))
+        .any(|origin| origin.matches(destination))
+        && (destination.scheme() == "https"
+            || (destination.scheme() == "http" && is_loopback(destination)))
 }
 
 impl Error for ClientError {
@@ -1900,7 +1954,13 @@ mod tests {
             .expect("HTTPS source config");
         assert_eq!(
             config.allowed_source_hosts().collect::<Vec<_>>(),
-            ["en.wikipedia.org"]
+            ["en.wikipedia.org", "upload.wikimedia.org"]
+        );
+        let third_party = ClientConfig::new("https://wiki.example.org/api.php", "WikiSyncer/0.1")
+            .expect("third-party HTTPS config");
+        assert_eq!(
+            third_party.allowed_source_hosts().collect::<Vec<_>>(),
+            ["wiki.example.org"]
         );
         assert!(ClientConfig::new("http://127.0.0.1:8080/api.php", "WikiSyncer/0.1").is_ok());
         assert!(matches!(
@@ -1920,6 +1980,62 @@ mod tests {
             assert!(matches!(
                 ClientConfig::new(endpoint, "WikiSyncer/0.1"),
                 Err(ConfigError::UnsafeDestination)
+            ));
+        }
+    }
+
+    #[test]
+    fn wikimedia_thumbnail_origin_is_derived_conservatively_and_matched_exactly() {
+        for endpoint in [
+            "https://en.wikipedia.org/w/api.php",
+            "https://commons.wikimedia.org/w/api.php",
+            "https://www.wikidata.org/w/api.php",
+            "https://www.mediawiki.org/w/api.php",
+            "https://de.wiktionary.org/w/api.php",
+        ] {
+            let config =
+                ClientConfig::new(endpoint, "WikiSyncer/0.1").expect("Wikimedia source config");
+            assert!(redirect_destination_allowed(
+                &Url::parse("https://upload.wikimedia.org/wikipedia/commons/thumb.jpg?width=640")
+                    .expect("CDN URL"),
+                &config.allowed_origins,
+            ));
+        }
+
+        let config = ClientConfig::new("https://en.wikipedia.org/w/api.php", "WikiSyncer/0.1")
+            .expect("Wikimedia source config");
+        assert!(redirect_destination_allowed(
+            &Url::parse("https://en.wikipedia.org/w/redirected-api.php").expect("API URL"),
+            &config.allowed_origins,
+        ));
+        for rejected in [
+            "https://commons.wikimedia.org/thumb.jpg",
+            "https://upload.wikimedia.org.evil.example/thumb.jpg",
+            "http://upload.wikimedia.org/thumb.jpg",
+            "https://upload.wikimedia.org:444/thumb.jpg",
+            "https://user@upload.wikimedia.org/thumb.jpg",
+            "https://upload.wikimedia.org/thumb.jpg#fragment",
+        ] {
+            assert!(
+                !redirect_destination_allowed(
+                    &Url::parse(rejected).expect("syntactically valid rejected URL"),
+                    &config.allowed_origins,
+                ),
+                "accepted {rejected}"
+            );
+        }
+
+        for endpoint in [
+            "https://wikipedia.org.evil.example/w/api.php",
+            "https://wiki.example.org/w/api.php",
+            "https://en.wikipedia.org:8443/w/api.php",
+        ] {
+            let config =
+                ClientConfig::new(endpoint, "WikiSyncer/0.1").expect("non-Wikimedia config");
+            assert_eq!(config.allowed_origins.len(), 1, "endpoint {endpoint}");
+            assert!(!redirect_destination_allowed(
+                &Url::parse("https://upload.wikimedia.org/thumb.jpg").expect("CDN URL"),
+                &config.allowed_origins,
             ));
         }
     }
@@ -1967,8 +2083,11 @@ mod tests {
             vec!["8.8.8.8:0".parse().expect("public address")],
             vec!["127.0.0.1:0".parse().expect("loopback address")],
         ]));
-        let resolver =
-            DestinationResolver::with_inner("source.example", DestinationPolicy::PublicOnly, inner);
+        let resolver = DestinationResolver::with_inner(
+            ["source.example"],
+            DestinationPolicy::PublicOnly,
+            inner,
+        );
 
         let first = resolver
             .resolve("source.example".parse().expect("DNS name"))
@@ -1987,13 +2106,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolver_applies_public_whole_answer_policy_to_approved_wikimedia_cdn() {
+        let inner = Arc::new(ScriptedResolver::new(vec![
+            vec!["208.80.154.240:0".parse().expect("public address")],
+            vec!["10.0.0.1:0".parse().expect("private address")],
+            vec!["192.0.2.1:0".parse().expect("special-use address")],
+        ]));
+        let resolver = DestinationResolver::with_inner(
+            ["en.wikipedia.org", WIKIMEDIA_UPLOAD_HOST],
+            DestinationPolicy::PublicOnly,
+            inner,
+        );
+
+        assert_eq!(
+            resolver
+                .resolve(WIKIMEDIA_UPLOAD_HOST.parse().expect("CDN DNS name"))
+                .await
+                .expect("public CDN answer")
+                .count(),
+            1
+        );
+        for description in ["private", "special-use"] {
+            let result = resolver
+                .resolve(WIKIMEDIA_UPLOAD_HOST.parse().expect("CDN DNS name"))
+                .await;
+            assert!(result.is_err(), "accepted {description} CDN answer");
+        }
+    }
+
+    #[tokio::test]
     async fn resolver_rejects_a_mixed_answer_instead_of_filtering_it() {
         let inner = Arc::new(ScriptedResolver::new(vec![vec![
             "8.8.8.8:0".parse().expect("public address"),
             "192.168.1.1:0".parse().expect("private address"),
         ]]));
-        let resolver =
-            DestinationResolver::with_inner("source.example", DestinationPolicy::PublicOnly, inner);
+        let resolver = DestinationResolver::with_inner(
+            ["source.example"],
+            DestinationPolicy::PublicOnly,
+            inner,
+        );
 
         assert!(
             resolver
@@ -2010,8 +2161,11 @@ mod tests {
             .map(|index| SocketAddr::from(([8, 8, 8, (index + 1) as u8], 0)))
             .collect();
         let inner = Arc::new(ScriptedResolver::new(vec![addresses]));
-        let resolver =
-            DestinationResolver::with_inner("source.example", DestinationPolicy::PublicOnly, inner);
+        let resolver = DestinationResolver::with_inner(
+            ["source.example"],
+            DestinationPolicy::PublicOnly,
+            inner,
+        );
 
         assert!(
             resolver
@@ -2032,8 +2186,11 @@ mod tests {
     #[tokio::test]
     async fn resolver_rejects_an_empty_answer() {
         let inner = Arc::new(ScriptedResolver::new(vec![Vec::new()]));
-        let resolver =
-            DestinationResolver::with_inner("source.example", DestinationPolicy::PublicOnly, inner);
+        let resolver = DestinationResolver::with_inner(
+            ["source.example"],
+            DestinationPolicy::PublicOnly,
+            inner,
+        );
 
         assert!(
             resolver
@@ -2050,8 +2207,11 @@ mod tests {
             "127.0.0.1:0".parse().expect("loopback address"),
             "[::1]:0".parse().expect("loopback address"),
         ]]));
-        let resolver =
-            DestinationResolver::with_inner("localhost", DestinationPolicy::LoopbackFixture, inner);
+        let resolver = DestinationResolver::with_inner(
+            ["localhost"],
+            DestinationPolicy::LoopbackFixture,
+            inner,
+        );
 
         assert_eq!(
             resolver

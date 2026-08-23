@@ -86,31 +86,40 @@ Routine read-only inspection should use read-only library APIs. Commands that op
 writable `Library` may apply pending migrations, so operators must make a verified
 backup before upgrading the only copy.
 
-## Export v1
+## Export v2
 
 `exports/current/manifest.json` identifies schema
-`wikisync-current-export-v1`. Historical output identifies
-`wikisync-historical-export-v1`. The manifest schema governs `manifest.json`, every
+`wikisync-current-export-v2`. Historical output identifies
+`wikisync-historical-export-v2`. These schemas supersede the corresponding v1
+schemas by adding attributed, locally stored media; each v2 manifest records its v1
+predecessor and the additive evolution. The manifest schema governs `manifest.json`, every
 line of `index.jsonl`, article filenames, and article metadata. Each export contains:
 
 ```text
 articles/<page-id>-<safe-slug>.<md|txt>
+media/<content-object-id>.<jpg|png>  # present only when selected revisions have media
 index.jsonl
 manifest.json
 ```
 
 The manifest records format, scope, counts, canonical source bytes, hash algorithm,
-transformer version, and maximum capture time. A historical manifest also records its
-inclusive revision/time selector. Index rows and article metadata preserve wiki,
-page, revision, capture, source URL/API endpoint, content hash, author when available,
-and transformer provenance. Markdown includes a source-and-attribution section; plain
-text includes equivalent source and attribution lines.
+transformer version, maximum capture time, and media object/placement counts and
+bytes. A historical manifest also records its inclusive revision/time selector.
+Index rows and article metadata preserve wiki, page, revision, capture, source
+URL/API endpoint, content hash, author when available, transformer provenance, and a
+bounded media array. Each media entry records the hash-addressed relative path,
+placement, caption/alternative text, source file identity and SHA-1, observed
+rendition URL, description URL, author/attribution, license, dimensions, MIME type,
+capture time, and local content hash. Markdown and plain text include equivalent
+source, attribution, license, and provenance sections.
 
 For unchanged canonical input, scope, selector, format, and transformer version, the
 export is byte deterministic. Installation uses a private staging directory and
 atomic directory replacement; a failed rebuild retains the previous complete output.
 Historical exports never replace `exports/current`. Symlinked output components are
-rejected.
+rejected. Identical media objects are written once per export even when several
+placements reference them. Export reads verify the object identity and repeat the
+bounded complete passive-raster validation before writing JPEG or PNG bytes.
 
 Exports are derived interchange views. They can be rebuilt offline from canonical
 objects, are not integrity evidence, and are not backups. A transformer change may

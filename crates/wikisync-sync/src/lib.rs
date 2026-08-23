@@ -9,17 +9,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha1::{Digest, Sha1};
 use wikisync_core::{
     CollectionBudget, CollectionId, CollectionRemovalPolicy, CollectionRule, HistoryPolicy,
-    InclusionReason, InvalidPageTitle, MAIN_NAMESPACE, PageId, PageTitle, RevisionId,
+    ImagePolicy, InclusionReason, InvalidPageTitle, MAIN_NAMESPACE, PageId, PageTitle, RevisionId,
     TitleSelection, WikiId,
 };
 use wikisync_mediawiki::{
     CategoryMemberKind, ClientError, MediaWikiClient, PageHeadResolution, ResolvedPage,
-    RevisionMetadata, RevisionOrder, TitleResolution,
+    RevisionMetadata, RevisionOrder, ThumbnailMetadataResolution,
+    ThumbnailMimeType as SourceThumbnailMimeType, TitleResolution,
 };
 use wikisync_search::{SearchDocument, SearchError, SearchIndex, SqliteSearchIndex};
 use wikisync_store::{
-    CollectionPreviewCommit, CurrentRevisionCapture, Library, MembershipCommit, ObjectId,
-    ResolvedCollectionMember, RevisionCapture, StoreError, StoredPage, SyncRunKind, SyncRunStatus,
+    CollectionPreviewCommit, CurrentRevisionCapture, Library, MediaPlacementKind, MembershipCommit,
+    ObjectId, ObjectKind, ResolvedCollectionMember, RevisionCapture, RevisionMediaPlacement,
+    StoreError, StoredPage, SyncRunKind, SyncRunStatus, ThumbnailCapture,
+    ThumbnailMimeType as StoredThumbnailMimeType,
 };
 
 /// Default maximum subcategory depth accepted by one category preview.
@@ -628,6 +631,8 @@ pub struct CaptureReport {
     pub pages: Vec<CapturedPage>,
     /// Canonical titles MediaWiki reported as missing.
     pub missing_titles: Vec<PageTitle>,
+    /// Optional thumbnails captured, reused, skipped, or rejected after text commits.
+    pub media: MediaCaptureReport,
 }
 
 /// One page head made durable during a capture operation.
@@ -654,6 +659,59 @@ pub struct HistoryCaptureReport {
     pub revisions_captured: usize,
     /// Number of already durable revisions whose content was not downloaded again.
     pub revisions_reused: usize,
+    /// Optional thumbnails processed for selected historical revisions.
+    pub media: MediaCaptureReport,
+}
+
+/// Bounded outcome of optional media acquisition.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MediaCaptureReport {
+    /// Eligible revision placements discovered from the exact revision.
+    pub placements_discovered: usize,
+    /// Placements newly attached to their durable article revision.
+    pub placements_captured: usize,
+    /// Already durable placements reused without another media request.
+    pub placements_reused: usize,
+    /// Placements whose current source metadata was missing or ineligible.
+    pub placements_ineligible: usize,
+    /// Redacted, bounded failures that did not invalidate canonical text capture.
+    pub failures: Vec<MediaCaptureFailure>,
+}
+
+impl MediaCaptureReport {
+    fn merge(&mut self, other: Self) {
+        self.placements_discovered += other.placements_discovered;
+        self.placements_captured += other.placements_captured;
+        self.placements_reused += other.placements_reused;
+        self.placements_ineligible += other.placements_ineligible;
+        self.failures.extend(other.failures);
+    }
+}
+
+/// Stage at which one optional thumbnail could not be captured.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaCaptureStage {
+    /// Exact-revision image discovery.
+    Discovery,
+    /// File metadata, attribution, and rendition resolution.
+    Metadata,
+    /// Bounded thumbnail transfer.
+    Download,
+    /// Collection budget, raster validation, or durable cataloguing.
+    Storage,
+}
+
+/// Redacted failure for one optional media operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MediaCaptureFailure {
+    /// Article revision whose optional media was being processed.
+    pub revision_id: RevisionId,
+    /// Zero-based placement, absent when discovery itself failed.
+    pub placement_index: Option<u32>,
+    /// Failed acquisition stage.
+    pub stage: MediaCaptureStage,
+    /// Whether repeating the source operation later may succeed.
+    pub retryable: bool,
 }
 
 /// Initial capture outcome for one committed collection.
@@ -688,6 +746,8 @@ pub struct ReconciliationReport {
     pub revisions_captured: usize,
     /// Already durable revisions encountered in the forward gap.
     pub revisions_reused: usize,
+    /// Optional thumbnails processed while reconciling selected revisions.
+    pub media: MediaCaptureReport,
 }
 
 /// Default maximum revision-list responses consumed for one page reconciliation.
@@ -756,7 +816,7 @@ impl Default for ReconciliationLimits {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct PageReconciliationReport {
     head_differed: bool,
     missing: bool,
@@ -764,6 +824,7 @@ struct PageReconciliationReport {
     revisions_enumerated: usize,
     revisions_captured: usize,
     revisions_reused: usize,
+    media: MediaCaptureReport,
 }
 
 /// Resolves explicit titles and captures each available current revision.
@@ -793,6 +854,7 @@ pub async fn capture_explicit_titles(
     let mut report = CaptureReport {
         pages: Vec::with_capacity(resolutions.len()),
         missing_titles: Vec::new(),
+        media: MediaCaptureReport::default(),
     };
 
     for resolution in resolutions {
@@ -802,17 +864,17 @@ pub async fn capture_explicit_titles(
                 report.missing_titles.push(title);
             }
             TitleResolution::Found(page) => {
-                report.pages.push(
-                    capture_resolved_page_head(
-                        client,
-                        library,
-                        &mut search_index,
-                        wiki_id,
-                        collection_id,
-                        page,
-                    )
-                    .await?,
-                );
+                let (captured, media) = capture_resolved_page_head(
+                    client,
+                    library,
+                    &mut search_index,
+                    wiki_id,
+                    collection_id,
+                    page,
+                )
+                .await?;
+                report.pages.push(captured);
+                report.media.merge(media);
             }
         }
     }
@@ -827,7 +889,7 @@ async fn capture_resolved_page_head(
     wiki_id: WikiId,
     collection_id: CollectionId,
     page: ResolvedPage,
-) -> Result<CapturedPage, CaptureError> {
+) -> Result<(CapturedPage, MediaCaptureReport), CaptureError> {
     let head = page
         .current_revision
         .ok_or(CaptureError::MissingCurrentRevision(page.page_id))?;
@@ -893,12 +955,29 @@ async fn capture_resolved_page_head(
         captions: "",
         transformer_version: search_content.transformer_version.as_str(),
     })?;
-    Ok(CapturedPage {
-        page_id: page.page_id,
-        revision_id: content.metadata.revision_id,
-        content_object_id: stored.id,
-        newly_captured,
-    })
+    let image_policy = library
+        .collection_configuration(collection_id)?
+        .ok_or(StoreError::CollectionNotConfigured(collection_id))?
+        .image_policy;
+    let media = capture_revision_media(
+        client,
+        library,
+        wiki_id,
+        collection_id,
+        page.page_id,
+        content.metadata.revision_id,
+        image_policy,
+    )
+    .await?;
+    Ok((
+        CapturedPage {
+            page_id: page.page_id,
+            revision_id: content.metadata.revision_id,
+            content_object_id: stored.id,
+            newly_captured,
+        },
+        media,
+    ))
 }
 
 fn enforce_collection_byte_budget(
@@ -926,6 +1005,150 @@ fn enforce_collection_byte_budget(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn capture_revision_media(
+    client: &MediaWikiClient,
+    library: &mut Library,
+    wiki_id: WikiId,
+    collection_id: CollectionId,
+    page_id: PageId,
+    revision_id: RevisionId,
+    image_policy: ImagePolicy,
+) -> Result<MediaCaptureReport, CaptureError> {
+    let ImagePolicy::Thumbnails(policy) = image_policy else {
+        return Ok(MediaCaptureReport::default());
+    };
+    let mut report = MediaCaptureReport::default();
+    let existing = library
+        .revision_media(wiki_id, revision_id)?
+        .into_iter()
+        .map(|media| media.placement_index)
+        .collect::<BTreeSet<_>>();
+    let placements = match client
+        .revision_image_placements(page_id, revision_id, policy)
+        .await
+    {
+        Ok(placements) => placements,
+        Err(error) => {
+            report.failures.push(MediaCaptureFailure {
+                revision_id,
+                placement_index: None,
+                stage: MediaCaptureStage::Discovery,
+                retryable: error.is_retryable(),
+            });
+            return Ok(report);
+        }
+    };
+    report.placements_discovered = placements.len();
+    let captured_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| StoreError::ClockBeforeUnixEpoch)?
+        .as_secs();
+
+    for placement in placements {
+        if existing.contains(&placement.index) {
+            report.placements_reused += 1;
+            continue;
+        }
+        let metadata = match client.resolve_thumbnail_metadata(&placement, policy).await {
+            Ok(ThumbnailMetadataResolution::Eligible(metadata)) => metadata,
+            Ok(ThumbnailMetadataResolution::Ineligible(_)) => {
+                report.placements_ineligible += 1;
+                continue;
+            }
+            Err(error) => {
+                report.failures.push(MediaCaptureFailure {
+                    revision_id,
+                    placement_index: Some(placement.index),
+                    stage: MediaCaptureStage::Metadata,
+                    retryable: error.is_retryable(),
+                });
+                continue;
+            }
+        };
+        let bytes = match client.download_thumbnail(&metadata, policy).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                report.failures.push(MediaCaptureFailure {
+                    revision_id,
+                    placement_index: Some(placement.index),
+                    stage: MediaCaptureStage::Download,
+                    retryable: error.is_retryable(),
+                });
+                continue;
+            }
+        };
+        let object_id = ObjectId::for_bytes(ObjectKind::Media, &bytes);
+        let additional_bytes = if library.contains(object_id)? {
+            0
+        } else {
+            bytes.len() as u64
+        };
+        match enforce_collection_byte_budget(library, collection_id, additional_bytes) {
+            Ok(()) => {}
+            Err(StoreError::CollectionBudgetExceeded { .. }) => {
+                report.failures.push(MediaCaptureFailure {
+                    revision_id,
+                    placement_index: Some(placement.index),
+                    stage: MediaCaptureStage::Storage,
+                    retryable: false,
+                });
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let mime_type = match metadata.mime_type {
+            SourceThumbnailMimeType::Jpeg => StoredThumbnailMimeType::Jpeg,
+            SourceThumbnailMimeType::Png => StoredThumbnailMimeType::Png,
+        };
+        let attribution = metadata.credit.as_deref().unwrap_or(&metadata.artist);
+        let capture = ThumbnailCapture {
+            media_id: metadata.media_id,
+            file_title: &metadata.file_title,
+            source_sha1: &metadata.source_sha1,
+            original_url: &metadata.thumbnail_url,
+            description_url: &metadata.description_url,
+            author: &metadata.artist,
+            attribution,
+            license_name: &metadata.license_short_name,
+            license_url: metadata.license_url.as_deref(),
+            width: metadata.width,
+            height: metadata.height,
+            mime_type,
+            captured_at,
+            source: &bytes,
+        };
+        let stored = library.capture_revision_thumbnail(
+            wiki_id,
+            page_id,
+            revision_id,
+            policy,
+            &capture,
+            RevisionMediaPlacement {
+                index: placement.index,
+                kind: MediaPlacementKind::Inline,
+                caption: placement.caption.as_deref(),
+                alt_text: placement.alt_text.as_deref(),
+            },
+        );
+        match stored {
+            Ok(_) => report.placements_captured += 1,
+            Err(
+                StoreError::InvalidMediaMetadata(_)
+                | StoreError::ConflictingMedia(_)
+                | StoreError::ConflictingMediaPlacement { .. },
+            ) => report.failures.push(MediaCaptureFailure {
+                revision_id,
+                placement_index: Some(placement.index),
+                stage: MediaCaptureStage::Storage,
+                retryable: false,
+            }),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(report)
+}
+
 /// Captures current heads for every committed member by stable page identity.
 pub async fn capture_committed_collection(
     client: &MediaWikiClient,
@@ -939,21 +1162,22 @@ pub async fn capture_committed_collection(
     let mut report = CaptureReport {
         pages: Vec::new(),
         missing_titles: Vec::new(),
+        media: MediaCaptureReport::default(),
     };
     for member in library.resolved_collection_members(collection_id)? {
         match client.resolve_page_head(member.page_id).await? {
             PageHeadResolution::Found(page) => {
-                report.pages.push(
-                    capture_resolved_page_head(
-                        client,
-                        library,
-                        &mut search_index,
-                        configuration.wiki_id,
-                        collection_id,
-                        *page,
-                    )
-                    .await?,
-                );
+                let (captured, media) = capture_resolved_page_head(
+                    client,
+                    library,
+                    &mut search_index,
+                    configuration.wiki_id,
+                    collection_id,
+                    *page,
+                )
+                .await?;
+                report.pages.push(captured);
+                report.media.merge(media);
             }
             PageHeadResolution::Missing { .. } => report.missing_titles.push(member.title),
         }
@@ -1002,6 +1226,7 @@ pub async fn capture_revision_history_with_policy(
         revisions_enumerated: 0,
         revisions_captured: 0,
         revisions_reused: 0,
+        media: MediaCaptureReport::default(),
     };
     if policy == HistoryPolicy::CurrentAndFuture {
         return Ok(report);
@@ -1041,49 +1266,66 @@ pub async fn capture_revision_history_with_policy(
                     });
                 }
                 report.revisions_reused += 1;
-                continue;
-            }
-
-            let content = client
-                .revision_content(page_id, metadata.revision_id)
-                .await?;
-            if content.metadata.parent_id != metadata.parent_id
-                || content.metadata.timestamp != metadata.timestamp
-            {
-                return Err(CaptureError::RevisionMetadataConflict {
-                    revision_id: metadata.revision_id,
-                });
-            }
-            validate_content(&content.metadata, &content.source)?;
-            if let Some(collection_id) = collection_id {
-                enforce_collection_byte_budget(
-                    library,
-                    collection_id,
-                    content.source.len() as u64,
+            } else {
+                let content = client
+                    .revision_content(page_id, metadata.revision_id)
+                    .await?;
+                if content.metadata.parent_id != metadata.parent_id
+                    || content.metadata.timestamp != metadata.timestamp
+                {
+                    return Err(CaptureError::RevisionMetadataConflict {
+                        revision_id: metadata.revision_id,
+                    });
+                }
+                validate_content(&content.metadata, &content.source)?;
+                if let Some(collection_id) = collection_id {
+                    enforce_collection_byte_budget(
+                        library,
+                        collection_id,
+                        content.source.len() as u64,
+                    )?;
+                }
+                let model = content
+                    .metadata
+                    .content_model
+                    .as_deref()
+                    .expect("validated content model");
+                library.capture_revision(
+                    wiki_id,
+                    page_id,
+                    &RevisionCapture {
+                        revision_id: content.metadata.revision_id,
+                        parent_id: content.metadata.parent_id,
+                        timestamp: &content.metadata.timestamp,
+                        author: content.metadata.user.as_deref(),
+                        author_id: content.metadata.user_id,
+                        comment: content.metadata.comment.as_deref(),
+                        minor: content.metadata.minor,
+                        upstream_sha1: content.metadata.sha1.as_deref(),
+                        content_model: model,
+                        source: &content.source,
+                    },
                 )?;
+                report.revisions_captured += 1;
             }
-            let model = content
-                .metadata
-                .content_model
-                .as_deref()
-                .expect("validated content model");
-            library.capture_revision(
-                wiki_id,
-                page_id,
-                &RevisionCapture {
-                    revision_id: content.metadata.revision_id,
-                    parent_id: content.metadata.parent_id,
-                    timestamp: &content.metadata.timestamp,
-                    author: content.metadata.user.as_deref(),
-                    author_id: content.metadata.user_id,
-                    comment: content.metadata.comment.as_deref(),
-                    minor: content.metadata.minor,
-                    upstream_sha1: content.metadata.sha1.as_deref(),
-                    content_model: model,
-                    source: &content.source,
-                },
-            )?;
-            report.revisions_captured += 1;
+            if let Some(collection_id) = collection_id {
+                let image_policy = library
+                    .collection_configuration(collection_id)?
+                    .ok_or(StoreError::CollectionNotConfigured(collection_id))?
+                    .image_policy;
+                report.media.merge(
+                    capture_revision_media(
+                        client,
+                        library,
+                        wiki_id,
+                        collection_id,
+                        page_id,
+                        metadata.revision_id,
+                        image_policy,
+                    )
+                    .await?,
+                );
+            }
         }
 
         if complete {
@@ -1129,12 +1371,14 @@ pub async fn bootstrap_collection(
     let mut current = CaptureReport {
         pages: Vec::new(),
         missing_titles: Vec::new(),
+        media: MediaCaptureReport::default(),
     };
     let mut history = HistoryCaptureReport {
         batches: 0,
         revisions_enumerated: 0,
         revisions_captured: 0,
         revisions_reused: 0,
+        media: MediaCaptureReport::default(),
     };
     let mut search_index = SqliteSearchIndex::open(library)?;
     while let Some(job) = library.claim_next_sync_job(run_id)? {
@@ -1142,6 +1386,7 @@ pub async fn bootstrap_collection(
             (
                 Option<CapturedPage>,
                 Option<PageTitle>,
+                MediaCaptureReport,
                 HistoryCaptureReport,
             ),
             CaptureError,
@@ -1163,15 +1408,17 @@ pub async fn bootstrap_collection(
                 PageHeadResolution::Missing { .. } => Ok((
                     None,
                     Some(member.title),
+                    MediaCaptureReport::default(),
                     HistoryCaptureReport {
                         batches: 0,
                         revisions_enumerated: 0,
                         revisions_captured: 0,
                         revisions_reused: 0,
+                        media: MediaCaptureReport::default(),
                     },
                 )),
                 PageHeadResolution::Found(page) => {
-                    let captured = capture_resolved_page_head(
+                    let (captured, media) = capture_resolved_page_head(
                         client,
                         library,
                         &mut search_index,
@@ -1189,20 +1436,22 @@ pub async fn bootstrap_collection(
                         configuration.history_policy,
                     )
                     .await?;
-                    Ok((Some(captured), None, page_history))
+                    Ok((Some(captured), None, media, page_history))
                 }
             }
         }
         .await;
         match result {
-            Ok((captured, missing, page_history)) => {
+            Ok((captured, missing, current_media, page_history)) => {
                 library.complete_sync_job(job.job_id)?;
                 current.pages.extend(captured);
                 current.missing_titles.extend(missing);
+                current.media.merge(current_media);
                 history.batches += page_history.batches;
                 history.revisions_enumerated += page_history.revisions_enumerated;
                 history.revisions_captured += page_history.revisions_captured;
                 history.revisions_reused += page_history.revisions_reused;
+                history.media.merge(page_history.media);
             }
             Err(error) => {
                 let retryable = error.is_retryable();
@@ -1374,6 +1623,7 @@ pub async fn reconcile_collection_heads_with_limits_and_cancellation(
         revisions_enumerated: 0,
         revisions_captured: 0,
         revisions_reused: 0,
+        media: MediaCaptureReport::default(),
     };
     loop {
         check_cancellation(cancellation)?;
@@ -1417,6 +1667,7 @@ pub async fn reconcile_collection_heads_with_limits_and_cancellation(
                 report.revisions_enumerated += page_report.revisions_enumerated;
                 report.revisions_captured += page_report.revisions_captured;
                 report.revisions_reused += page_report.revisions_reused;
+                report.media.merge(page_report.media);
             }
             Err(CaptureError::Cancelled) => return Err(CaptureError::Cancelled),
             Err(error) => {
@@ -1507,6 +1758,23 @@ async fn reconcile_page_head(
             .await?;
         }
     }
+
+    let image_policy = library
+        .collection_configuration(collection_id)?
+        .ok_or(StoreError::CollectionNotConfigured(collection_id))?
+        .image_policy;
+    report.media.merge(
+        capture_revision_media(
+            client,
+            library,
+            wiki_id,
+            collection_id,
+            page.page_id,
+            head.revision_id,
+            image_policy,
+        )
+        .await?,
+    );
 
     // Head and search-index advancement form one bounded completion boundary.
     // Do not observe cancellation between them and expose a half-updated page.
@@ -1623,6 +1891,23 @@ async fn stream_forward_gap(
                 report.revisions_captured += 1;
                 check_cancellation(cancellation)?;
             }
+            let image_policy = library
+                .collection_configuration(collection_id)?
+                .ok_or(StoreError::CollectionNotConfigured(collection_id))?
+                .image_policy;
+            report.media.merge(
+                capture_revision_media(
+                    client,
+                    library,
+                    wiki_id,
+                    collection_id,
+                    page_id,
+                    metadata.revision_id,
+                    image_policy,
+                )
+                .await?,
+            );
+            check_cancellation(cancellation)?;
             previous_revision = metadata.revision_id;
             if metadata.revision_id == remote_head.revision_id {
                 if metadata.parent_id != remote_head.parent_id

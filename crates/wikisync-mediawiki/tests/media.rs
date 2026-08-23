@@ -257,6 +257,22 @@ async fn rejects_cross_origin_redirect_before_contacting_destination() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn rejects_same_host_redirect_to_a_different_port_before_contact() {
+    let server = FixtureServer::start(vec![FixtureResponse::redirect(
+        "http://127.0.0.1:9/private.jpg?secret=token".to_owned(),
+    )]);
+    let thumbnail_url = server.endpoint().replace("/w/api.php", "/thumb.jpg");
+    let client = client(&server);
+    let error = client
+        .download_thumbnail(&metadata(thumbnail_url), policy(1, 32))
+        .await
+        .expect_err("port-changing redirect must fail closed");
+    assert_eq!(error, ThumbnailDownloadError::UrlRejected);
+    assert!(!error.to_string().contains("secret"));
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn enforces_declared_per_image_and_shared_run_byte_limits() {
     let oversized_server = FixtureServer::start(vec![FixtureResponse::json("0123456789")]);
     let thumbnail_url = oversized_server

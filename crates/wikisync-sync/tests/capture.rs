@@ -2,8 +2,8 @@ mod support;
 
 use support::{FixtureResponse, FixtureServer};
 use wikisync_core::{
-    CollectionBudget, CollectionRemovalPolicy, CollectionRule, HistoryPolicy, InclusionReason,
-    PageId, PageTitle, RevisionId, TitleSelection,
+    CollectionBudget, CollectionRemovalPolicy, CollectionRule, HistoryPolicy, ImagePolicy,
+    InclusionReason, PageId, PageTitle, RevisionId, ThumbnailPolicy, TitleSelection,
 };
 use wikisync_mediawiki::{ClientConfig, MediaWikiClient};
 use wikisync_search::{SearchIndex, SearchQuery, SqliteSearchIndex};
@@ -67,6 +67,41 @@ const RECONCILIATION_MISSING_PAGE: &str =
     include_str!("../../../fixtures/mediawiki/reconciliation-missing-page.json");
 const RECONCILIATION_REVISIONS_FROM_MIDDLE: &str =
     include_str!("../../../fixtures/mediawiki/reconciliation-revisions-from-middle.json");
+const REVISION_IMAGES: &str = r#"
+{"parse":{"pageid":25357340,"revid":1300000001,"images":["Fixture.png"]}}
+"#;
+const THUMBNAIL_METADATA: &str = r#"
+{
+  "query": {
+    "pages": [{
+      "pageid": 9001,
+      "ns": 6,
+      "title": "File:Fixture.png",
+      "imageinfo": [{
+        "sha1": "abcdef0123456789abcdef0123456789",
+        "mime": "image/png",
+        "thumburl": "{{ENDPOINT}}?fixture-thumbnail=1",
+        "thumbwidth": 1,
+        "thumbheight": 1,
+        "descriptionurl": "{{ENDPOINT}}?fixture-description=1",
+        "extmetadata": {
+          "Artist": {"value": "Fixture photographer"},
+          "Credit": {"value": "Fixture photographer / fixture source"},
+          "LicenseShortName": {"value": "CC BY-SA 4.0"},
+          "LicenseUrl": {"value": "https://creativecommons.org/licenses/by-sa/4.0/"}
+        }
+      }]
+    }]
+  }
+}
+"#;
+const VALID_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5, 0x1c, 0x0c,
+    0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64, 0xf8, 0x0f, 0x00,
+    0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+    0xae, 0x42, 0x60, 0x82,
+];
 
 #[tokio::test(flavor = "multi_thread")]
 async fn category_preview_handles_continuation_recursion_cycles_and_deduplication() {
@@ -262,6 +297,80 @@ async fn explicit_title_capture_is_durable_and_idempotent() {
     assert_eq!(requests.len(), 4);
     assert!(requests[0].contains("titles=Definitely+missing"));
     assert!(requests[1].contains("rvstartid=1300000001"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn thumbnail_policy_captures_validated_attributed_media_after_text() {
+    let server = FixtureServer::start(vec![
+        FixtureResponse::json(TITLE_RESOLUTION),
+        FixtureResponse::json(REVISION_CONTENT),
+        FixtureResponse::json(REVISION_IMAGES),
+        FixtureResponse::json(THUMBNAIL_METADATA),
+        FixtureResponse::bytes(VALID_PNG.to_vec(), "image/png"),
+        FixtureResponse::json(TITLE_RESOLUTION),
+        FixtureResponse::json(REVISION_CONTENT),
+        FixtureResponse::json(REVISION_IMAGES),
+    ]);
+    let client = MediaWikiClient::new(
+        ClientConfig::new(server.endpoint(), "WikiSyncer/0.1 thumbnail-sync-test")
+            .expect("client configuration"),
+    )
+    .expect("client");
+    let directory = tempfile::tempdir().expect("temporary library");
+    let mut library = Library::open(directory.path()).expect("library");
+    let wiki_id = library
+        .register_wiki(server.endpoint(), "en")
+        .expect("wiki");
+    let collection_id = library
+        .create_explicit_collection(wiki_id, "Fixture pages")
+        .expect("collection");
+    library
+        .set_collection_image_policy(
+            collection_id,
+            ImagePolicy::Thumbnails(ThumbnailPolicy::new(64, 2, 1024).expect("thumbnail policy")),
+        )
+        .expect("enable thumbnails");
+    let selection =
+        TitleSelection::new([PageTitle::new("Rust_programming_language").expect("title")])
+            .expect("selection");
+
+    let first = capture_explicit_titles(&client, &mut library, wiki_id, collection_id, &selection)
+        .await
+        .expect("capture with media");
+    assert_eq!(first.media.placements_discovered, 1);
+    assert_eq!(first.media.placements_captured, 1);
+    assert!(first.media.failures.is_empty());
+    let media = library
+        .revision_media(wiki_id, first.pages[0].revision_id)
+        .expect("revision media");
+    assert_eq!(media.len(), 1);
+    assert_eq!(media[0].author, "Fixture photographer");
+    assert_eq!(
+        media[0].attribution,
+        "Fixture photographer / fixture source"
+    );
+    assert_eq!(media[0].license_name, "CC BY-SA 4.0");
+    assert_eq!(
+        library
+            .read_object(media[0].content_object_id)
+            .expect("thumbnail object"),
+        VALID_PNG
+    );
+
+    let second = capture_explicit_titles(&client, &mut library, wiki_id, collection_id, &selection)
+        .await
+        .expect("idempotent media capture");
+    assert_eq!(second.media.placements_discovered, 1);
+    assert_eq!(second.media.placements_reused, 1);
+    assert_eq!(second.media.placements_captured, 0);
+    assert!(second.media.failures.is_empty());
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 8);
+    assert!(requests[2].contains("action=parse"));
+    assert!(requests[3].contains("prop=imageinfo"));
+    assert!(requests[4].contains("fixture-thumbnail=1"));
+    assert!(requests[7].contains("action=parse"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

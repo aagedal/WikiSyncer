@@ -42,8 +42,10 @@ const MIGRATION_12: &str = include_str!("../migrations/0012_thumbnail_media.sql"
 const OBJECT_DOMAIN: &[u8] = b"wikisync-object-v1\0";
 const DATABASE_NAME: &str = "library.sqlite3";
 const MANIFEST_DOMAIN: &[u8] = b"wikisync-manifest-v1\0";
+const MANIFEST_MEDIA_DOMAIN: &[u8] = b"wikisync-manifest-media-v1\0";
+const MANIFEST_MEDIA_PLACEMENT_DOMAIN: &[u8] = b"wikisync-manifest-media-placement-v1\0";
 const MANIFEST_DIRECTORY: &str = "manifests";
-const MANIFEST_SCHEMA_VERSION: u32 = 1;
+const MANIFEST_SCHEMA_VERSION: u32 = 2;
 const MANIFEST_FILENAME_DIGITS: usize = 12;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MANIFEST_ENTRIES: usize = 100_000;
@@ -425,6 +427,47 @@ pub struct ManifestPageHead {
     pub revision_id: Option<RevisionId>,
 }
 
+/// One immutable captured media rendition authenticated by a media-aware manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestMedia {
+    /// Stable MediaWiki file-page identity.
+    pub media_id: MediaId,
+    /// Exact upstream identity for the captured file version.
+    pub source_sha1: String,
+    /// Immutable canonical raster identity.
+    pub content_object_id: ObjectId,
+    /// Domain-separated identity of all durable source, attribution, raster, and
+    /// capture-time metadata for this rendition.
+    pub metadata_identity: String,
+}
+
+/// One revision-specific media placement authenticated by a media-aware manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestMediaPlacement {
+    /// Owning immutable article revision.
+    pub revision_id: RevisionId,
+    /// Stable zero-based order within that revision.
+    pub placement_index: u32,
+    /// Stable MediaWiki file-page identity.
+    pub media_id: MediaId,
+    /// Exact upstream identity for the captured file version.
+    pub source_sha1: String,
+    /// Immutable canonical raster identity selected by the placement.
+    pub content_object_id: ObjectId,
+    /// Domain-separated identity of the placement kind, caption, alt text, and
+    /// selected media identity.
+    pub placement_identity: String,
+}
+
+/// Complete bounded media inventory and revision-placement snapshot for one scope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestMediaSnapshot {
+    /// Captured renditions in stable media/version/object order.
+    pub inventory: Vec<ManifestMedia>,
+    /// Revision placements in stable revision/index order.
+    pub placements: Vec<ManifestMediaPlacement>,
+}
+
 /// Parsed, validated contents of one predecessor-linked synchronization manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncManifest {
@@ -452,6 +495,9 @@ pub struct SyncManifest {
     pub introduced_revisions: Vec<ManifestRevision>,
     /// Resulting page heads in stable page-ID order.
     pub page_heads: Vec<ManifestPageHead>,
+    /// Complete media state for this run scope. `None` means this is a readable
+    /// schema-v1 manifest that predates authenticated media coverage.
+    pub media_snapshot: Option<ManifestMediaSnapshot>,
 }
 
 /// One durably installed and identity-verified manifest.
@@ -485,6 +531,10 @@ struct ManifestBody {
     configuration_hash: String,
     introduced_revisions: Vec<ManifestRevisionWire>,
     page_heads: Vec<ManifestPageHeadWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    media_inventory: Option<Vec<ManifestMediaWire>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    media_placements: Option<Vec<ManifestMediaPlacementWire>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -498,6 +548,56 @@ struct ManifestRevisionWire {
 struct ManifestPageHeadWire {
     page_id: u64,
     revision_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ManifestMediaWire {
+    media_id: u64,
+    source_sha1: String,
+    content_object_id: String,
+    metadata_identity: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ManifestMediaPlacementWire {
+    revision_id: u64,
+    placement_index: u32,
+    media_id: u64,
+    source_sha1: String,
+    content_object_id: String,
+    placement_identity: String,
+}
+
+#[derive(Serialize)]
+struct ManifestMediaIdentityBody<'a> {
+    wiki_id: u64,
+    media_id: u64,
+    source_sha1: &'a str,
+    content_object_id: &'a str,
+    file_title: &'a str,
+    original_url: &'a str,
+    description_url: &'a str,
+    author: &'a str,
+    attribution: &'a str,
+    license_name: &'a str,
+    license_url: Option<&'a str>,
+    width: i64,
+    height: i64,
+    mime_type: &'a str,
+    captured_at: i64,
+}
+
+#[derive(Serialize)]
+struct ManifestMediaPlacementIdentityBody<'a> {
+    wiki_id: u64,
+    revision_id: u64,
+    placement_index: u32,
+    media_id: u64,
+    source_sha1: &'a str,
+    content_object_id: &'a str,
+    placement_kind: &'a str,
+    caption: Option<&'a str>,
+    alt_text: Option<&'a str>,
 }
 
 type ManifestConfigurationRow = (
@@ -2839,6 +2939,17 @@ impl Library {
                  AND revisions.page_id = members.page_id
                 WHERE members.collection_id = ?1
                   AND members.membership_state = 'active'
+                UNION
+                SELECT placements.content_object_id
+                FROM collection_resolved_members AS members
+                JOIN revisions
+                  ON revisions.wiki_id = members.wiki_id
+                 AND revisions.page_id = members.page_id
+                JOIN page_media AS placements
+                  ON placements.wiki_id = revisions.wiki_id
+                 AND placements.revision_id = revisions.revision_id
+                WHERE members.collection_id = ?1
+                  AND members.membership_state = 'active'
              )",
             [raw_collection_id],
             |row| row.get(0),
@@ -3660,6 +3771,7 @@ impl Library {
         introduced_revisions
             .retain(|revision| candidate_revision_ids.contains(&revision.revision_id));
         let page_heads = self.manifest_page_heads(status.wiki_id, status.collection_id)?;
+        let media_snapshot = self.manifest_media_snapshot(status.wiki_id, status.collection_id)?;
         let sequence = prior.last().map_or(Ok(1_u64), |stored| {
             stored
                 .manifest
@@ -3681,6 +3793,7 @@ impl Library {
             configuration_hash,
             introduced_revisions,
             page_heads,
+            media_snapshot: Some(media_snapshot),
         };
         let (id, bytes) = encode_manifest(&manifest)?;
         let path = self.manifest_path(sequence)?;
@@ -3944,6 +4057,203 @@ impl Library {
             }
         }
         Ok(heads)
+    }
+
+    /// Returns the complete bounded media inventory represented by a manifest for
+    /// the given source or collection scope.
+    ///
+    /// Collection snapshots include media reachable from every retained resolved
+    /// member revision, matching the revision-catalog scope used by manifests.
+    pub fn manifest_media_snapshot(
+        &self,
+        wiki_id: WikiId,
+        collection_id: Option<CollectionId>,
+    ) -> Result<ManifestMediaSnapshot, StoreError> {
+        let raw_wiki_id = to_sql_integer(wiki_id.get())?;
+        let raw_collection_id = collection_id
+            .map(|id| to_sql_integer(id.get()))
+            .transpose()?;
+        let placement_sql = if collection_id.is_some() {
+            "SELECT placement.revision_id, placement.placement_index,
+                    placement.source_media_id, placement.source_sha1,
+                    placement.content_object_id, placement.placement_kind,
+                    placement.caption, placement.alt_text
+             FROM page_media AS placement
+             JOIN revisions AS revision
+               ON revision.wiki_id = placement.wiki_id
+              AND revision.revision_id = placement.revision_id
+             JOIN collection_resolved_members AS member
+               ON member.wiki_id = revision.wiki_id
+              AND member.page_id = revision.page_id
+             WHERE member.collection_id = ?2 AND placement.wiki_id = ?1
+             ORDER BY placement.revision_id, placement.placement_index"
+        } else {
+            "SELECT placement.revision_id, placement.placement_index,
+                    placement.source_media_id, placement.source_sha1,
+                    placement.content_object_id, placement.placement_kind,
+                    placement.caption, placement.alt_text
+             FROM page_media AS placement
+             WHERE placement.wiki_id = ?1 AND ?2 IS NULL
+             ORDER BY placement.revision_id, placement.placement_index"
+        };
+        let mut placement_statement = self.connection.prepare(placement_sql)?;
+        let placement_rows =
+            placement_statement.query_map(params![raw_wiki_id, raw_collection_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            })?;
+        let mut placements = Vec::new();
+        for row in placement_rows {
+            let (revision_id, index, media_id, source_sha1, object_id, kind, caption, alt_text) =
+                row?;
+            let parsed_revision_id: RevisionId =
+                sql_id(revision_id, "invalid manifest media revision ID")?;
+            let placement_index = u32::try_from(index)
+                .map_err(|_| StoreError::CorruptMetadata("invalid manifest placement index"))?;
+            let parsed_media_id: MediaId = sql_id(media_id, "invalid manifest media ID")?;
+            let parsed_object_id = object_id
+                .parse()
+                .map_err(|_| StoreError::CorruptMetadata("invalid manifest media object ID"))?;
+            let identity = manifest_record_identity(
+                MANIFEST_MEDIA_PLACEMENT_DOMAIN,
+                &ManifestMediaPlacementIdentityBody {
+                    wiki_id: wiki_id.get(),
+                    revision_id: parsed_revision_id.get(),
+                    placement_index,
+                    media_id: parsed_media_id.get(),
+                    source_sha1: &source_sha1,
+                    content_object_id: &object_id,
+                    placement_kind: &kind,
+                    caption: caption.as_deref(),
+                    alt_text: alt_text.as_deref(),
+                },
+            )?;
+            placements.push(ManifestMediaPlacement {
+                revision_id: parsed_revision_id,
+                placement_index,
+                media_id: parsed_media_id,
+                source_sha1,
+                content_object_id: parsed_object_id,
+                placement_identity: identity,
+            });
+            if placements.len() > MAX_MANIFEST_ENTRIES {
+                return Err(StoreError::ManifestLimitExceeded);
+            }
+        }
+
+        let inventory_sql = if collection_id.is_some() {
+            "SELECT DISTINCT media.source_media_id, media.source_sha1,
+                    media.content_object_id, media.file_title, media.original_url,
+                    media.description_url, media.author, media.attribution,
+                    media.license_name, media.license_url, media.width, media.height,
+                    media.mime_type, media.captured_at
+             FROM media
+             JOIN page_media AS placement
+               ON placement.wiki_id = media.wiki_id
+              AND placement.source_media_id = media.source_media_id
+              AND placement.source_sha1 = media.source_sha1
+              AND placement.content_object_id = media.content_object_id
+             JOIN revisions AS revision
+               ON revision.wiki_id = placement.wiki_id
+              AND revision.revision_id = placement.revision_id
+             JOIN collection_resolved_members AS member
+               ON member.wiki_id = revision.wiki_id
+              AND member.page_id = revision.page_id
+             WHERE member.collection_id = ?2 AND media.wiki_id = ?1
+             ORDER BY media.source_media_id, media.source_sha1, media.content_object_id"
+        } else {
+            "SELECT media.source_media_id, media.source_sha1,
+                    media.content_object_id, media.file_title, media.original_url,
+                    media.description_url, media.author, media.attribution,
+                    media.license_name, media.license_url, media.width, media.height,
+                    media.mime_type, media.captured_at
+             FROM media WHERE media.wiki_id = ?1 AND ?2 IS NULL
+             ORDER BY media.source_media_id, media.source_sha1, media.content_object_id"
+        };
+        let mut inventory_statement = self.connection.prepare(inventory_sql)?;
+        let inventory_rows =
+            inventory_statement.query_map(params![raw_wiki_id, raw_collection_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, i64>(13)?,
+                ))
+            })?;
+        let mut inventory = Vec::new();
+        for row in inventory_rows {
+            let (
+                media_id,
+                source_sha1,
+                object_id,
+                file_title,
+                original_url,
+                description_url,
+                author,
+                attribution,
+                license_name,
+                license_url,
+                width,
+                height,
+                mime_type,
+                captured_at,
+            ) = row?;
+            let parsed_media_id: MediaId = sql_id(media_id, "invalid manifest media ID")?;
+            let parsed_object_id = object_id
+                .parse()
+                .map_err(|_| StoreError::CorruptMetadata("invalid manifest media object ID"))?;
+            let identity = manifest_record_identity(
+                MANIFEST_MEDIA_DOMAIN,
+                &ManifestMediaIdentityBody {
+                    wiki_id: wiki_id.get(),
+                    media_id: parsed_media_id.get(),
+                    source_sha1: &source_sha1,
+                    content_object_id: &object_id,
+                    file_title: &file_title,
+                    original_url: &original_url,
+                    description_url: &description_url,
+                    author: &author,
+                    attribution: &attribution,
+                    license_name: &license_name,
+                    license_url: license_url.as_deref(),
+                    width,
+                    height,
+                    mime_type: &mime_type,
+                    captured_at,
+                },
+            )?;
+            inventory.push(ManifestMedia {
+                media_id: parsed_media_id,
+                source_sha1,
+                content_object_id: parsed_object_id,
+                metadata_identity: identity,
+            });
+            if inventory.len() > MAX_MANIFEST_ENTRIES {
+                return Err(StoreError::ManifestLimitExceeded);
+            }
+        }
+        Ok(ManifestMediaSnapshot {
+            inventory,
+            placements,
+        })
     }
 
     /// Makes canonical bytes durable, then atomically records their page and revision.
@@ -7991,6 +8301,17 @@ fn commit_preview_transaction(
              AND revisions.page_id = members.page_id
             WHERE members.collection_id = ?1
               AND members.membership_state = 'active'
+            UNION
+            SELECT placements.content_object_id
+            FROM collection_resolved_members AS members
+            JOIN revisions
+              ON revisions.wiki_id = members.wiki_id
+             AND revisions.page_id = members.page_id
+            JOIN page_media AS placements
+              ON placements.wiki_id = revisions.wiki_id
+             AND placements.revision_id = revisions.revision_id
+            WHERE members.collection_id = ?1
+              AND members.membership_state = 'active'
          )",
         [raw_collection_id],
         |row| row.get(0),
@@ -8579,6 +8900,40 @@ fn to_sql_integer(value: u64) -> Result<i64, StoreError> {
 
 fn encode_manifest(manifest: &SyncManifest) -> Result<(ManifestId, Vec<u8>), StoreError> {
     validate_manifest(manifest)?;
+    let (media_inventory, media_placements) =
+        manifest
+            .media_snapshot
+            .as_ref()
+            .map_or((None, None), |snapshot| {
+                (
+                    Some(
+                        snapshot
+                            .inventory
+                            .iter()
+                            .map(|media| ManifestMediaWire {
+                                media_id: media.media_id.get(),
+                                source_sha1: media.source_sha1.clone(),
+                                content_object_id: media.content_object_id.to_string(),
+                                metadata_identity: media.metadata_identity.clone(),
+                            })
+                            .collect(),
+                    ),
+                    Some(
+                        snapshot
+                            .placements
+                            .iter()
+                            .map(|placement| ManifestMediaPlacementWire {
+                                revision_id: placement.revision_id.get(),
+                                placement_index: placement.placement_index,
+                                media_id: placement.media_id.get(),
+                                source_sha1: placement.source_sha1.clone(),
+                                content_object_id: placement.content_object_id.to_string(),
+                                placement_identity: placement.placement_identity.clone(),
+                            })
+                            .collect(),
+                    ),
+                )
+            });
     let body = ManifestBody {
         schema_version: MANIFEST_SCHEMA_VERSION,
         sequence: manifest.sequence,
@@ -8608,6 +8963,8 @@ fn encode_manifest(manifest: &SyncManifest) -> Result<(ManifestId, Vec<u8>), Sto
                 revision_id: head.revision_id.map(RevisionId::get),
             })
             .collect(),
+        media_inventory,
+        media_placements,
     };
     let canonical_body = serde_json::to_vec(&body)
         .map_err(|_| StoreError::InvalidManifest("manifest body could not be serialized"))?;
@@ -8630,7 +8987,7 @@ fn decode_manifest(sequence: u64, bytes: &[u8]) -> Result<StoredManifest, StoreE
             sequence,
             message: "manifest is not valid schema-v1 JSON",
         })?;
-    if envelope.body.schema_version != MANIFEST_SCHEMA_VERSION {
+    if !matches!(envelope.body.schema_version, 1 | MANIFEST_SCHEMA_VERSION) {
         return Err(StoreError::CorruptManifest {
             sequence,
             message: "unsupported manifest schema version",
@@ -8674,6 +9031,16 @@ fn decode_manifest(sequence: u64, bytes: &[u8]) -> Result<StoredManifest, StoreE
     }
     if envelope.body.introduced_revisions.len() > MAX_MANIFEST_ENTRIES
         || envelope.body.page_heads.len() > MAX_MANIFEST_ENTRIES
+        || envelope
+            .body
+            .media_inventory
+            .as_ref()
+            .is_some_and(|entries| entries.len() > MAX_MANIFEST_ENTRIES)
+        || envelope
+            .body
+            .media_placements
+            .as_ref()
+            .is_some_and(|entries| entries.len() > MAX_MANIFEST_ENTRIES)
     {
         return Err(StoreError::CorruptManifest {
             sequence,
@@ -8728,6 +9095,73 @@ fn decode_manifest(sequence: u64, bytes: &[u8]) -> Result<StoredManifest, StoreE
                 })?,
         });
     }
+    let media_snapshot = match (
+        envelope.body.media_inventory,
+        envelope.body.media_placements,
+    ) {
+        (None, None) if envelope.body.schema_version == 1 => None,
+        (Some(inventory), Some(placements)) if envelope.body.schema_version == 2 => {
+            let inventory = inventory
+                .into_iter()
+                .map(|media| {
+                    Ok(ManifestMedia {
+                        media_id: MediaId::new(media.media_id).map_err(|_| {
+                            StoreError::CorruptManifest {
+                                sequence,
+                                message: "manifest media ID is invalid",
+                            }
+                        })?,
+                        source_sha1: media.source_sha1,
+                        content_object_id: media.content_object_id.parse().map_err(|_| {
+                            StoreError::CorruptManifest {
+                                sequence,
+                                message: "manifest media object ID is invalid",
+                            }
+                        })?,
+                        metadata_identity: media.metadata_identity,
+                    })
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            let placements = placements
+                .into_iter()
+                .map(|placement| {
+                    Ok(ManifestMediaPlacement {
+                        revision_id: RevisionId::new(placement.revision_id).map_err(|_| {
+                            StoreError::CorruptManifest {
+                                sequence,
+                                message: "manifest media revision ID is invalid",
+                            }
+                        })?,
+                        placement_index: placement.placement_index,
+                        media_id: MediaId::new(placement.media_id).map_err(|_| {
+                            StoreError::CorruptManifest {
+                                sequence,
+                                message: "manifest placement media ID is invalid",
+                            }
+                        })?,
+                        source_sha1: placement.source_sha1,
+                        content_object_id: placement.content_object_id.parse().map_err(|_| {
+                            StoreError::CorruptManifest {
+                                sequence,
+                                message: "manifest placement object ID is invalid",
+                            }
+                        })?,
+                        placement_identity: placement.placement_identity,
+                    })
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            Some(ManifestMediaSnapshot {
+                inventory,
+                placements,
+            })
+        }
+        _ => {
+            return Err(StoreError::CorruptManifest {
+                sequence,
+                message: "manifest schema and media coverage fields disagree",
+            });
+        }
+    };
     let manifest = SyncManifest {
         sequence,
         predecessor,
@@ -8757,6 +9191,7 @@ fn decode_manifest(sequence: u64, bytes: &[u8]) -> Result<StoredManifest, StoreE
         configuration_hash: envelope.body.configuration_hash,
         introduced_revisions,
         page_heads,
+        media_snapshot,
     };
     validate_manifest(&manifest).map_err(|_| StoreError::CorruptManifest {
         sequence,
@@ -8786,6 +9221,10 @@ fn validate_manifest(manifest: &SyncManifest) -> Result<(), StoreError> {
         .map_err(|_| StoreError::InvalidManifest("configuration hash is invalid"))?;
     if manifest.introduced_revisions.len() > MAX_MANIFEST_ENTRIES
         || manifest.page_heads.len() > MAX_MANIFEST_ENTRIES
+        || manifest.media_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.inventory.len() > MAX_MANIFEST_ENTRIES
+                || snapshot.placements.len() > MAX_MANIFEST_ENTRIES
+        })
     {
         return Err(StoreError::ManifestLimitExceeded);
     }
@@ -8807,7 +9246,62 @@ fn validate_manifest(manifest: &SyncManifest) -> Result<(), StoreError> {
             "page heads are not strictly ordered",
         ));
     }
+    if let Some(snapshot) = &manifest.media_snapshot {
+        if snapshot.inventory.windows(2).any(|pair| {
+            (
+                &pair[0].media_id,
+                &pair[0].source_sha1,
+                pair[0].content_object_id,
+            ) >= (
+                &pair[1].media_id,
+                &pair[1].source_sha1,
+                pair[1].content_object_id,
+            )
+        }) {
+            return Err(StoreError::InvalidManifest(
+                "media inventory is not strictly ordered",
+            ));
+        }
+        if snapshot.placements.windows(2).any(|pair| {
+            (pair[0].revision_id, pair[0].placement_index)
+                >= (pair[1].revision_id, pair[1].placement_index)
+        }) {
+            return Err(StoreError::InvalidManifest(
+                "media placements are not strictly ordered",
+            ));
+        }
+        for media in &snapshot.inventory {
+            validate_manifest_text(&media.source_sha1)?;
+            validate_blake3_identity(&media.metadata_identity)?;
+        }
+        for placement in &snapshot.placements {
+            validate_manifest_text(&placement.source_sha1)?;
+            validate_blake3_identity(&placement.placement_identity)?;
+            if placement.placement_index >= MAX_THUMBNAILS_PER_REVISION {
+                return Err(StoreError::InvalidManifest(
+                    "manifest media placement index exceeds bounds",
+                ));
+            }
+        }
+    }
     Ok(())
+}
+
+fn manifest_record_identity<T: Serialize>(domain: &[u8], body: &T) -> Result<String, StoreError> {
+    let bytes = serde_json::to_vec(body)
+        .map_err(|_| StoreError::InvalidManifest("media identity could not be serialized"))?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(&bytes);
+    Ok(format!("b3:{}", hasher.finalize().to_hex()))
+}
+
+fn validate_blake3_identity(value: &str) -> Result<(), StoreError> {
+    value
+        .parse::<ManifestId>()
+        .map(|_| ())
+        .map_err(|_| StoreError::InvalidManifest("media record identity is invalid"))
 }
 
 fn validate_manifest_text(value: &str) -> Result<(), StoreError> {
@@ -13133,6 +13627,101 @@ mod tests {
             serde_json::to_vec(&serde_json::from_slice::<ManifestEnvelope>(&bytes).unwrap())
                 .unwrap(),
             bytes
+        );
+    }
+
+    #[test]
+    fn media_aware_manifest_is_deterministic_and_schema_v1_remains_readable() {
+        let (directory, mut library, media_object_id) = integrity_media_fixture();
+        let wiki_id = WikiId::new(1).expect("wiki ID");
+        let collection_id = CollectionId::new(1).expect("collection ID");
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 100)
+            .expect("start run")
+            .status
+            .run_id;
+        library
+            .complete_sync_run(run_id, None)
+            .expect("complete run");
+        let stored = library
+            .append_sync_manifest(run_id)
+            .expect("append manifest");
+        let snapshot = stored
+            .manifest
+            .media_snapshot
+            .as_ref()
+            .expect("schema-v2 media snapshot");
+        assert_eq!(snapshot.inventory.len(), 1);
+        assert_eq!(snapshot.placements.len(), 1);
+        assert_eq!(snapshot.inventory[0].content_object_id, media_object_id);
+        assert_eq!(snapshot.placements[0].content_object_id, media_object_id);
+        assert_eq!(
+            snapshot,
+            &library
+                .manifest_media_snapshot(wiki_id, Some(collection_id))
+                .expect("reproduce deterministic snapshot")
+        );
+
+        let path = directory.path().join("manifests/000000000001.json");
+        let bytes = fs::read(&path).expect("manifest bytes");
+        let mut legacy: ManifestEnvelope = serde_json::from_slice(&bytes).expect("manifest JSON");
+        legacy.body.schema_version = 1;
+        legacy.body.media_inventory = None;
+        legacy.body.media_placements = None;
+        let canonical_body = serde_json::to_vec(&legacy.body).expect("legacy body");
+        legacy.manifest_id = ManifestId::for_body(&canonical_body).to_string();
+        fs::write(&path, serde_json::to_vec(&legacy).expect("legacy manifest"))
+            .expect("install legacy fixture");
+        let legacy = library.read_manifest(1).expect("read schema-v1 manifest");
+        assert!(legacy.manifest.media_snapshot.is_none());
+        assert_eq!(legacy.manifest.introduced_revisions.len(), 1);
+        assert_eq!(legacy.manifest.page_heads.len(), 1);
+    }
+
+    #[test]
+    fn collection_usage_counts_distinct_active_revision_media_objects_once() {
+        let (_directory, mut library, _media_object_id) = integrity_media_fixture();
+        let wiki_id = WikiId::new(1).expect("wiki ID");
+        let collection_id = CollectionId::new(1).expect("collection ID");
+        let file_title = PageTitle::new("File:Integrity.png").expect("file title");
+        let capture = ThumbnailCapture {
+            media_id: MediaId::new(9001).expect("media ID"),
+            file_title: &file_title,
+            source_sha1: "abcdef0123456789abcdef0123456789",
+            original_url: "https://upload.wikimedia.org/integrity.png",
+            description_url: "https://commons.wikimedia.org/wiki/File:Integrity.png",
+            author: "Fixture photographer",
+            attribution: "Fixture photographer / Wikimedia Commons",
+            license_name: "CC BY-SA 4.0",
+            license_url: Some("https://creativecommons.org/licenses/by-sa/4.0/"),
+            width: 1,
+            height: 1,
+            mime_type: ThumbnailMimeType::Png,
+            captured_at: 1_776_000_000,
+            source: VALID_PNG,
+        };
+        library
+            .capture_revision_thumbnail(
+                wiki_id,
+                PageId::new(41).expect("page ID"),
+                RevisionId::new(410).expect("revision ID"),
+                ThumbnailPolicy::new(640, 8, 1024).expect("thumbnail policy"),
+                &capture,
+                RevisionMediaPlacement {
+                    index: 1,
+                    kind: MediaPlacementKind::Inline,
+                    caption: Some("Same bytes, second placement"),
+                    alt_text: None,
+                },
+            )
+            .expect("link shared media object twice");
+
+        let estimate = library
+            .collection_estimate(collection_id)
+            .expect("collection usage");
+        assert_eq!(
+            estimate.current_canonical_bytes,
+            "Integrity media article".len() as u64 + VALID_PNG.len() as u64
         );
     }
 

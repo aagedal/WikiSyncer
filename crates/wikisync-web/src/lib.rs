@@ -7,6 +7,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::{Path as RoutePath, Query, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
@@ -17,10 +18,12 @@ use axum::routing::get;
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, html};
 use serde::Deserialize;
-use wikisync_content::{DiffMode, DiffTag, diff, to_markdown, to_plain_text};
+use wikisync_content::{
+    DiffMode, DiffTag, ThumbnailLimits, diff, to_markdown, to_plain_text, validate_thumbnail,
+};
 use wikisync_core::{PageId, PageTitle, RevisionId, WikiId};
 use wikisync_search::{SearchIndex, SearchQuery, SqliteSearchIndex};
-use wikisync_store::{Library, StoredPage, StoredRevision};
+use wikisync_store::{Library, StoredPage, StoredRevision, StoredRevisionMedia};
 
 const CSP: &str = "default-src 'none'; style-src 'self'; img-src 'self' data:; \
     script-src 'none'; connect-src 'none'; font-src 'none'; form-action 'self'; \
@@ -106,6 +109,11 @@ button { background: var(--accent); border: 0; border-radius: .25rem; color: whi
 .diff .insert { background: var(--insert); }
 .diff del { background: color-mix(in srgb, #c22 25%, transparent); }
 .diff ins { background: color-mix(in srgb, #198a36 25%, transparent); }
+.captured-media { display: grid; gap: 1.5rem; margin: 2rem 0; }
+.captured-media figure { background: var(--surface); border: 1px solid var(--border); border-radius: .3rem; margin: 0; overflow: hidden; }
+.captured-media img { display: block; height: auto; max-height: 42rem; max-width: 100%; object-fit: contain; }
+.captured-media figcaption { border-top: 1px solid var(--border); font: .82rem ui-sans-serif, system-ui, sans-serif; padding: .7rem .85rem; }
+.captured-media figcaption p { margin: .25rem 0; }
 @media (max-width: 44rem) {
   :root { font-size: 16px; }
   .site-header-inner { align-items: flex-start; flex-direction: column; gap: .65rem; }
@@ -150,6 +158,10 @@ pub fn router(library_root: impl AsRef<Path>) -> Router {
         .route("/wiki/{*title}", get(article))
         .route("/page/{page_id}/history", get(history))
         .route("/revision/{revision_id}", get(revision))
+        .route(
+            "/media/{wiki_id}/{revision_id}/{placement_index}",
+            get(media_bytes),
+        )
         .route("/diff/{from}/{to}", get(revision_diff))
         .route("/changes", get(changes))
         .route("/collections", get(collections))
@@ -336,6 +348,11 @@ async fn article(
         &library,
     )?);
     body.push_str("</article>");
+    body.push_str(&media_figures(
+        &library,
+        page_data.wiki_id,
+        stored_revision.revision_id,
+    )?);
     body.push_str(&source_section(&page_data, &stored_revision));
     Ok(page(StatusCode::OK, page_data.title.as_str(), &body))
 }
@@ -424,8 +441,61 @@ async fn revision(
     body.push_str("<article>");
     body.push_str(&markdown_to_html(&to_markdown(&source), wiki_id, &library)?);
     body.push_str("</article>");
+    body.push_str(&media_figures(
+        &library,
+        wiki_id,
+        stored_revision.revision_id,
+    )?);
     body.push_str(&source_section(&page_data, &stored_revision));
     Ok(page(StatusCode::OK, "Captured revision", &body))
+}
+
+async fn media_bytes(
+    State(state): State<AppState>,
+    RoutePath((raw_wiki_id, raw_revision_id, placement_index)): RoutePath<(u64, u64, u32)>,
+) -> Result<Response, ReaderError> {
+    let wiki_id = WikiId::new(raw_wiki_id).map_err(ReaderError::bad_request)?;
+    let revision_id = RevisionId::new(raw_revision_id).map_err(ReaderError::bad_request)?;
+    let library = open_library(&state)?;
+    let media = library
+        .revision_media(wiki_id, revision_id)?
+        .into_iter()
+        .find(|media| media.placement_index == placement_index)
+        .ok_or_else(|| ReaderError::not_found("captured media was not found"))?;
+    let bytes = verified_media_bytes(&library, &media)?;
+    Ok(secured_binary_response(
+        StatusCode::OK,
+        media.mime_type.as_str(),
+        bytes,
+    ))
+}
+
+fn verified_media_bytes(
+    library: &Library,
+    media: &StoredRevisionMedia,
+) -> Result<Vec<u8>, ReaderError> {
+    let bytes = library.read_object(media.content_object_id)?;
+    let pixels = u64::from(media.width)
+        .checked_mul(u64::from(media.height))
+        .ok_or_else(|| ReaderError::corrupt("captured media dimensions overflowed"))?;
+    let limits = ThumbnailLimits {
+        max_encoded_bytes: u64::try_from(bytes.len())
+            .map_err(|_| ReaderError::corrupt("captured media length overflowed"))?,
+        max_width: media.width,
+        max_height: media.height,
+        max_pixels: pixels,
+        max_decoded_bytes: pixels
+            .checked_mul(8)
+            .ok_or_else(|| ReaderError::corrupt("captured media allocation overflowed"))?,
+    };
+    let validated = validate_thumbnail(&bytes, media.mime_type.as_str(), &limits)
+        .map_err(|_| ReaderError::corrupt("captured media failed passive-raster validation"))?;
+    if validated.width != media.width || validated.height != media.height {
+        return Err(ReaderError::corrupt(
+            "captured media dimensions disagree with its metadata",
+        ));
+    }
+    Ok(bytes)
 }
 
 async fn revision_diff(
@@ -764,6 +834,81 @@ fn source_section(page_data: &StoredPage, revision: &StoredRevision) -> String {
     )
 }
 
+fn media_figures(
+    library: &Library,
+    wiki_id: WikiId,
+    revision_id: RevisionId,
+) -> Result<String, ReaderError> {
+    let media = library.revision_media(wiki_id, revision_id)?;
+    if media.is_empty() {
+        return Ok(String::new());
+    }
+    let mut output = String::from(
+        "<section class=\"captured-media\" aria-labelledby=\"captured-media-heading\">\
+         <h2 id=\"captured-media-heading\">Captured media</h2>",
+    );
+    for item in &media {
+        output.push_str(&media_figure(item));
+    }
+    output.push_str("</section>");
+    Ok(output)
+}
+
+fn media_figure(media: &StoredRevisionMedia) -> String {
+    let caption = media
+        .caption
+        .as_deref()
+        .or(media.alt_text.as_deref())
+        .unwrap_or_else(|| media.file_title.as_str());
+    let alternative = media
+        .alt_text
+        .as_deref()
+        .or(media.caption.as_deref())
+        .unwrap_or_else(|| media.file_title.as_str());
+    let source = safe_metadata_link("Source description", &media.description_url);
+    let rendition = safe_metadata_link("Observed rendition", &media.original_url);
+    let license = media.license_url.as_deref().map_or_else(
+        || escape_html(&media.license_name),
+        |url| safe_metadata_link(&media.license_name, url),
+    );
+    format!(
+        "<figure><img src=\"/media/{}/{}/{}\" alt=\"{}\" width=\"{}\" height=\"{}\" \
+         loading=\"lazy\" decoding=\"async\"><figcaption><p>{}</p>\
+         <p><strong>Artist/creator:</strong> {} · <strong>Credit:</strong> {}</p>\
+         <p>{source} · <strong>License:</strong> {license} · {} × {} px</p>\
+         <p class=\"meta\">{rendition}. Captured locally at Unix timestamp {} as the recorded {} \
+         placement. Upstream file hash: <code>{}</code>. Local content object: \
+         <code>{}</code>.</p></figcaption></figure>",
+        media.wiki_id,
+        media.revision_id,
+        media.placement_index,
+        escape_attribute(alternative),
+        media.width,
+        media.height,
+        escape_html(caption),
+        escape_html(&media.author),
+        escape_html(&media.attribution),
+        media.width,
+        media.height,
+        media.captured_at,
+        escape_html(media.placement_kind.as_str()),
+        escape_html(&media.source_sha1),
+        escape_html(&media.content_object_id.to_string()),
+    )
+}
+
+fn safe_metadata_link(label: &str, url: &str) -> String {
+    if url.starts_with("https://") || url.starts_with("http://") {
+        format!(
+            "<a href=\"{}\" rel=\"noreferrer noopener\">{}</a>",
+            escape_attribute(url),
+            escape_html(label)
+        )
+    } else {
+        format!("{}: {}", escape_html(label), escape_html(url))
+    }
+}
+
 fn search_form(query: &str, wiki_id: Option<WikiId>) -> String {
     let wiki = wiki_id.map_or_else(String::new, |wiki_id| {
         format!("<input type=\"hidden\" name=\"wiki\" value=\"{wiki_id}\">")
@@ -1018,6 +1163,21 @@ fn secured_response(status: StatusCode, content_type: &'static str, body: String
     response
 }
 
+fn secured_binary_response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Vec<u8>,
+) -> Response {
+    let mut response = (status, Body::from(body)).into_response();
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response
+}
+
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -1133,9 +1293,12 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
     use wikisync_content::to_search_content;
-    use wikisync_core::{PageId, PageTitle, RevisionId};
+    use wikisync_core::{MediaId, PageId, PageTitle, RevisionId, ThumbnailPolicy};
     use wikisync_search::{SearchDocument, SearchIndex, SqliteSearchIndex};
-    use wikisync_store::{CurrentRevisionCapture, Library, RevisionCapture};
+    use wikisync_store::{
+        CurrentRevisionCapture, Library, MediaPlacementKind, RevisionCapture,
+        RevisionMediaPlacement, ThumbnailCapture, ThumbnailMimeType,
+    };
 
     use super::*;
 
@@ -1148,6 +1311,14 @@ mod tests {
         older_revision: RevisionId,
         title: PageTitle,
     }
+
+    const VALID_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5,
+        0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64,
+        0xf8, 0x0f, 0x00, 0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
 
     fn fixture() -> Fixture {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -1211,6 +1382,37 @@ mod tests {
                 },
             )
             .expect("older revision");
+        let file_title = PageTitle::new("File:Offline fixture.png").expect("file title");
+        library
+            .capture_revision_thumbnail(
+                wiki_id,
+                page_id,
+                current_revision,
+                ThumbnailPolicy::new(640, 8, 1024).expect("thumbnail policy"),
+                &ThumbnailCapture {
+                    media_id: MediaId::new(9001).expect("media ID"),
+                    file_title: &file_title,
+                    source_sha1: "abcdef0123456789abcdef0123456789",
+                    original_url: "https://upload.wikimedia.org/offline-fixture.png",
+                    description_url: "https://commons.wikimedia.org/wiki/File:Offline_fixture.png",
+                    author: "Fixture photographer",
+                    attribution: "Fixture photographer / Wikimedia Commons",
+                    license_name: "CC BY-SA 4.0",
+                    license_url: Some("https://creativecommons.org/licenses/by-sa/4.0/"),
+                    width: 1,
+                    height: 1,
+                    mime_type: ThumbnailMimeType::Png,
+                    captured_at: 1_776_000_000,
+                    source: VALID_PNG,
+                },
+                RevisionMediaPlacement {
+                    index: 0,
+                    kind: MediaPlacementKind::Lead,
+                    caption: Some("Offline fixture caption"),
+                    alt_text: None,
+                },
+            )
+            .expect("capture thumbnail");
         let current_source = std::str::from_utf8(current_source).expect("fixture source");
         let content = to_search_content(current_source);
         let mut index = SqliteSearchIndex::open(&library).expect("search index");
@@ -1245,6 +1447,18 @@ mod tests {
         application: Router,
         uri: &str,
     ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let (status, headers, body) = response_bytes(application, uri).await;
+        (
+            status,
+            headers,
+            String::from_utf8(body).expect("UTF-8 response"),
+        )
+    }
+
+    async fn response_bytes(
+        application: Router,
+        uri: &str,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
         let response = application
             .oneshot(
                 Request::builder()
@@ -1259,11 +1473,7 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024 * 1024)
             .await
             .expect("response body");
-        (
-            status,
-            headers,
-            String::from_utf8(body.to_vec()).expect("UTF-8 response"),
-        )
+        (status, headers, body.to_vec())
     }
 
     #[tokio::test]
@@ -1337,6 +1547,55 @@ mod tests {
         assert!(body.contains("class=\"footnote-reference\""));
         assert!(body.contains("<h2>References</h2>"));
         assert!(body.contains("reference guide"));
+    }
+
+    #[tokio::test]
+    async fn article_and_revision_render_attributed_verified_local_thumbnail() {
+        let fixture = fixture();
+        let title = utf8_percent_encode(fixture.title.as_str(), NON_ALPHANUMERIC);
+        let (_, headers, article) = response_text(
+            router(&fixture.root),
+            &format!("/wiki/{title}?wiki={}", fixture.wiki_id),
+        )
+        .await;
+        let media_url = format!("/media/{}/{}/0", fixture.wiki_id, fixture.current_revision);
+        assert_eq!(
+            headers
+                .get(CONTENT_SECURITY_POLICY)
+                .and_then(|value| value.to_str().ok()),
+            Some(CSP)
+        );
+        assert!(article.contains(&format!("src=\"{media_url}\"")));
+        assert!(article.contains("alt=\"Offline fixture caption\""));
+        assert!(article.contains("Fixture photographer / Wikimedia Commons"));
+        assert!(article.contains("Source description"));
+        assert!(article.contains("CC BY-SA 4.0"));
+        assert!(article.contains("1 × 1 px"));
+        assert!(article.contains("Upstream file hash"));
+        assert!(!article.contains("src=\"https://"));
+
+        let (_, _, revision) = response_text(
+            router(&fixture.root),
+            &format!(
+                "/revision/{}?wiki={}",
+                fixture.current_revision, fixture.wiki_id
+            ),
+        )
+        .await;
+        assert!(revision.contains(&format!("src=\"{media_url}\"")));
+
+        let (status, headers, bytes) = response_bytes(router(&fixture.root), &media_url).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "image/png");
+        assert_eq!(headers.get(X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+        assert_eq!(bytes, VALID_PNG);
+
+        let (missing, _, _) = response_bytes(
+            router(&fixture.root),
+            &format!("/media/{}/{}/1", fixture.wiki_id, fixture.current_revision),
+        )
+        .await;
+        assert_eq!(missing, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1427,11 +1686,17 @@ mod tests {
             if !visited.insert(uri.clone()) {
                 continue;
             }
-            let (status, _, body) = response_text(router(&fixture.root), &uri).await;
+            let (status, headers, bytes) = response_bytes(router(&fixture.root), &uri).await;
             assert!(
                 status.is_success() || status == StatusCode::NOT_FOUND,
                 "crawl failed for {uri}: {status}"
             );
+            if uri.starts_with("/media/") {
+                assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "image/png");
+                assert_eq!(bytes, VALID_PNG);
+                continue;
+            }
+            let body = String::from_utf8(bytes).expect("HTML or CSS is UTF-8");
             for resource in attribute_values(&body, "src")
                 .into_iter()
                 .chain(stylesheet_links(&body))
@@ -1440,6 +1705,9 @@ mod tests {
                     resource.starts_with('/') || resource.starts_with("data:"),
                     "outbound resource URL in {uri}: {resource}"
                 );
+                if resource.starts_with('/') {
+                    pending.push(resource);
+                }
             }
             for link in attribute_values(&body, "href") {
                 if link.starts_with('/') {
@@ -1450,6 +1718,7 @@ mod tests {
         assert!(visited.contains("/assets/reader.css"));
         assert!(visited.iter().any(|path| path.starts_with("/wiki/")));
         assert!(visited.iter().any(|path| path.starts_with("/revision/")));
+        assert!(visited.iter().any(|path| path.starts_with("/media/")));
     }
 
     #[tokio::test]

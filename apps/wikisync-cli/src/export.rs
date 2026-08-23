@@ -9,17 +9,21 @@ use std::path::{Path, PathBuf};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use serde_json::{Value, json};
-use wikisync_content::{OutputKind, transform};
-use wikisync_core::{CollectionId, PageId, RevisionId, WikiId};
+use wikisync_content::{OutputKind, ThumbnailLimits, transform, validate_thumbnail};
+use wikisync_core::{CollectionId, MAX_THUMBNAILS_PER_REVISION, PageId, RevisionId, WikiId};
 use wikisync_mediawiki::ClientConfig;
-use wikisync_store::{Library, StoreError, StoredPage, StoredRevision, StoredWiki};
+use wikisync_store::{
+    Library, ObjectId, StoreError, StoredPage, StoredRevision, StoredRevisionMedia, StoredWiki,
+};
 
 const MAX_EXPORT_ARTICLES: usize = 10_000;
 const MAX_EXPORT_CANONICAL_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXPORT_OUTPUT_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_EXISTING_OUTPUT_ENTRIES: usize = MAX_EXPORT_ARTICLES + 8;
-const EXPORT_SCHEMA: &str = "wikisync-current-export-v1";
-const HISTORICAL_EXPORT_SCHEMA: &str = "wikisync-historical-export-v1";
+const MAX_EXPORT_MEDIA_PLACEMENTS: usize =
+    MAX_EXPORT_ARTICLES * MAX_THUMBNAILS_PER_REVISION as usize;
+const MAX_EXISTING_OUTPUT_ENTRIES: usize = MAX_EXPORT_ARTICLES + MAX_EXPORT_MEDIA_PLACEMENTS + 10;
+const EXPORT_SCHEMA: &str = "wikisync-current-export-v2";
+const HISTORICAL_EXPORT_SCHEMA: &str = "wikisync-historical-export-v2";
 const CONTENT_HASH_ALGORITHM: &str = "wikisync-object-v1/domain-separated-blake3";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,6 +131,12 @@ struct Article {
     revision: StoredRevision,
     wiki: StoredWiki,
     relative_path: String,
+    media: Vec<ExportMedia>,
+}
+
+struct ExportMedia {
+    stored: StoredRevisionMedia,
+    relative_path: String,
 }
 
 struct ExportSelection {
@@ -227,6 +237,8 @@ fn run_selected(
     let mut canonical_bytes = 0_u64;
     let mut uncaptured_page_count = 0_usize;
     let mut used_paths = BTreeSet::new();
+    let mut media_paths = BTreeMap::<ObjectId, String>::new();
+    let mut media_placement_count = 0_usize;
 
     for page in pages.into_values() {
         let revision = match revision_selection {
@@ -279,11 +291,34 @@ fn run_selected(
                 ));
             }
         }
+        let media = library
+            .revision_media(page.wiki_id, revision.revision_id)?
+            .into_iter()
+            .map(|stored| {
+                media_placement_count = media_placement_count.checked_add(1).ok_or_else(|| {
+                    ExportError::message("export media placement count overflowed")
+                })?;
+                if media_placement_count > MAX_EXPORT_MEDIA_PLACEMENTS {
+                    return Err(ExportError::message(format!(
+                        "export contains more than {MAX_EXPORT_MEDIA_PLACEMENTS} media placements"
+                    )));
+                }
+                let relative_path = media_paths
+                    .entry(stored.content_object_id)
+                    .or_insert_with(|| media_relative_path(&stored))
+                    .clone();
+                Ok(ExportMedia {
+                    stored,
+                    relative_path,
+                })
+            })
+            .collect::<Result<Vec<_>, ExportError>>()?;
         articles.push(Article {
             page,
             revision,
             wiki,
             relative_path,
+            media,
         });
     }
 
@@ -508,9 +543,17 @@ fn build_staged_export(
 ) -> Result<(), ExportError> {
     let article_directory = staging.join("articles");
     create_private_directory(&article_directory)?;
+    let media_directory = staging.join("media");
+    let has_media = articles.iter().any(|article| !article.media.is_empty());
+    if has_media {
+        create_private_directory(&media_directory)?;
+    }
     let mut index = private_new_file(&staging.join("index.jsonl"))?;
     let mut output_bytes = 0_u64;
     let mut maximum_capture_time = None;
+    let mut media_bytes = 0_u64;
+    let mut media_placement_count = 0_usize;
+    let mut written_media = BTreeSet::new();
 
     for article in articles {
         let source = library.read_object(article.revision.content_object_id)?;
@@ -532,6 +575,30 @@ fn build_staged_export(
             &source_url,
             derived.transformer_version.as_str(),
         );
+        for media in &article.media {
+            media_placement_count += 1;
+            maximum_capture_time = Some(
+                maximum_capture_time.map_or(media.stored.captured_at, |current: u64| {
+                    current.max(media.stored.captured_at)
+                }),
+            );
+            if written_media.insert(media.stored.content_object_id) {
+                let bytes = verified_export_media_bytes(library, &media.stored)?;
+                let length = u64::try_from(bytes.len()).expect("usize fits in u64");
+                media_bytes = media_bytes
+                    .checked_add(length)
+                    .ok_or_else(|| ExportError::message("export media byte count overflowed"))?;
+                output_bytes = output_bytes
+                    .checked_add(length)
+                    .ok_or_else(|| ExportError::message("export output byte count overflowed"))?;
+                if output_bytes > MAX_EXPORT_OUTPUT_BYTES {
+                    return Err(ExportError::message(format!(
+                        "derived export exceeds the bounded output limit of {MAX_EXPORT_OUTPUT_BYTES} bytes"
+                    )));
+                }
+                write_private_file(&staging.join(&media.relative_path), &bytes)?;
+            }
+        }
         let rendered = render_article(format, &metadata, &derived.body, article);
         output_bytes = output_bytes
             .checked_add(u64::try_from(rendered.len()).expect("usize fits in u64"))
@@ -558,7 +625,16 @@ fn build_staged_export(
         "content_hash_algorithm": CONTENT_HASH_ALGORITHM,
         "format": format.as_str(),
         "maximum_capture_time_unix": maximum_capture_time,
+        "media_bytes": media_bytes,
+        "media_object_count": written_media.len(),
+        "media_placement_count": media_placement_count,
         "schema": target.schema,
+        "schema_evolution": "v2-additive-attributed-local-media",
+        "schema_predecessor": if target.schema == EXPORT_SCHEMA {
+            "wikisync-current-export-v1"
+        } else {
+            "wikisync-historical-export-v1"
+        },
         "scope": scope,
         "transformer_version": format.output_kind().transformer_version().as_str(),
         "uncaptured_page_count": totals.uncaptured_page_count,
@@ -570,8 +646,45 @@ fn build_staged_export(
     manifest_bytes.push(b'\n');
     write_private_file(&staging.join("manifest.json"), &manifest_bytes)?;
     sync_directory(&article_directory)?;
+    if has_media {
+        sync_directory(&media_directory)?;
+    }
     sync_directory(staging)?;
     Ok(())
+}
+
+fn verified_export_media_bytes(
+    library: &Library,
+    media: &StoredRevisionMedia,
+) -> Result<Vec<u8>, ExportError> {
+    let bytes = library.read_object(media.content_object_id)?;
+    let pixels = u64::from(media.width)
+        .checked_mul(u64::from(media.height))
+        .ok_or_else(|| ExportError::message("captured media dimensions overflowed"))?;
+    let limits = ThumbnailLimits {
+        max_encoded_bytes: u64::try_from(bytes.len())
+            .map_err(|_| ExportError::message("captured media length overflowed"))?,
+        max_width: media.width,
+        max_height: media.height,
+        max_pixels: pixels,
+        max_decoded_bytes: pixels
+            .checked_mul(8)
+            .ok_or_else(|| ExportError::message("captured media allocation overflowed"))?,
+    };
+    let validated =
+        validate_thumbnail(&bytes, media.mime_type.as_str(), &limits).map_err(|_| {
+            ExportError::message(format!(
+                "captured media for revision {} placement {} failed passive-raster validation",
+                media.revision_id, media.placement_index
+            ))
+        })?;
+    if validated.width != media.width || validated.height != media.height {
+        return Err(ExportError::message(format!(
+            "captured media for revision {} placement {} disagrees with its dimensions",
+            media.revision_id, media.placement_index
+        )));
+    }
+    Ok(bytes)
 }
 
 fn article_metadata(
@@ -580,12 +693,14 @@ fn article_metadata(
     source_url: &str,
     transformer_version: &str,
 ) -> Value {
+    let media = article.media.iter().map(media_metadata).collect::<Vec<_>>();
     json!({
         "author": article.revision.author,
         "capture_time_unix": article.revision.captured_at,
         "content_hash": article.revision.content_object_id.to_string(),
         "content_hash_algorithm": CONTENT_HASH_ALGORITHM,
         "format": format.as_str(),
+        "media": media,
         "page_id": article.page.page_id.get(),
         "relative_path": article.relative_path,
         "revision_id": article.revision.revision_id.get(),
@@ -596,6 +711,30 @@ fn article_metadata(
         "transformer_version": transformer_version,
         "wiki": article.wiki.language_code,
         "wiki_id": article.wiki.wiki_id.get(),
+    })
+}
+
+fn media_metadata(media: &ExportMedia) -> Value {
+    json!({
+        "alt_text": media.stored.alt_text,
+        "attribution": media.stored.attribution,
+        "author": media.stored.author,
+        "caption": media.stored.caption,
+        "capture_time_unix": media.stored.captured_at,
+        "content_hash": media.stored.content_object_id.to_string(),
+        "description_url": media.stored.description_url,
+        "file_title": media.stored.file_title.as_str(),
+        "height": media.stored.height,
+        "license_name": media.stored.license_name,
+        "license_url": media.stored.license_url,
+        "mime_type": media.stored.mime_type.as_str(),
+        "original_url": media.stored.original_url,
+        "placement_index": media.stored.placement_index,
+        "placement_kind": media.stored.placement_kind.as_str(),
+        "relative_path": media.relative_path,
+        "source_media_id": media.stored.media_id.get(),
+        "source_sha1": media.stored.source_sha1,
+        "width": media.stored.width,
     })
 }
 
@@ -633,6 +772,7 @@ fn render_article(format: ExportFormat, metadata: &Value, body: &str, article: &
             if !body.ends_with('\n') && !body.is_empty() {
                 rendered.push('\n');
             }
+            render_markdown_media(&mut rendered, &article.media);
             rendered.push_str("\n## Source and attribution\n\n");
             rendered.push_str(&format!(
                 "Source: [{}]({source_url}), revision {} ({}).\n\n",
@@ -664,6 +804,7 @@ fn render_article(format: ExportFormat, metadata: &Value, body: &str, article: &
             if !body.ends_with('\n') && !body.is_empty() {
                 rendered.push('\n');
             }
+            render_text_media(&mut rendered, &article.media);
             rendered.push_str("\nSOURCE AND ATTRIBUTION\n");
             rendered.push_str(&format!(
                 "Source: {} (revision {}, {}).\nRevision author: {author}.\n",
@@ -676,6 +817,126 @@ fn render_article(format: ExportFormat, metadata: &Value, body: &str, article: &
             rendered
         }
     }
+}
+
+fn render_markdown_media(rendered: &mut String, media: &[ExportMedia]) {
+    if media.is_empty() {
+        return;
+    }
+    rendered.push_str("\n## Captured media\n\n");
+    for item in media {
+        let caption = media_caption(&item.stored);
+        let alternative = media_alternative(&item.stored);
+        rendered.push_str(&format!(
+            "![{}](../{})\n\n",
+            markdown_text(alternative),
+            item.relative_path
+        ));
+        rendered.push_str(&format!("**{}**  \n", markdown_text(caption)));
+        rendered.push_str(&format!(
+            "Artist/creator: {}. Credit: {}.  \n",
+            markdown_text(&item.stored.author),
+            markdown_text(&item.stored.attribution)
+        ));
+        rendered.push_str(&format!(
+            "{} License: {}. Dimensions: {} × {} px.  \n",
+            markdown_metadata_link("Source description", &item.stored.description_url),
+            markdown_metadata_link(
+                &item.stored.license_name,
+                item.stored.license_url.as_deref().unwrap_or("")
+            ),
+            item.stored.width,
+            item.stored.height
+        ));
+        rendered.push_str(&format!(
+            "Observed rendition: {}. Captured locally at Unix timestamp {} as {} placement {}. Upstream file hash: `{}`. Local content object: `{}`.\n\n",
+            markdown_metadata_link("source URL", &item.stored.original_url),
+            item.stored.captured_at,
+            item.stored.placement_kind.as_str(),
+            item.stored.placement_index,
+            markdown_text(&item.stored.source_sha1),
+            item.stored.content_object_id,
+        ));
+    }
+}
+
+fn render_text_media(rendered: &mut String, media: &[ExportMedia]) {
+    if media.is_empty() {
+        return;
+    }
+    rendered.push_str("\nCAPTURED MEDIA\n");
+    for item in media {
+        rendered.push_str(&format!(
+            "\nMedia {}: {}\nLocal file: ../{}\nAlternative text: {}\nArtist/creator: {}\nCredit: {}\nSource description: {}\nLicense: {}{}\nDimensions: {} x {} px\nObserved rendition URL: {}\nCaptured locally (Unix): {}\nPlacement: {} {}\nUpstream file hash: {}\nLocal content object: {}\n",
+            item.stored.placement_index + 1,
+            media_caption(&item.stored),
+            item.relative_path,
+            media_alternative(&item.stored),
+            item.stored.author,
+            item.stored.attribution,
+            item.stored.description_url,
+            item.stored.license_name,
+            item.stored
+                .license_url
+                .as_deref()
+                .map_or_else(String::new, |url| format!(" ({url})")),
+            item.stored.width,
+            item.stored.height,
+            item.stored.original_url,
+            item.stored.captured_at,
+            item.stored.placement_kind.as_str(),
+            item.stored.placement_index,
+            item.stored.source_sha1,
+            item.stored.content_object_id,
+        ));
+    }
+}
+
+fn media_caption(media: &StoredRevisionMedia) -> &str {
+    media
+        .caption
+        .as_deref()
+        .or(media.alt_text.as_deref())
+        .unwrap_or_else(|| media.file_title.as_str())
+}
+
+fn media_alternative(media: &StoredRevisionMedia) -> &str {
+    media
+        .alt_text
+        .as_deref()
+        .or(media.caption.as_deref())
+        .unwrap_or_else(|| media.file_title.as_str())
+}
+
+fn markdown_metadata_link(label: &str, url: &str) -> String {
+    if url.starts_with("https://") || url.starts_with("http://") {
+        format!("[{}]({})", markdown_text(label), markdown_url(url))
+    } else if url.is_empty() {
+        markdown_text(label)
+    } else {
+        format!("{}: {}", markdown_text(label), markdown_text(url))
+    }
+}
+
+fn markdown_url(url: &str) -> String {
+    url.replace(' ', "%20")
+        .replace('(', "%28")
+        .replace(')', "%29")
+        .replace('<', "%3C")
+        .replace('>', "%3E")
+}
+
+fn media_relative_path(media: &StoredRevisionMedia) -> String {
+    let extension = match media.mime_type.as_str() {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        _ => unreachable!("stored media MIME type is a closed passive-raster enum"),
+    };
+    format!(
+        "media/{}.{}",
+        media.content_object_id.to_string().replace(':', "-"),
+        extension
+    )
 }
 
 fn safe_slug(title: &str) -> String {

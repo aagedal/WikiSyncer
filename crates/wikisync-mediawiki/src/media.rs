@@ -125,7 +125,7 @@ pub enum ThumbnailMetadataResolution {
 /// No variant stores or displays the requested URL or response bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ThumbnailDownloadError {
-    /// The URL was malformed or outside the API endpoint's exact origin.
+    /// The URL was malformed or outside the source's explicitly approved origins.
     UrlRejected,
     /// The shared circuit breaker is temporarily open.
     CircuitOpen {
@@ -184,7 +184,7 @@ impl fmt::Display for ThumbnailDownloadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UrlRejected => formatter
-                .write_str("thumbnail URL must remain on the configured MediaWiki source origin"),
+                .write_str("thumbnail URL must remain on an approved MediaWiki source origin"),
             Self::CircuitOpen { retry_after } => write!(
                 formatter,
                 "MediaWiki circuit breaker is open; retry after about {} ms",
@@ -289,9 +289,10 @@ impl MediaWikiClient {
 
     /// Downloads one eligible thumbnail through the client's shared transport policy.
     ///
-    /// The URL is rejected before contact unless it has the same scheme, host, and
-    /// effective port as the configured Action API endpoint. Typical Wikimedia upload
-    /// hosts therefore require a future explicitly modelled source-origin policy.
+    /// The URL is rejected before contact unless it has an exact approved scheme,
+    /// host, and effective port. Ordinary HTTPS Wikimedia project endpoints derive
+    /// the exact `https://upload.wikimedia.org:443` thumbnail origin; third-party and
+    /// loopback fixture endpoints remain restricted to their API origin.
     pub async fn download_thumbnail(
         &self,
         metadata: &ThumbnailMetadata,
@@ -304,13 +305,7 @@ impl MediaWikiClient {
         }
         let url = Url::parse(&metadata.thumbnail_url)
             .ok()
-            .filter(|url| {
-                redirect_destination_allowed(
-                    url,
-                    &self.config.endpoint,
-                    &self.config.allowed_source_hosts,
-                )
-            })
+            .filter(|url| redirect_destination_allowed(url, &self.config.allowed_origins))
             .ok_or(ThumbnailDownloadError::UrlRejected)?;
         self.get_thumbnail_bytes(url, policy.maximum_bytes_per_image().get())
             .await

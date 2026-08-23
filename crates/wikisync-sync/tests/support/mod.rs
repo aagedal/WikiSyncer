@@ -3,14 +3,25 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct FixtureResponse {
-    pub body: &'static str,
+    pub body: Vec<u8>,
+    pub content_type: &'static str,
 }
 
 impl FixtureResponse {
-    pub const fn json(body: &'static str) -> Self {
-        Self { body }
+    pub fn json(body: impl AsRef<str>) -> Self {
+        Self {
+            body: body.as_ref().as_bytes().to_vec(),
+            content_type: "application/json",
+        }
+    }
+
+    pub fn bytes(body: impl Into<Vec<u8>>, content_type: &'static str) -> Self {
+        Self {
+            body: body.into(),
+            content_type,
+        }
     }
 }
 
@@ -25,6 +36,8 @@ impl FixtureServer {
     pub fn start(responses: Vec<FixtureResponse>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
         let address = listener.local_addr().expect("fixture server address");
+        let endpoint = format!("http://{address}/w/api.php");
+        let response_endpoint = endpoint.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&requests);
         let thread = thread::spawn(move || {
@@ -32,12 +45,12 @@ impl FixtureServer {
                 let (mut stream, _) = listener.accept().expect("accept fixture request");
                 let request = read_request(&mut stream);
                 captured.lock().expect("request lock").push(request);
-                write_response(&mut stream, response);
+                write_response(&mut stream, response, &response_endpoint);
             }
         });
 
         Self {
-            endpoint: format!("http://{address}/w/api.php"),
+            endpoint,
             requests,
             thread: Some(thread),
         }
@@ -75,15 +88,22 @@ fn read_request(stream: &mut TcpStream) -> String {
     String::from_utf8(bytes).expect("request headers are UTF-8 compatible")
 }
 
-fn write_response(stream: &mut TcpStream, response: FixtureResponse) {
+fn write_response(stream: &mut TcpStream, response: FixtureResponse, endpoint: &str) {
+    let body = if response.content_type == "application/json" {
+        String::from_utf8(response.body)
+            .expect("JSON fixture is UTF-8")
+            .replace("{{ENDPOINT}}", endpoint)
+            .into_bytes()
+    } else {
+        response.body
+    };
     let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        response.body.len()
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        response.content_type,
+        body.len()
     );
     stream
         .write_all(headers.as_bytes())
         .expect("write fixture headers");
-    stream
-        .write_all(response.body.as_bytes())
-        .expect("write fixture body");
+    stream.write_all(&body).expect("write fixture body");
 }

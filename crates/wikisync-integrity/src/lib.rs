@@ -7,7 +7,7 @@
 //! schema. Schema version 12 has no persistent derived-cache table, so no report from
 //! this version claims derived-cache inventory or cache-body verification.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -19,7 +19,7 @@ use wikisync_content::{PLAIN_TEXT_TRANSFORMER_VERSION, ThumbnailLimits, validate
 use wikisync_core::{MAX_THUMBNAIL_BYTES, MAX_THUMBNAIL_EDGE_PIXELS};
 use wikisync_store::{
     IntegrityMetadataIssue, IntegrityMetadataSubject, Library, ManifestId, ObjectId,
-    ObjectVerificationState, StoreError, SyncRunState,
+    ObjectVerificationState, StoreError, StoredManifest, SyncRunState,
 };
 
 const TRUSTED_HEAD_SCHEMA_VERSION: u32 = 1;
@@ -98,6 +98,18 @@ pub enum VerificationCoverage {
     Partial,
 }
 
+/// Coverage of media inventory by the newest manifest for each represented sync
+/// scope. Older schema-v1 manifests remain readable but do not authenticate media.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManifestMediaCoverage {
+    /// No represented scope has a media-aware manifest boundary.
+    NotCovered,
+    /// Some, but not every, represented scope has a media-aware latest boundary.
+    Partial,
+    /// Every represented scope has a media-aware latest boundary.
+    Complete,
+}
+
 /// Stable category for one verification finding.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum VerificationFindingKind {
@@ -125,6 +137,20 @@ pub enum VerificationFindingKind {
     SuccessfulRunMissingManifest,
     /// Manifest directory membership changed during the scan.
     ManifestsChangedDuringVerification,
+    /// Media recorded at the authenticated run boundary is no longer inventoried.
+    ManifestMediaDeleted,
+    /// Durable media metadata no longer reproduces its authenticated identity.
+    ManifestMediaTampered,
+    /// A recorded revision media placement is no longer inventoried.
+    ManifestMediaPlacementDeleted,
+    /// A placement now selects a different media rendition than the manifest records.
+    ManifestMediaPlacementSwapped,
+    /// Placement display metadata no longer reproduces its authenticated identity.
+    ManifestMediaPlacementTampered,
+    /// The current scope contains media or placements absent from its latest manifest.
+    ManifestMediaInventoryChanged,
+    /// SQLite media inventory changed while manifest media was being compared.
+    ManifestMediaInventoryChangedDuringVerification,
     /// The external trusted-head signature did not verify with its embedded key.
     TrustedHeadSignatureInvalid,
     /// The authenticated external head did not match the current local manifest head.
@@ -225,6 +251,10 @@ pub struct VerificationReport {
     pub manifests_examined: u64,
     /// Manifest files whose embedded identity reproduced their canonical body.
     pub manifests_identity_verified: u64,
+    /// Whether the newest manifest for each represented scope authenticates media.
+    pub manifest_media_coverage: ManifestMediaCoverage,
+    /// Latest media-aware scope snapshots compared with current durable metadata.
+    pub manifest_media_snapshots_examined: u64,
     /// Revision, page, checkpoint, search-document, FTS, media, and media-placement
     /// records present when a full metadata-reference scan began. Quick verification
     /// leaves this zero.
@@ -529,6 +559,8 @@ pub fn verify_library_with_options(
         manifests_at_end: 0,
         manifests_examined: 0,
         manifests_identity_verified: 0,
+        manifest_media_coverage: ManifestMediaCoverage::NotCovered,
+        manifest_media_snapshots_examined: 0,
         metadata_records_at_start: 0,
         metadata_records_at_end: 0,
         metadata_records_examined: 0,
@@ -1160,6 +1192,7 @@ fn verify_manifest_history(
     let mut expected_sequence = 1_u64;
     let mut previous: Option<(u64, ManifestId)> = None;
     let mut represented_runs = HashSet::new();
+    let mut latest_by_scope: HashMap<(u64, Option<u64>), StoredManifest> = HashMap::new();
     for sequence in sequences {
         if sequence != expected_sequence {
             let message = if sequence > expected_sequence {
@@ -1267,7 +1300,16 @@ fn verify_manifest_history(
                 },
             );
         }
+        latest_by_scope.insert(
+            (
+                stored.manifest.wiki_id.get(),
+                stored.manifest.collection_id.map(|id| id.get()),
+            ),
+            stored,
+        );
     }
+
+    verify_manifest_media_snapshots(library, latest_by_scope, maximum_findings, report)?;
 
     let mut run_cursor = None;
     loop {
@@ -1331,6 +1373,252 @@ fn verify_manifest_history(
                 },
             );
         }
+    }
+    Ok(())
+}
+
+fn verify_manifest_media_snapshots(
+    library: &Library,
+    latest_by_scope: HashMap<(u64, Option<u64>), StoredManifest>,
+    maximum_findings: usize,
+    report: &mut VerificationReport,
+) -> Result<(), VerificationError> {
+    let scope_count = latest_by_scope.len();
+    let covered_count = latest_by_scope
+        .values()
+        .filter(|stored| stored.manifest.media_snapshot.is_some())
+        .count();
+    report.manifest_media_coverage = match (covered_count, scope_count) {
+        (0, _) => ManifestMediaCoverage::NotCovered,
+        (covered, total) if covered == total => ManifestMediaCoverage::Complete,
+        _ => ManifestMediaCoverage::Partial,
+    };
+    if covered_count == 0 {
+        return Ok(());
+    }
+
+    let change_counter_at_start = library.integrity_metadata_change_counter()?;
+    let mut manifests = latest_by_scope.into_values().collect::<Vec<_>>();
+    manifests.sort_by_key(|stored| stored.manifest.sequence);
+    for stored in manifests {
+        let Some(expected) = stored.manifest.media_snapshot.as_ref() else {
+            continue;
+        };
+        report.manifest_media_snapshots_examined =
+            report.manifest_media_snapshots_examined.saturating_add(1);
+        let current = library
+            .manifest_media_snapshot(stored.manifest.wiki_id, stored.manifest.collection_id)?;
+        let current_inventory = current
+            .inventory
+            .iter()
+            .map(|media| {
+                (
+                    (
+                        media.media_id.get(),
+                        media.source_sha1.as_str(),
+                        media.content_object_id,
+                    ),
+                    media,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let expected_inventory = expected
+            .inventory
+            .iter()
+            .map(|media| {
+                (
+                    (
+                        media.media_id.get(),
+                        media.source_sha1.as_str(),
+                        media.content_object_id,
+                    ),
+                    media,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for media in &expected.inventory {
+            let key = (
+                media.media_id.get(),
+                media.source_sha1.as_str(),
+                media.content_object_id,
+            );
+            match current_inventory.get(&key) {
+                None => push_finding(
+                    report,
+                    maximum_findings,
+                    VerificationFinding {
+                        kind: VerificationFindingKind::ManifestMediaDeleted,
+                        object_id: Some(media.content_object_id),
+                        manifest_sequence: Some(stored.manifest.sequence),
+                        metadata_subject: None,
+                        message: format!(
+                            "manifested media {} version {:?} is absent from the current scope inventory",
+                            media.media_id.get(),
+                            media.source_sha1
+                        ),
+                    },
+                ),
+                Some(current) if current.metadata_identity != media.metadata_identity => {
+                    push_finding(
+                        report,
+                        maximum_findings,
+                        VerificationFinding {
+                            kind: VerificationFindingKind::ManifestMediaTampered,
+                            object_id: Some(media.content_object_id),
+                            manifest_sequence: Some(stored.manifest.sequence),
+                            metadata_subject: None,
+                            message: format!(
+                                "media {} metadata identity changed from {} to {}",
+                                media.media_id.get(),
+                                media.metadata_identity,
+                                current.metadata_identity
+                            ),
+                        },
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+        for media in &current.inventory {
+            let key = (
+                media.media_id.get(),
+                media.source_sha1.as_str(),
+                media.content_object_id,
+            );
+            if !expected_inventory.contains_key(&key) {
+                push_finding(
+                    report,
+                    maximum_findings,
+                    VerificationFinding {
+                        kind: VerificationFindingKind::ManifestMediaInventoryChanged,
+                        object_id: Some(media.content_object_id),
+                        manifest_sequence: Some(stored.manifest.sequence),
+                        metadata_subject: None,
+                        message: format!(
+                            "current scope contains media {} version {:?} absent from its latest manifest",
+                            media.media_id.get(),
+                            media.source_sha1
+                        ),
+                    },
+                );
+            }
+        }
+
+        let current_placements = current
+            .placements
+            .iter()
+            .map(|placement| {
+                (
+                    (placement.revision_id.get(), placement.placement_index),
+                    placement,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let expected_placements = expected
+            .placements
+            .iter()
+            .map(|placement| {
+                (
+                    (placement.revision_id.get(), placement.placement_index),
+                    placement,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for placement in &expected.placements {
+            let key = (placement.revision_id.get(), placement.placement_index);
+            match current_placements.get(&key) {
+                None => push_finding(
+                    report,
+                    maximum_findings,
+                    VerificationFinding {
+                        kind: VerificationFindingKind::ManifestMediaPlacementDeleted,
+                        object_id: Some(placement.content_object_id),
+                        manifest_sequence: Some(stored.manifest.sequence),
+                        metadata_subject: None,
+                        message: format!(
+                            "manifested media placement revision {} index {} is absent",
+                            placement.revision_id.get(),
+                            placement.placement_index
+                        ),
+                    },
+                ),
+                Some(current)
+                    if current.media_id != placement.media_id
+                        || current.source_sha1 != placement.source_sha1
+                        || current.content_object_id != placement.content_object_id =>
+                {
+                    push_finding(
+                        report,
+                        maximum_findings,
+                        VerificationFinding {
+                            kind: VerificationFindingKind::ManifestMediaPlacementSwapped,
+                            object_id: Some(current.content_object_id),
+                            manifest_sequence: Some(stored.manifest.sequence),
+                            metadata_subject: None,
+                            message: format!(
+                                "media placement revision {} index {} selects a different rendition",
+                                placement.revision_id.get(),
+                                placement.placement_index
+                            ),
+                        },
+                    );
+                }
+                Some(current) if current.placement_identity != placement.placement_identity => {
+                    push_finding(
+                        report,
+                        maximum_findings,
+                        VerificationFinding {
+                            kind: VerificationFindingKind::ManifestMediaPlacementTampered,
+                            object_id: Some(placement.content_object_id),
+                            manifest_sequence: Some(stored.manifest.sequence),
+                            metadata_subject: None,
+                            message: format!(
+                                "media placement revision {} index {} display metadata changed",
+                                placement.revision_id.get(),
+                                placement.placement_index
+                            ),
+                        },
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+        for placement in &current.placements {
+            let key = (placement.revision_id.get(), placement.placement_index);
+            if !expected_placements.contains_key(&key) {
+                push_finding(
+                    report,
+                    maximum_findings,
+                    VerificationFinding {
+                        kind: VerificationFindingKind::ManifestMediaInventoryChanged,
+                        object_id: Some(placement.content_object_id),
+                        manifest_sequence: Some(stored.manifest.sequence),
+                        metadata_subject: None,
+                        message: format!(
+                            "current scope contains media placement revision {} index {} absent from its latest manifest",
+                            placement.revision_id.get(),
+                            placement.placement_index
+                        ),
+                    },
+                );
+            }
+        }
+    }
+
+    let change_counter_at_end = library.integrity_metadata_change_counter()?;
+    if change_counter_at_end != change_counter_at_start {
+        report.coverage = VerificationCoverage::Partial;
+        push_finding(
+            report,
+            maximum_findings,
+            VerificationFinding {
+                kind: VerificationFindingKind::ManifestMediaInventoryChangedDuringVerification,
+                object_id: None,
+                manifest_sequence: None,
+                metadata_subject: None,
+                message: "SQLite media inventory changed during manifest comparison".to_owned(),
+            },
+        );
     }
     Ok(())
 }
@@ -1450,7 +1738,7 @@ mod tests {
 
     use rusqlite::params;
     use tempfile::TempDir;
-    use wikisync_core::{MediaId, PageId, PageTitle, RevisionId, ThumbnailPolicy};
+    use wikisync_core::{CollectionId, MediaId, PageId, PageTitle, RevisionId, ThumbnailPolicy};
     use wikisync_store::{
         CurrentRevisionCapture, Library, MediaPlacementKind, ObjectKind, RevisionMediaPlacement,
         SyncRunKind, ThumbnailCapture, ThumbnailMimeType,
@@ -1645,6 +1933,27 @@ mod tests {
         (directory, library, stored.id)
     }
 
+    fn manifested_media_fixture() -> (TempDir, Library, ObjectId) {
+        let (directory, mut library, object_id) = media_fixture();
+        let run_id = library
+            .start_or_resume_sync_run(
+                wikisync_core::WikiId::new(1).expect("wiki"),
+                Some(CollectionId::new(1).expect("collection")),
+                SyncRunKind::Bootstrap,
+                100,
+            )
+            .expect("start media run")
+            .status
+            .run_id;
+        library
+            .complete_sync_run(run_id, None)
+            .expect("complete media run");
+        library
+            .append_sync_manifest(run_id)
+            .expect("media manifest");
+        (directory, library, object_id)
+    }
+
     #[test]
     fn full_verification_reads_every_object_across_bounded_pages() {
         let (_directory, library, expected_bytes) = populated_library(7);
@@ -1770,6 +2079,118 @@ mod tests {
         assert_eq!(report.manifests_identity_verified, 3);
         assert_eq!(report.finding_count, 0);
         assert!(report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn full_verification_authenticates_latest_media_inventory_and_placements() {
+        let (_directory, library, _object_id) = manifested_media_fixture();
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert_eq!(
+            report.manifest_media_coverage,
+            ManifestMediaCoverage::Complete
+        );
+        assert_eq!(report.manifest_media_snapshots_examined, 1);
+        assert_eq!(report.finding_count, 0);
+    }
+
+    #[test]
+    fn manifest_media_verification_detects_metadata_and_placement_tampering() {
+        let (_directory, library, object_id) = manifested_media_fixture();
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .execute(
+                "UPDATE media SET author = 'Tampered author' WHERE source_media_id = 9001",
+                [],
+            )
+            .expect("tamper media metadata");
+        connection
+            .execute(
+                "UPDATE page_media SET caption = 'Tampered caption'
+                 WHERE revision_id = 400 AND placement_index = 0",
+                [],
+            )
+            .expect("tamper placement metadata");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestMediaTampered
+                && finding.object_id == Some(object_id)
+                && finding.manifest_sequence == Some(1)
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestMediaPlacementTampered
+                && finding.object_id == Some(object_id)
+                && finding.manifest_sequence == Some(1)
+        }));
+    }
+
+    #[test]
+    fn manifest_media_verification_detects_deletion_swapping_and_added_inventory() {
+        let (_directory, library, object_id) = manifested_media_fixture();
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .expect("disable fixture foreign keys");
+        connection
+            .execute(
+                "UPDATE page_media SET source_media_id = 9002
+                 WHERE revision_id = 400 AND placement_index = 0",
+                [],
+            )
+            .expect("swap placement target");
+
+        let swapped = verify_library(&library, VerificationScope::Full).expect("swapped");
+        assert!(swapped.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestMediaPlacementSwapped
+                && finding.manifest_sequence == Some(1)
+        }));
+        assert!(swapped.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestMediaDeleted
+                && finding.object_id == Some(object_id)
+        }));
+
+        connection
+            .execute(
+                "UPDATE page_media SET source_media_id = 9001
+                 WHERE revision_id = 400 AND placement_index = 0",
+                [],
+            )
+            .expect("restore placement target");
+        connection
+            .execute(
+                "INSERT INTO page_media (
+                    wiki_id, revision_id, placement_index, source_media_id,
+                    source_sha1, content_object_id, placement_kind, caption, alt_text
+                 ) SELECT wiki_id, revision_id, 1, source_media_id, source_sha1,
+                          content_object_id, 'inline', 'Added placement', NULL
+                   FROM page_media WHERE revision_id = 400 AND placement_index = 0",
+                [],
+            )
+            .expect("add unmanifested placement");
+        let added = verify_library(&library, VerificationScope::Full).expect("added inventory");
+        assert!(added.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestMediaInventoryChanged
+                && finding.manifest_sequence == Some(1)
+        }));
+
+        connection
+            .execute("DELETE FROM page_media WHERE revision_id = 400", [])
+            .expect("delete placements");
+        connection
+            .execute("DELETE FROM media WHERE source_media_id = 9001", [])
+            .expect("delete media");
+        let deleted = verify_library(&library, VerificationScope::Full).expect("deleted");
+        assert!(deleted.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestMediaDeleted
+                && finding.object_id == Some(object_id)
+        }));
+        assert!(deleted.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestMediaPlacementDeleted
+                && finding.object_id == Some(object_id)
+        }));
     }
 
     #[test]
