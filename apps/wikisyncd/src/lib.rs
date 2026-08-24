@@ -7,6 +7,7 @@
 
 mod application;
 mod collection;
+mod dump_bootstrap;
 mod network;
 mod schedule;
 mod source;
@@ -16,6 +17,11 @@ pub use collection::{
     CollectionAdministration, CollectionAdministrationOutcome, CollectionDraft,
     CollectionDraftEstimate, administer_collection_direct, decode_collection_draft,
     encode_collection_draft,
+};
+pub use dump_bootstrap::{
+    CurrentDumpBootstrapOutcome, CurrentDumpBootstrapPreview, CurrentDumpBootstrapRequest,
+    bootstrap_collection_from_current_dump_direct,
+    bootstrap_collection_from_current_dump_direct_async, preview_current_dump_bootstrap,
 };
 pub use network::{
     MeteredNetworkProbeOutcome, MeteredNetworkState, MeteredNetworkStatus, detect_metered_network,
@@ -63,6 +69,8 @@ const IPC_LOCK_NAME: &str = ".wikisync-ipc.lock";
 pub const SET_COLLECTION_SCHEDULE_EXTENSION: &str = "set-collection-schedule-v1";
 /// Versioned extension name used to configure the library-wide network policy.
 pub const SET_NETWORK_TRANSFER_POLICY_EXTENSION: &str = "set-network-transfer-policy-v1";
+/// Versioned extension used to execute one authenticated current-dump bootstrap.
+pub const SET_CURRENT_DUMP_BOOTSTRAP_EXTENSION: &str = "current-dump-bootstrap-v1";
 
 const REQUEST_MAGIC: &[u8; 4] = b"WKSR";
 const RESPONSE_MAGIC: &[u8; 4] = b"WKSP";
@@ -655,6 +663,21 @@ impl Client {
             ResponseKind::Error(error) => Err(DaemonError::Remote(error)),
             kind => Err(unexpected_response("mutation", kind)),
         }
+    }
+
+    /// Executes one authenticated current-dump bootstrap through the daemon writer.
+    pub fn bootstrap_collection_from_current_dump(
+        &self,
+        request: &CurrentDumpBootstrapRequest,
+    ) -> Result<CurrentDumpBootstrapOutcome, DaemonError> {
+        let outcome =
+            self.forward_mutation(dump_bootstrap::current_dump_bootstrap_mutation(request)?)?;
+        if outcome.result != "current-dump-bootstrap-complete" {
+            return Err(DaemonError::Protocol(
+                "unexpected current-dump bootstrap result name",
+            ));
+        }
+        dump_bootstrap::decode_current_dump_bootstrap_outcome(&outcome.payload)
     }
 
     /// Requests graceful shutdown after the daemon's current request completes.

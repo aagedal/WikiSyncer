@@ -1,6 +1,6 @@
 # WikiSyncer implementation status
 
-Updated: 2026-08-23
+Updated: 2026-08-24
 
 ## Completed backlog items
 
@@ -296,6 +296,29 @@ Stable contracts, pack tuning, and dump-import foundations now also include:
   intermediate revisions are durable before the bootstrap checkpoint and manifest
   complete. Ordinary bootstrap jobs cannot be adopted as dump work.
 
+Authenticated current-dump bootstrap now also has an end-to-end product workflow:
+
+- a typed, bounded shared service previews the configured source, independently
+  retained BLAKE3 index identity, resolved stable-page-ID scope, durable network
+  policy, acquisition/parser/storage ceilings, private cache location, collection
+  generation, and hard page/canonical-byte budgets without contacting the source;
+- execution is bound to the previewed collection generation, preserves the
+  `TrustedDumpIndex` to authenticated acquisition to `VerifiedDumpSet` boundary, and
+  uses the same direct short-writer or daemon-owned writer discovery as other
+  mutations. A versioned bounded daemon extension preserves protocol-1/2 behavior;
+- `wikisync dump-bootstrap` is preview-only by default and requires explicit
+  `--commit`, a collection ID, index URL, caller-retained BLAKE3 index digest, and
+  expected database. Human and stable JSON output explicitly warn that a checksum
+  downloaded or stored beside the index is not an independent trust anchor;
+- Iced provides separate preview and confirmed-start controls for the same trust,
+  scope, limits, and budgets, including safe async direct execution without nesting a
+  runtime; and CLI/GUI status surfaces durable dump identity, cursor, imported pages
+  and bytes, attempts, retryability, and structured failure state; and
+- offline fixtures cover direct execution, daemon forwarding, GUI execution inside
+  its Tokio task, and a retryable closure failure followed by a real daemon restart.
+  The restart re-authenticates the index, reuses the verified cached artifact, and
+  resumes the same run/import identity without counting partial work as complete.
+
 Optional-thumbnail capture now forms an end-to-end, default-off stable-v1 path:
 
 - schema migration 12 adds default-off, generation-tracked bounded thumbnail policy,
@@ -384,8 +407,7 @@ The ordered first implementation backlog (items 1–13) is complete. The broader
 milestone delivery lists are not all closed: destructive purge is not implemented,
 credentialed platform packages remain outstanding, while pack tuning, the initial
 stable-contract definition, optional thumbnail media, and the authenticated durable
-dump-bootstrap library path are implemented. Dump bootstrap remains partial Milestone
-5 product work until it is exposed through the daemon and user-facing administration.
+dump-bootstrap library and daemon/CLI/GUI product paths are implemented.
 Daemon-owned source administration, the planned
 non-destructive collection CLI/GUI surface, user-facing external
 signing/trusted-anchor workflows, historical export, and periodic dynamic-category
@@ -404,20 +426,30 @@ protection when the anchor is kept with and can be replaced alongside the librar
 
 ## Next checkpoint
 
-For locally actionable stable-v1 work, expose authenticated current-dump bootstrap
-through the single-writer daemon and an explicit CLI/GUI workflow. The workflow must
-preview source, trusted index identity, scope, transfer/storage limits, and hard
-collection budgets; must never treat a co-located legacy checksum as an independent
-trust anchor; and must preserve the typed `VerifiedDumpSet` boundary already enforced
-by the library path. Add fixture-backed direct/daemon forwarding, restart, and status
-tests without depending on live Wikimedia services.
+The next locally actionable stable-v1 item is the separately confirmed destructive
+purge design. It must not be implemented as ordinary row/file deletion: the current
+schema has no authenticated purge event, full verification does not yet reconcile
+every manifested text revision/page claim against current storage, and selective pack
+deletion can strand retained delta dependents. A naive purge could therefore remove
+manifested canonical content while later verification incorrectly appears clean.
+
+The safe checkpoint is to define and implement a backward-readable manifest event for
+authorized purge, a durable preview/authorization/cleanup journal, bounded shared-
+reference closure, manifest-aware findings for unexplained versus authorized absence,
+and verified replacement-pack activation before old packed bytes are retired. The
+product contract must first confirm that purge means collection-exclusive payload and
+storage reclamation while retaining audit metadata and hashes; complete personal-
+metadata erasure and secure erasure of backups, snapshots, or SSD remnants are
+different promises and cannot be inferred. CLI/GUI commit must remain preview-first,
+generation/head/catalog-bound, tombstone-only, and require explicit name, fingerprint,
+and backup acknowledgements through the same direct/daemon writer boundary.
 
 Credentialed Apple signing/notarization, protected production release identities and
 independent trust distribution, native release validation, clean-system assessment,
 and signed publication must still succeed before candidate archives can be called
 signed beta packages; those external actions remain unauthorized/unavailable in this
-checkpoint. Destructive purge design and release acceptance on macOS/Ubuntu also
-remain separately tracked Milestone 5 work.
+checkpoint. Release acceptance on macOS/Ubuntu also remains separately tracked
+Milestone 5 work.
 
 Milestone gates remain tracked in `IMPLEMENTATION_PLAN.md`; an item being complete
 means its initial implementation is present, not that its later milestone hardening

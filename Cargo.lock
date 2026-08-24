@@ -3686,6 +3686,8 @@ version = "0.1.0"
 name = "wikisync-gui"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "bzip2",
  "iced",
  "tempfile",
  "tokio",
@@ -3792,6 +3794,8 @@ dependencies = [
 name = "wikisyncd"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "bzip2",
  "fs2",
  "signal-hook",
  "tokio",

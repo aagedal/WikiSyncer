@@ -1,5 +1,6 @@
 mod collection;
 mod doctor;
+mod dump_bootstrap;
 mod export;
 mod trust;
 
@@ -23,7 +24,8 @@ use wikisync_search::{
     MAX_SEARCH_RESULTS, SearchError, SearchIndex, SearchQuery, SqliteSearchIndex,
 };
 use wikisync_store::{
-    Library, StoreError, StoredPage, StoredRevision, SyncCheckpoint, SyncRunState, SyncRunStatus,
+    DumpImportStatus, Library, StoreError, StoredPage, StoredRevision, SyncCheckpoint,
+    SyncRunState, SyncRunStatus,
 };
 use wikisync_sync::{CategoryPreviewLimits, preview_category_selection};
 use wikisyncd::{
@@ -65,6 +67,7 @@ Usage:
   wikisync --library <path> sync [--collection <id>]
   wikisync --library <path> verify [--full]
   wikisync --library <path> compact
+  wikisync --library <path> dump-bootstrap --collection <id> --index-url <url> --index-blake3 <digest> --expected-database <name> [--commit] [--json]
   wikisync --library <path> status [--json]
   wikisync --library <path> export --format <markdown|text> [--collection <id>] [--at <revision-or-time>]
   wikisync --library <path> doctor [--json] [--bundle <new-file>] [--online]
@@ -143,6 +146,10 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
             let command = match command {
                 Command::Collection(command) => {
                     return collection::run(&library_root, command).map_err(Into::into);
+                }
+                Command::DumpBootstrap(command) => {
+                    return dump_bootstrap::run(&library_root, command, CLI_JSON_SCHEMA_VERSION)
+                        .map_err(Into::into);
                 }
                 command => command,
             };
@@ -408,6 +415,9 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                 Command::Collection(_) => {
                     unreachable!("collection administration returned before opening a reader")
                 }
+                Command::DumpBootstrap(_) => {
+                    unreachable!("dump bootstrap returned before opening a reader")
+                }
                 Command::TrustKeyGenerate { .. }
                 | Command::TrustKeyValidate { .. }
                 | Command::TrustKeyImport { .. }
@@ -612,14 +622,28 @@ fn category_preview(
 fn status(library: &Library, json_output: bool) -> Result<(), CliError> {
     let checkpoints = library.sync_checkpoints()?;
     let runs = library.sync_run_statuses(20)?;
+    let dump_imports = runs
+        .iter()
+        .map(|run| library.dump_import_status(run.run_id))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     let state = library_sync_state(&runs);
     if json_output {
-        write_json(&json!({
+        let mut output = json!({
             "schema_version": CLI_JSON_SCHEMA_VERSION,
             "state": state,
             "checkpoints": checkpoints.iter().map(checkpoint_json).collect::<Vec<_>>(),
             "runs": runs.iter().map(sync_run_json).collect::<Vec<_>>(),
-        }))?;
+        });
+        // Preserve the stable empty-status v1 contract byte-for-byte while exposing
+        // the extension whenever durable dump work exists in the bounded run window.
+        if !dump_imports.is_empty() {
+            output["dump_imports"] =
+                serde_json::Value::Array(dump_imports.iter().map(dump_import_json).collect());
+        }
+        write_json(&output)?;
     } else {
         println!("WikiSyncer status: {state}");
         if checkpoints.is_empty() {
@@ -653,9 +677,63 @@ fn status(library: &Library, json_output: bool) -> Result<(), CliError> {
             if let Some(error) = run.latest_error {
                 println!("  Last error [{}]: {}", error.code, error.message);
             }
+            if let Some(import) = dump_imports
+                .iter()
+                .find(|import| import.run_id == run.run_id)
+            {
+                println!(
+                    "  Dump import {}: {} — index {}, cursor {} pages; {} selected pages / {} canonical bytes; authenticated dump set {} compressed bytes; attempt {}",
+                    import.import_id,
+                    import.state.as_str(),
+                    import.dump_digest,
+                    import.pages_scanned,
+                    import.imported_pages,
+                    import.imported_canonical_bytes,
+                    import.dump_compressed_bytes,
+                    import.attempt_count,
+                );
+                if let Some(error) = &import.latest_error {
+                    println!(
+                        "    Last dump error [{}; retryable={}]: {}",
+                        error.code, error.retryable, error.message
+                    );
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn dump_import_json(import: &DumpImportStatus) -> serde_json::Value {
+    json!({
+        "import_id": import.import_id,
+        "run_id": import.run_id,
+        "wiki_id": import.wiki_id.get(),
+        "collection_id": import.collection_id.get(),
+        "authenticated_index_digest": import.dump_digest,
+        "dump_compressed_bytes": import.dump_compressed_bytes,
+        "collection_generation": import.collection_generation,
+        "configuration_hash": import.configuration_hash,
+        "bootstrap_started_at": import.bootstrap_started_at,
+        "state": import.state.as_str(),
+        "progress": {
+            "pages_scanned": import.pages_scanned,
+            "imported_pages": import.imported_pages,
+            "imported_canonical_bytes": import.imported_canonical_bytes,
+        },
+        "attempt_count": import.attempt_count,
+        "retryable": import.retryable,
+        "created_at": import.created_at,
+        "claimed_at": import.claimed_at,
+        "updated_at": import.updated_at,
+        "finished_at": import.finished_at,
+        "latest_error": import.latest_error.as_ref().map(|error| json!({
+            "code": error.code,
+            "message": error.message,
+            "retryable": error.retryable,
+            "occurred_at": error.occurred_at,
+        })),
+    })
 }
 
 fn library_sync_state(runs: &[SyncRunStatus]) -> &'static str {
@@ -1119,6 +1197,7 @@ enum Command {
         json: bool,
     },
     Collection(collection::Command),
+    DumpBootstrap(dump_bootstrap::Command),
     TrustKeyGenerate {
         output: PathBuf,
     },
@@ -1218,8 +1297,8 @@ fn parse(
             Some("--version" | "-V") => return Ok(Action::Version),
             Some(
                 "init" | "source" | "collection" | "trust" | "category-preview" | "search" | "show"
-                | "history" | "diff" | "sync" | "verify" | "compact" | "status" | "export"
-                | "doctor" | "serve",
+                | "history" | "diff" | "sync" | "verify" | "compact" | "dump-bootstrap" | "status"
+                | "export" | "doctor" | "serve",
             ) => break argument,
             Some(value) => return Err(CliError::usage(format!("unknown command {value:?}"))),
             None => return Err(CliError::usage("arguments must be valid UTF-8")),
@@ -1257,6 +1336,9 @@ fn parse(
         Some("sync") => parse_sync(values)?,
         Some("verify") => parse_verify(values)?,
         Some("compact") => parse_compact(values)?,
+        Some("dump-bootstrap") => {
+            Command::DumpBootstrap(dump_bootstrap::parse(values).map_err(CliError::usage)?)
+        }
         Some("status") => parse_status(values)?,
         Some("export") => parse_export(values)?,
         Some("doctor") => parse_doctor(values)?,
@@ -1971,6 +2053,12 @@ impl From<wikisync_sync::CategoryPreviewError> for CliError {
 
 impl From<collection::Error> for CliError {
     fn from(error: collection::Error) -> Self {
+        Self::message(error.to_string())
+    }
+}
+
+impl From<dump_bootstrap::Error> for CliError {
+    fn from(error: dump_bootstrap::Error) -> Self {
         Self::message(error.to_string())
     }
 }

@@ -8,6 +8,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod dump;
+
 use iced::widget::{
     Space, button, checkbox, column, container, horizontal_rule, progress_bar, row, scrollable,
     text, text_input,
@@ -24,8 +26,9 @@ use wikisync_integrity::{
 };
 use wikisync_mediawiki::ClientConfig;
 use wikisync_store::{
-    CollectionSchedule, Library, NetworkTransferPolicy, ScheduleCadence, StoredCollection,
-    StoredCollectionConfiguration, StoredWiki, SyncCheckpoint, SyncRunState, SyncRunStatus,
+    CollectionSchedule, DumpImportStatus, Library, NetworkTransferPolicy, ScheduleCadence,
+    StoredCollection, StoredCollectionConfiguration, StoredWiki, SyncCheckpoint, SyncRunState,
+    SyncRunStatus,
 };
 use wikisync_sync::{
     CategoryPreviewLimits, CollectionSelectionPreview, bootstrap_collection, parse_title_list,
@@ -35,9 +38,12 @@ use wikisync_web::ReaderHandle;
 use wikisyncd::{
     CollectionAdministration, CollectionAdministrationOutcome, CollectionDraft,
     MeteredNetworkState, Mutation, SourceAdministration, SourceAdministrationOutcome, WriterAccess,
-    WriterLease, administer_collection_direct, administer_source_direct, detect_metered_network,
+    WriterLease, administer_collection_direct, administer_source_direct,
+    bootstrap_collection_from_current_dump_direct_async, detect_metered_network,
     next_occurrence_after, set_collection_schedule_mutation, set_network_transfer_policy_mutation,
 };
+
+use dump::{DumpBootstrapForm, DumpBootstrapPreview, INDEPENDENT_ANCHOR_NOTICE};
 
 const DATABASE_NAME: &str = "library.sqlite3";
 const RECENT_REVISION_LIMIT: u32 = 12;
@@ -67,6 +73,8 @@ struct App {
     remove_confirmation: Option<CollectionId>,
     schedule_editor: Option<ScheduleEditor>,
     network_policy_editor: NetworkPolicyEditor,
+    dump_bootstrap_form: DumpBootstrapForm,
+    dump_bootstrap_preview: Option<DumpBootstrapPreview>,
     selection_preview: Option<CollectionSelectionPreview>,
     verification: VerificationState,
     signing_key_path: String,
@@ -97,6 +105,8 @@ impl App {
             remove_confirmation: None,
             schedule_editor: None,
             network_policy_editor: NetworkPolicyEditor::default(),
+            dump_bootstrap_form: DumpBootstrapForm::default(),
+            dump_bootstrap_preview: None,
             selection_preview: None,
             verification: VerificationState::NotRun,
             signing_key_path: String::new(),
@@ -185,6 +195,7 @@ impl App {
                 self.screen = Screen::Setup;
                 self.snapshot = None;
                 self.notice = None;
+                self.dump_bootstrap_preview = None;
                 self.verification = VerificationState::NotRun;
                 self.reader = None;
             }
@@ -900,6 +911,145 @@ impl App {
                     Err(error) => self.notice = Some(Notice::error(error)),
                 }
             }
+            Message::DumpCollectionChanged(value) => {
+                if !self.is_busy() {
+                    self.dump_bootstrap_form.collection_id = value;
+                    self.dump_bootstrap_preview = None;
+                }
+            }
+            Message::DumpIndexUrlChanged(value) => {
+                if !self.is_busy() {
+                    self.dump_bootstrap_form.trusted_index_url = value;
+                    self.dump_bootstrap_preview = None;
+                }
+            }
+            Message::DumpIndexDigestChanged(value) => {
+                if !self.is_busy() {
+                    self.dump_bootstrap_form.trusted_index_digest = value;
+                    self.dump_bootstrap_preview = None;
+                }
+            }
+            Message::DumpExpectedDatabaseChanged(value) => {
+                if !self.is_busy() {
+                    self.dump_bootstrap_form.expected_database = value;
+                    self.dump_bootstrap_preview = None;
+                }
+            }
+            Message::DumpMaxIndexBytesChanged(value) => {
+                if !self.is_busy() {
+                    self.dump_bootstrap_form.max_index_bytes = value;
+                    self.dump_bootstrap_preview = None;
+                }
+            }
+            Message::DumpMaxArtifactBytesChanged(value) => {
+                if !self.is_busy() {
+                    self.dump_bootstrap_form.max_artifact_bytes = value;
+                    self.dump_bootstrap_preview = None;
+                }
+            }
+            Message::DumpMaxTotalArtifactBytesChanged(value) => {
+                if !self.is_busy() {
+                    self.dump_bootstrap_form.max_total_artifact_bytes = value;
+                    self.dump_bootstrap_preview = None;
+                }
+            }
+            Message::DumpMaxArtifactsChanged(value) => {
+                if !self.is_busy() {
+                    self.dump_bootstrap_form.max_artifacts = value;
+                    self.dump_bootstrap_preview = None;
+                }
+            }
+            Message::DumpMaxElapsedSecondsChanged(value) => {
+                if !self.is_busy() {
+                    self.dump_bootstrap_form.max_elapsed_seconds = value;
+                    self.dump_bootstrap_preview = None;
+                }
+            }
+            Message::DumpMaxCompressedBytesChanged(value) => {
+                if !self.is_busy() {
+                    self.dump_bootstrap_form.max_compressed_bytes = value;
+                    self.dump_bootstrap_preview = None;
+                }
+            }
+            Message::DumpMaxDecompressedBytesChanged(value) => {
+                if !self.is_busy() {
+                    self.dump_bootstrap_form.max_decompressed_bytes = value;
+                    self.dump_bootstrap_preview = None;
+                }
+            }
+            Message::DumpMaxPagesChanged(value) => {
+                if !self.is_busy() {
+                    self.dump_bootstrap_form.max_pages = value;
+                    self.dump_bootstrap_preview = None;
+                }
+            }
+            Message::DumpMaxPageXmlBytesChanged(value) => {
+                if !self.is_busy() {
+                    self.dump_bootstrap_form.max_page_xml_bytes = value;
+                    self.dump_bootstrap_preview = None;
+                }
+            }
+            Message::DumpMaxTextBytesChanged(value) => {
+                if !self.is_busy() {
+                    self.dump_bootstrap_form.max_text_bytes = value;
+                    self.dump_bootstrap_preview = None;
+                }
+            }
+            Message::PreviewDumpBootstrap => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                self.notice = None;
+                let path = PathBuf::from(&self.library_path);
+                let key = self.begin_request(path.clone());
+                return dump_preview_task(key, path, self.dump_bootstrap_form.clone());
+            }
+            Message::DumpBootstrapPreviewed(completion) => {
+                if !self.finish_request(&completion.key) {
+                    return Task::none();
+                }
+                match completion.result {
+                    Ok(preview) => {
+                        self.notice = Some(Notice::success(
+                            "Dump bootstrap preview is ready. Confirm the independent trust identity, scope, limits, and hard budgets before starting.",
+                        ));
+                        self.dump_bootstrap_preview = Some(preview);
+                    }
+                    Err(error) => self.notice = Some(Notice::error(error)),
+                }
+            }
+            Message::StartDumpBootstrap => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let Some(preview) = self.dump_bootstrap_preview.clone() else {
+                    self.notice = Some(Notice::error(
+                        "Preview the authenticated dump bootstrap before starting it.",
+                    ));
+                    return Task::none();
+                };
+                self.notice = None;
+                let path = PathBuf::from(&self.library_path);
+                let key = self.begin_request(path.clone());
+                return dump_bootstrap_task(key, path, preview);
+            }
+            Message::DumpBootstrapFinished(completion) => {
+                if !self.finish_request(&completion.key) {
+                    return Task::none();
+                }
+                match completion.result {
+                    Ok(snapshot) => {
+                        self.network_policy_editor =
+                            NetworkPolicyEditor::from_policy(snapshot.network_policy);
+                        self.snapshot = Some(snapshot);
+                        self.dump_bootstrap_preview = None;
+                        self.notice = Some(Notice::success(
+                            "Authenticated current-dump bootstrap completed. Its durable import status and checkpoint are shown below.",
+                        ));
+                    }
+                    Err(error) => self.notice = Some(Notice::error(error)),
+                }
+            }
             Message::SigningKeyPathChanged(value) => {
                 if !self.is_busy() {
                     self.signing_key_path = value;
@@ -1603,7 +1753,7 @@ impl App {
         column![list, horizontal_rule(1), form].spacing(18).into()
     }
 
-    fn sync_view<'a>(&self, snapshot: &'a DashboardSnapshot) -> Element<'a, Message> {
+    fn sync_view<'a>(&'a self, snapshot: &'a DashboardSnapshot) -> Element<'a, Message> {
         let rate_label = snapshot
             .network_policy
             .max_download_bytes_per_second()
@@ -1649,8 +1799,52 @@ impl App {
                 .spacing(9),
             )
             .padding(12),
+            self.dump_bootstrap_panel(),
         ]
         .spacing(10);
+
+        content = content.push(text("Durable dump-import progress").size(23));
+        if snapshot.dump_imports.is_empty() {
+            content = content.push(text("No authenticated current-dump imports recorded."));
+        } else {
+            for import in &snapshot.dump_imports {
+                let mut card = column![
+                    row![
+                        text(format!(
+                            "Dump import #{} · collection {} · run #{}",
+                            import.import_id, import.collection_id, import.run_id
+                        ))
+                        .size(19),
+                        Space::new(Length::Fill, Length::Shrink),
+                        text(import.state.as_str()),
+                    ],
+                    text(format!(
+                        "{} pages scanned · {} selected pages imported · {} canonical bytes · attempt {}{}",
+                        import.pages_scanned,
+                        import.imported_pages,
+                        format_bytes(import.imported_canonical_bytes),
+                        import.attempt_count,
+                        if import.retryable { " · retryable" } else { "" },
+                    )),
+                    text(format!(
+                        "Authenticated index {} · compressed artifact set {}",
+                        import.dump_digest,
+                        format_bytes(import.dump_compressed_bytes),
+                    ))
+                    .size(13),
+                ]
+                .spacing(7);
+                if let Some(error) = &import.latest_error {
+                    card = card.push(text(format!(
+                        "Last import error [{}]: {}",
+                        error.code, error.message
+                    )));
+                }
+                content = content.push(container(card).padding(12));
+            }
+        }
+
+        content = content.push(horizontal_rule(1));
 
         if snapshot.runs.is_empty() {
             content = content.push(text("No synchronization runs recorded."));
@@ -1708,6 +1902,153 @@ impl App {
             }
         }
         content.into()
+    }
+
+    fn dump_bootstrap_panel(&self) -> Element<'_, Message> {
+        let form = &self.dump_bootstrap_form;
+        let preview: Element<'_, Message> = self.dump_bootstrap_preview.as_ref().map_or_else(
+            || text("No dump bootstrap preview is active.").into(),
+            |preview| {
+                let page_budget = preview.budget.maximum_pages().map_or_else(
+                    || "unlimited".to_owned(),
+                    |value| value.get().to_string(),
+                );
+                let byte_budget = preview.budget.maximum_bytes().map_or_else(
+                    || "unlimited".to_owned(),
+                    |value| format_bytes(value.get()),
+                );
+                let byte_rate = preview.max_download_bytes_per_second.map_or_else(
+                    || "unlimited".to_owned(),
+                    |value| format!("{}/s", format_bytes(value)),
+                );
+                container(
+                    column![
+                        text("Confirmed preview").size(20),
+                        text(format!(
+                            "Source: {} ({}, wiki {})",
+                            preview.source_endpoint, preview.language_code, preview.wiki_id
+                        )),
+                        text(format!(
+                            "Trust identity: BLAKE3 {} for {} (expected database {})",
+                            preview.draft.trusted_index_digest.to_hex(),
+                            preview.draft.trusted_index_url,
+                            preview.draft.expected_database,
+                        )),
+                        text(format!(
+                            "Scope: collection {} “{}”, generation {}, {} resolved pages",
+                            preview.draft.collection_id,
+                            preview.collection_name,
+                            preview.collection_generation,
+                            preview.resolved_pages,
+                        )),
+                        text(format!(
+                            "Hard collection budgets: pages {page_budget}; canonical bytes {byte_budget}."
+                        )),
+                        text(format!(
+                            "Transfer/storage ceilings: index {}, each artifact {}, all cached artifacts {}, {} artifacts, {} seconds; private cache {}.",
+                            format_bytes(preview.draft.acquisition_limits.max_index_bytes as u64),
+                            format_bytes(preview.draft.acquisition_limits.max_artifact_bytes),
+                            format_bytes(preview.draft.acquisition_limits.max_total_artifact_bytes),
+                            preview.draft.acquisition_limits.max_artifacts,
+                            preview.draft.acquisition_limits.max_elapsed.as_secs(),
+                            preview.cache_directory,
+                        )),
+                        text(format!(
+                            "Durable network policy: {} concurrent request(s), byte rate {byte_rate}, metered-network avoidance {}.",
+                            preview.max_concurrent_requests,
+                            if preview.avoid_metered_networks { "enabled" } else { "disabled" },
+                        )),
+                        text(format!(
+                            "Parser ceilings: compressed {}, decompressed {}, {} pages, {} XML/page, {} revision text.",
+                            format_bytes(preview.draft.parser_limits.max_compressed_bytes),
+                            format_bytes(preview.draft.parser_limits.max_decompressed_bytes),
+                            preview.draft.parser_limits.max_pages,
+                            format_bytes(preview.draft.parser_limits.max_page_xml_bytes),
+                            format_bytes(preview.draft.parser_limits.max_text_bytes as u64),
+                        )),
+                        button("Confirm and start authenticated dump bootstrap").on_press_maybe(
+                            (!self.is_busy()).then_some(Message::StartDumpBootstrap)
+                        ),
+                    ]
+                    .spacing(6),
+                )
+                .padding(10)
+                .into()
+            },
+        );
+
+        container(
+            column![
+                text("Authenticated current-dump bootstrap").size(23),
+                text("Use a current-page dump only for an already resolved current-and-future collection. Previewing is read-only; starting is a separate single-writer action."),
+                text(INDEPENDENT_ANCHOR_NOTICE).size(13),
+                row![
+                    text_input("Collection ID", &form.collection_id)
+                        .on_input(Message::DumpCollectionChanged)
+                        .padding(10),
+                    text_input("Expected database (for example: enwiki)", &form.expected_database)
+                        .on_input(Message::DumpExpectedDatabaseChanged)
+                        .padding(10),
+                ]
+                .spacing(10),
+                text_input("Trusted dump index URL", &form.trusted_index_url)
+                    .on_input(Message::DumpIndexUrlChanged)
+                    .padding(10),
+                text_input("Independently retained BLAKE3 index digest (64 hex digits)", &form.trusted_index_digest)
+                    .on_input(Message::DumpIndexDigestChanged)
+                    .padding(10),
+                text("Transfer and cached-artifact storage limits").size(17),
+                row![
+                    text_input("Maximum index bytes", &form.max_index_bytes)
+                        .on_input(Message::DumpMaxIndexBytesChanged)
+                        .padding(10),
+                    text_input("Maximum bytes per artifact", &form.max_artifact_bytes)
+                        .on_input(Message::DumpMaxArtifactBytesChanged)
+                        .padding(10),
+                    text_input("Maximum total artifact bytes", &form.max_total_artifact_bytes)
+                        .on_input(Message::DumpMaxTotalArtifactBytesChanged)
+                        .padding(10),
+                ]
+                .spacing(8),
+                row![
+                    text_input("Maximum artifact count", &form.max_artifacts)
+                        .on_input(Message::DumpMaxArtifactsChanged)
+                        .padding(10),
+                    text_input("Maximum acquisition seconds", &form.max_elapsed_seconds)
+                        .on_input(Message::DumpMaxElapsedSecondsChanged)
+                        .padding(10),
+                ]
+                .spacing(8),
+                text("Streaming parser limits").size(17),
+                row![
+                    text_input("Maximum compressed bytes", &form.max_compressed_bytes)
+                        .on_input(Message::DumpMaxCompressedBytesChanged)
+                        .padding(10),
+                    text_input("Maximum decompressed bytes", &form.max_decompressed_bytes)
+                        .on_input(Message::DumpMaxDecompressedBytesChanged)
+                        .padding(10),
+                    text_input("Maximum scanned pages", &form.max_pages)
+                        .on_input(Message::DumpMaxPagesChanged)
+                        .padding(10),
+                ]
+                .spacing(8),
+                row![
+                    text_input("Maximum XML bytes per page", &form.max_page_xml_bytes)
+                        .on_input(Message::DumpMaxPageXmlBytesChanged)
+                        .padding(10),
+                    text_input("Maximum revision text bytes", &form.max_text_bytes)
+                        .on_input(Message::DumpMaxTextBytesChanged)
+                        .padding(10),
+                ]
+                .spacing(8),
+                button("Preview authenticated dump bootstrap")
+                    .on_press_maybe((!self.is_busy()).then_some(Message::PreviewDumpBootstrap)),
+                preview,
+            ]
+            .spacing(9),
+        )
+        .padding(12)
+        .into()
     }
 
     fn integrity_view<'a>(&'a self, snapshot: &'a DashboardSnapshot) -> Element<'a, Message> {
@@ -1881,6 +2222,24 @@ enum Message {
     AvoidMeteredNetworksChanged(bool),
     SaveNetworkPolicy,
     NetworkPolicySaved(ScopedResult<DashboardSnapshot>),
+    DumpCollectionChanged(String),
+    DumpIndexUrlChanged(String),
+    DumpIndexDigestChanged(String),
+    DumpExpectedDatabaseChanged(String),
+    DumpMaxIndexBytesChanged(String),
+    DumpMaxArtifactBytesChanged(String),
+    DumpMaxTotalArtifactBytesChanged(String),
+    DumpMaxArtifactsChanged(String),
+    DumpMaxElapsedSecondsChanged(String),
+    DumpMaxCompressedBytesChanged(String),
+    DumpMaxDecompressedBytesChanged(String),
+    DumpMaxPagesChanged(String),
+    DumpMaxPageXmlBytesChanged(String),
+    DumpMaxTextBytesChanged(String),
+    PreviewDumpBootstrap,
+    DumpBootstrapPreviewed(ScopedResult<DumpBootstrapPreview>),
+    StartDumpBootstrap,
+    DumpBootstrapFinished(ScopedResult<DashboardSnapshot>),
     SigningKeyPathChanged(String),
     TrustedHeadPathChanged(String),
     GenerateSigningKey,
@@ -1925,6 +2284,7 @@ struct DashboardSnapshot {
     collection_configurations: Vec<StoredCollectionConfiguration>,
     schedules: Vec<CollectionSchedule>,
     runs: Vec<SyncRunStatus>,
+    dump_imports: Vec<DumpImportStatus>,
     checkpoints: Vec<SyncCheckpoint>,
     recent_revisions: Vec<RecentRevision>,
     unique_page_count: usize,
@@ -2547,6 +2907,30 @@ fn save_network_policy_task(
     )
 }
 
+fn dump_preview_task(key: RequestKey, path: PathBuf, form: DumpBootstrapForm) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = form.preview(&path);
+            ScopedResult { key, result }
+        },
+        Message::DumpBootstrapPreviewed,
+    )
+}
+
+fn dump_bootstrap_task(
+    key: RequestKey,
+    path: PathBuf,
+    preview: DumpBootstrapPreview,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = start_dump_bootstrap(path, preview).await;
+            ScopedResult { key, result }
+        },
+        Message::DumpBootstrapFinished,
+    )
+}
+
 fn verification_task(key: RequestKey) -> Task<Message> {
     Task::perform(
         async move {
@@ -3024,6 +3408,38 @@ async fn update_collection(
     snapshot(&library)
 }
 
+async fn start_dump_bootstrap(
+    path: PathBuf,
+    preview: DumpBootstrapPreview,
+) -> Result<DashboardSnapshot, String> {
+    let request = preview
+        .draft
+        .request()?
+        .with_expected_collection_generation(preview.collection_generation);
+    let current_generation = collection_generation(&path, preview.draft.collection_id)?;
+    if current_generation != preview.collection_generation {
+        return Err(
+            "The collection changed after the dump bootstrap preview. Refresh, preview the current scope and budgets again, then confirm."
+                .to_owned(),
+        );
+    }
+    match WriterAccess::discover(&path).map_err(|error| error.to_string())? {
+        WriterAccess::Direct(_lease) => {
+            let mut library = Library::open(&path).map_err(|error| error.to_string())?;
+            bootstrap_collection_from_current_dump_direct_async(&mut library, &request)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        WriterAccess::Daemon(client) => {
+            client
+                .bootstrap_collection_from_current_dump(&request)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    let library = Library::open_read_only(&path).map_err(|error| error.to_string())?;
+    snapshot(&library)
+}
+
 async fn save_collection_schedule(
     path: PathBuf,
     collection_id: CollectionId,
@@ -3450,6 +3866,17 @@ fn snapshot(library: &Library) -> Result<DashboardSnapshot, String> {
     let runs = library
         .sync_run_statuses(20)
         .map_err(|error| error.to_string())?;
+    let dump_imports = runs
+        .iter()
+        .map(|run| {
+            library
+                .dump_import_status(run.run_id)
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<Option<DumpImportStatus>>, String>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     let checkpoints = library
         .sync_checkpoints()
         .map_err(|error| error.to_string())?;
@@ -3491,6 +3918,7 @@ fn snapshot(library: &Library) -> Result<DashboardSnapshot, String> {
         collection_configurations,
         schedules,
         runs,
+        dump_imports,
         checkpoints,
         recent_revisions,
         unique_page_count: unique_pages.len(),
@@ -4130,12 +4558,15 @@ fn storage_files_label(storage: &Result<StorageUsage, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bzip2::Compression;
+    use bzip2::write::BzEncoder;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc as Shared, Mutex};
     use std::thread;
     use wikisync_core::{PageId, PageTitle, RevisionId};
-    use wikisync_store::{CurrentRevisionCapture, SyncRunKind};
+    use wikisync_store::{CurrentRevisionCapture, DumpImportRequest, SyncRunKind};
 
     const TITLE_RESOLUTION: &str =
         include_str!("../../../fixtures/mediawiki/title-resolution.json");
@@ -4205,6 +4636,111 @@ mod tests {
                 .into_inner()
                 .expect("request lock")
         }
+    }
+
+    #[derive(Debug)]
+    struct DumpFixtureServer {
+        api_endpoint: String,
+        index_url: String,
+        index_digest: String,
+        requests: Shared<AtomicUsize>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl DumpFixtureServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("dump fixture listener");
+            let address = listener.local_addr().expect("dump fixture address");
+            let api_endpoint = format!("http://{address}/w/api.php");
+            let index_url = format!("http://{address}/index.json");
+            let xml = format!(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" version="0.11" xml:lang="en">
+  <siteinfo><sitename>Fixture</sitename><dbname>enwiki</dbname>
+    <base>{api_endpoint}</base><generator>MediaWiki fixture</generator><case>first-letter</case>
+    <namespaces><namespace key="0" case="first-letter" /></namespaces>
+  </siteinfo>
+  <page><title>Alpha</title><ns>0</ns><id>10</id><revision>
+    <id>100</id><parentid>99</parentid><timestamp>2026-08-23T10:00:00Z</timestamp>
+    <contributor><username>Fixture editor</username><id>42</id></contributor>
+    <comment>dump head</comment><model>wikitext</model><format>text/x-wiki</format>
+    <text bytes="5" xml:space="preserve">Alpha</text>
+  </revision></page>
+</mediawiki>"#
+            );
+            let mut encoder = BzEncoder::new(Vec::new(), Compression::best());
+            encoder
+                .write_all(xml.as_bytes())
+                .expect("compress dump XML");
+            let artifact = encoder.finish().expect("finish dump artifact");
+            let index = format!(
+                r#"{{"schema":"wikisync-current-dump-index-v1","database":"enwiki","generated_at":"2026-08-23T10:02:00Z","artifacts":[{{"kind":"pages-meta-current-multistream","path":"fixture.xml.bz2","bytes":{},"blake3":"{}"}}]}}"#,
+                artifact.len(),
+                blake3::hash(&artifact).to_hex()
+            )
+            .into_bytes();
+            let index_digest = blake3::hash(&index).to_hex().to_string();
+            let unchanged = br#"{
+              "batchcomplete":true,"query":{"pages":[{
+                "pageid":10,"ns":0,"title":"Alpha","revisions":[{
+                  "revid":100,"parentid":99,"timestamp":"2026-08-23T10:00:00Z","size":5
+                }]
+              }]}}
+            "#
+            .to_vec();
+            let responses = [
+                (index, "application/json"),
+                (artifact, "application/x-bzip2"),
+                (unchanged, "application/json"),
+            ];
+            let requests = Shared::new(AtomicUsize::new(0));
+            let observed = Shared::clone(&requests);
+            let thread = thread::spawn(move || {
+                for (body, content_type) in responses {
+                    let (mut stream, _) = listener.accept().expect("accept dump request");
+                    read_fixture_request(&mut stream);
+                    observed.fetch_add(1, Ordering::Release);
+                    write_fixture_response(&mut stream, &body, content_type);
+                }
+            });
+            Self {
+                api_endpoint,
+                index_url,
+                index_digest,
+                requests,
+                thread: Some(thread),
+            }
+        }
+
+        fn finish(mut self) {
+            self.thread
+                .take()
+                .expect("dump fixture thread")
+                .join()
+                .expect("dump fixture did not panic");
+            assert_eq!(self.requests.load(Ordering::Acquire), 3);
+        }
+    }
+
+    fn read_fixture_request(stream: &mut TcpStream) {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1_024];
+        while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).expect("read dump request");
+            assert!(read > 0, "client closed before request headers");
+            bytes.extend_from_slice(&buffer[..read]);
+            assert!(bytes.len() < 64 * 1_024, "dump request too large");
+        }
+    }
+
+    fn write_fixture_response(stream: &mut TcpStream, body: &[u8], content_type: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write dump response headers");
+        stream.write_all(body).expect("write dump response body");
     }
 
     #[test]
@@ -4320,6 +4856,92 @@ mod tests {
         assert!(invalid.policy().is_err());
     }
 
+    #[test]
+    fn sync_snapshot_surfaces_durable_dump_import_progress_and_failure() {
+        let temporary = tempfile::tempdir().expect("library");
+        let (wiki_id, collection_id) = seeded_admin_collection(temporary.path());
+        let mut library = Library::open(temporary.path()).expect("writer");
+        let generation = library
+            .collection_configuration(collection_id)
+            .expect("configuration")
+            .expect("configured")
+            .generation;
+        let run = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 1_000)
+            .expect("bootstrap run");
+        let import = library
+            .claim_or_resume_dump_import(DumpImportRequest {
+                run_id: run.status.run_id,
+                dump_digest: &format!("b3:{}", "ab".repeat(32)),
+                dump_compressed_bytes: 4_096,
+                collection_generation: generation,
+                bootstrap_started_at: run.status.checkpoint_candidate,
+            })
+            .expect("dump import");
+        library
+            .record_dump_import_progress(import.status.import_id, 23)
+            .expect("progress");
+        library
+            .fail_dump_import(
+                import.status.import_id,
+                "fixture-interruption",
+                "restartable fixture failure",
+                true,
+            )
+            .expect("failure");
+
+        let snapshot = snapshot(&library).expect("dashboard snapshot");
+        assert_eq!(snapshot.dump_imports.len(), 1);
+        let status = &snapshot.dump_imports[0];
+        assert_eq!(status.collection_id, collection_id);
+        assert_eq!(status.pages_scanned, 23);
+        assert_eq!(status.dump_compressed_bytes, 4_096);
+        assert!(status.retryable);
+        assert_eq!(
+            status.latest_error.as_ref().expect("error").code,
+            "fixture-interruption"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_dump_start_rejects_a_scope_changed_after_preview() {
+        let temporary = tempfile::tempdir().expect("library");
+        let (wiki_id, collection_id) = seeded_admin_collection(temporary.path());
+        let form = DumpBootstrapForm {
+            collection_id: collection_id.get().to_string(),
+            trusted_index_url: "https://dumps.wikimedia.org/enwiki/fixture/index.json".to_owned(),
+            trusted_index_digest: "ab".repeat(32),
+            expected_database: "enwiki".to_owned(),
+            ..DumpBootstrapForm::default()
+        };
+        let preview = form.preview(temporary.path()).expect("read-only preview");
+
+        let mut library = Library::open(temporary.path()).expect("concurrent writer");
+        administer_collection_direct(
+            &mut library,
+            CollectionAdministration::Edit {
+                collection_id,
+                expected_generation: preview.collection_generation,
+                draft: CollectionDraft {
+                    wiki_id,
+                    name: "Changed after preview".to_owned(),
+                    preview: administration_preview("Ferris", 20),
+                    history_policy: HistoryPolicy::CurrentAndFuture,
+                    budget: CollectionBudget::unlimited(),
+                    removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+                },
+            },
+        )
+        .expect("concurrent scope change");
+        drop(library);
+
+        let error = start_dump_bootstrap(temporary.path().to_path_buf(), preview)
+            .await
+            .expect_err("stale confirmed preview must fail before acquisition");
+        assert!(error.contains("changed after the dump bootstrap preview"));
+        assert!(!temporary.path().join("cache/dumps").exists());
+    }
+
     fn administration_preview(title: &str, page_id: u64) -> CollectionSelectionPreview {
         let title = PageTitle::new(title).expect("title");
         CollectionSelectionPreview {
@@ -4336,6 +4958,53 @@ mod tests {
             predicted_canonical_bytes: Some(1_024),
             category_batches: 0,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn direct_dump_bootstrap_succeeds_inside_the_gui_async_task_context() {
+        let server = DumpFixtureServer::start();
+        let temporary = tempfile::tempdir().expect("library");
+        let collection_id = {
+            let mut library = Library::open(temporary.path()).expect("library");
+            let wiki_id = library
+                .register_wiki(&server.api_endpoint, "en")
+                .expect("fixture source");
+            let outcome = administer_collection_direct(
+                &mut library,
+                CollectionAdministration::Add(CollectionDraft {
+                    wiki_id,
+                    name: "Async dump fixture".to_owned(),
+                    preview: administration_preview("Alpha", 10),
+                    history_policy: HistoryPolicy::CurrentAndFuture,
+                    budget: CollectionBudget::unlimited()
+                        .with_maximum_pages(1)
+                        .expect("page budget")
+                        .with_maximum_bytes(1_024)
+                        .expect("byte budget"),
+                    removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+                }),
+            )
+            .expect("fixture collection");
+            added_collection_id(outcome).expect("collection ID")
+        };
+        let form = DumpBootstrapForm {
+            collection_id: collection_id.get().to_string(),
+            trusted_index_url: server.index_url.clone(),
+            trusted_index_digest: server.index_digest.clone(),
+            expected_database: "enwiki".to_owned(),
+            ..DumpBootstrapForm::default()
+        };
+        let preview = form.preview(temporary.path()).expect("dump preview");
+        assert_eq!(server.requests.load(Ordering::Acquire), 0);
+
+        let snapshot = start_dump_bootstrap(temporary.path().to_path_buf(), preview)
+            .await
+            .expect("async-safe direct dump bootstrap");
+        assert_eq!(snapshot.dump_imports.len(), 1);
+        assert_eq!(snapshot.dump_imports[0].state.as_str(), "succeeded");
+        assert_eq!(snapshot.dump_imports[0].imported_pages, 1);
+        assert!(temporary.path().join("cache/dumps").is_dir());
+        server.finish();
     }
 
     fn seeded_admin_collection(path: &Path) -> (WikiId, CollectionId) {

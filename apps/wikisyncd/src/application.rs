@@ -20,9 +20,10 @@ use crate::{
     HandlerStatus, MAX_COLLECTION_DRAFT_BYTES, MAX_COLLECTION_DRAFT_CHUNK_BYTES,
     MeteredNetworkState, MeteredNetworkStatus, Mutation, MutationOutcome, OperationControl,
     OperationError, RequestHandler, SET_COLLECTION_SCHEDULE_EXTENSION,
-    SET_NETWORK_TRANSFER_POLICY_EXTENSION, SourceAdministration, SourceAdministrationOutcome,
-    administer_collection_direct, administer_source_direct, canonical_library_root,
-    detect_metered_network, next_occurrence_after, recover,
+    SET_CURRENT_DUMP_BOOTSTRAP_EXTENSION, SET_NETWORK_TRANSFER_POLICY_EXTENSION,
+    SourceAdministration, SourceAdministrationOutcome, administer_collection_direct,
+    administer_source_direct, bootstrap_collection_from_current_dump_direct,
+    canonical_library_root, detect_metered_network, next_occurrence_after, recover,
 };
 
 const BACKGROUND_RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -561,6 +562,30 @@ impl ApplicationHandler {
         })
     }
 
+    fn bootstrap_current_dump(
+        &mut self,
+        payload: &[u8],
+        control: &OperationControl,
+    ) -> Result<MutationOutcome, OperationError> {
+        if control.is_shutdown_requested() {
+            return Err(OperationError::failed(
+                "current dump bootstrap cancelled by shutdown request",
+            ));
+        }
+        let request = crate::dump_bootstrap::decode_current_dump_bootstrap_request(payload)?;
+        let mut library = Library::open(&self.library_root).map_err(operation_failed)?;
+        let outcome = bootstrap_collection_from_current_dump_direct(&mut library, &request)?;
+        let encoded = crate::dump_bootstrap::encode_current_dump_bootstrap_outcome(&outcome)?;
+        self.last_operation = Some(format!(
+            "completed authenticated current dump bootstrap for collection {} (run {}, import {})",
+            outcome.preview.collection_id, outcome.run_id, outcome.import_id
+        ));
+        Ok(MutationOutcome {
+            result: "current-dump-bootstrap-complete".to_owned(),
+            payload: encoded,
+        })
+    }
+
     fn poll_schedule(
         &mut self,
         control: &OperationControl,
@@ -716,6 +741,11 @@ impl RequestHandler for ApplicationHandler {
                 if name == SET_NETWORK_TRANSFER_POLICY_EXTENSION =>
             {
                 self.set_network_policy(&payload)
+            }
+            Mutation::Extension { name, payload }
+                if name == SET_CURRENT_DUMP_BOOTSTRAP_EXTENSION =>
+            {
+                self.bootstrap_current_dump(&payload, &control)
             }
             Mutation::Extension { name, .. } => Err(OperationError::unsupported(format!(
                 "extension operation {name:?} is not implemented"

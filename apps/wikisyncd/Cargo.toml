@@ -23,3 +23,7 @@ wikisync-integrity = { version = "=0.1.0", path = "../../crates/wikisync-integri
 wikisync-mediawiki = { version = "=0.1.0", path = "../../crates/wikisync-mediawiki" }
 wikisync-store = { version = "=0.1.0", path = "../../crates/wikisync-store" }
 wikisync-sync = { version = "=0.1.0", path = "../../crates/wikisync-sync" }
+
+[dev-dependencies]
+blake3 = "1.8"
+bzip2 = { version = "0.6", default-features = false, features = ["bzip2-sys"] }
