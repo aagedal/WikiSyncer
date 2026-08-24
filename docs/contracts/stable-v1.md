@@ -164,3 +164,27 @@ The operational stop/copy/verify and restore sequences are expanded in
 `docs/operations/backup-restore-migration.md`. A future portable archive format would
 be an additional versioned format, not an implicit reinterpretation of this directory
 contract.
+
+## Pending destructive purge contract
+
+Destructive purge is not part of the currently implemented stable-v1 CLI, daemon, or
+GUI. `collection remove` has one stable meaning: stop tracking by tombstoning the
+collection while retaining captured payload and audit history. A future purge must be
+a separate preview-first operation and must not repurpose that command or its JSON
+fields.
+
+The normative product and durability requirements for that future operation are in
+`docs/operations/destructive-purge.md`. In summary, purge may reclaim only canonical
+text/media payload proved exclusive to one tombstoned collection. It retains audit
+metadata and content hashes; requires exact collection-name, preview-fingerprint, and
+explicit payload-only and external-copy acknowledgements; binds authorization to the
+collection generation, manifest head, and complete catalog fingerprint;
+authenticates absence with a typed manifest event and durable cleanup journal;
+preserves shared objects; and activates verified replacement packs before retiring
+old packed bytes.
+
+This pending contract is not a claim of personal-metadata erasure, secure erase, or
+removal from backups, snapshots, exports, synchronized copies, or SSD remnants. When
+the command is implemented, its successful JSON shape and any durable manifest/journal
+format must be independently versioned and added to this compatibility document
+before being called stable.

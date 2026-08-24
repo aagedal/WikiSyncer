@@ -4,7 +4,7 @@
 //! identities recorded when they were captured. It does not establish that an
 //! upstream statement is true, unbiased, complete, or still publicly available.
 //! Full verification also checks reference consistency exposed by the current
-//! schema. Schema version 13 has no persistent derived-cache table, so no report from
+//! schema. Schema version 14 has no persistent derived-cache table, so no report from
 //! this version claims derived-cache inventory or cache-body verification.
 
 use std::collections::{HashMap, HashSet};
@@ -135,6 +135,22 @@ pub enum VerificationFindingKind {
     ManifestRunNotSucceeded,
     /// A successful durable sync run had no installed manifest.
     SuccessfulRunMissingManifest,
+    /// A manifested revision claim no longer had a retained revision record.
+    ManifestRevisionClaimMissing,
+    /// A manifested revision claim's retained owning page was absent.
+    ManifestRevisionClaimPageMissing,
+    /// A manifested revision claim now belonged to a different page.
+    ManifestRevisionClaimPageMismatch,
+    /// A manifested revision claim now selected a different canonical object.
+    ManifestRevisionClaimObjectMismatch,
+    /// A manifested positive page-head claim's retained page was absent.
+    ManifestPageHeadClaimPageMissing,
+    /// A manifested positive page-head claim's retained revision was absent.
+    ManifestPageHeadClaimRevisionMissing,
+    /// A manifested positive page-head revision now belonged to a different page.
+    ManifestPageHeadClaimRevisionPageMismatch,
+    /// Retained metadata changed while historical manifest claims were replayed.
+    ManifestClaimsChangedDuringVerification,
     /// Manifest directory membership changed during the scan.
     ManifestsChangedDuringVerification,
     /// Media recorded at the authenticated run boundary is no longer inventoried.
@@ -251,6 +267,13 @@ pub struct VerificationReport {
     pub manifests_examined: u64,
     /// Manifest files whose embedded identity reproduced their canonical body.
     pub manifests_identity_verified: u64,
+    /// Historical introduced-revision claims compared with retained metadata.
+    pub manifest_revision_claims_examined: u64,
+    /// Historical positive page-head claims compared with retained metadata.
+    ///
+    /// Page-head entries without a revision do not make a retained revision claim
+    /// and are therefore excluded from this counter.
+    pub manifest_page_head_claims_examined: u64,
     /// Whether the newest manifest for each represented scope authenticates media.
     pub manifest_media_coverage: ManifestMediaCoverage,
     /// Latest media-aware scope snapshots compared with current durable metadata.
@@ -559,6 +582,8 @@ pub fn verify_library_with_options(
         manifests_at_end: 0,
         manifests_examined: 0,
         manifests_identity_verified: 0,
+        manifest_revision_claims_examined: 0,
+        manifest_page_head_claims_examined: 0,
         manifest_media_coverage: ManifestMediaCoverage::NotCovered,
         manifest_media_snapshots_examined: 0,
         metadata_records_at_start: 0,
@@ -1137,6 +1162,7 @@ fn verify_manifest_history(
     maximum_findings: usize,
     report: &mut VerificationReport,
 ) -> Result<(), VerificationError> {
+    let claim_change_counter_at_start = library.integrity_metadata_change_counter()?;
     let start_names = match manifest_inventory_names(library) {
         Ok(names) => names,
         Err(error) => {
@@ -1236,6 +1262,7 @@ fn verify_manifest_history(
             }
         };
         report.manifests_identity_verified = report.manifests_identity_verified.saturating_add(1);
+        verify_manifest_metadata_claims(library, &stored, maximum_findings, report)?;
 
         let expected_predecessor = if sequence == 1 {
             None
@@ -1309,6 +1336,13 @@ fn verify_manifest_history(
         );
     }
 
+    record_manifest_claim_scan_stability(
+        library,
+        claim_change_counter_at_start,
+        maximum_findings,
+        report,
+    )?;
+
     verify_manifest_media_snapshots(library, latest_by_scope, maximum_findings, report)?;
 
     let mut run_cursor = None;
@@ -1372,6 +1406,185 @@ fn verify_manifest_history(
                     message: error.to_string(),
                 },
             );
+        }
+    }
+    Ok(())
+}
+
+fn record_manifest_claim_scan_stability(
+    library: &Library,
+    change_counter_at_start: u64,
+    maximum_findings: usize,
+    report: &mut VerificationReport,
+) -> Result<(), VerificationError> {
+    let change_counter_at_end = library.integrity_metadata_change_counter()?;
+    if change_counter_at_end != change_counter_at_start {
+        report.coverage = VerificationCoverage::Partial;
+        push_finding(
+            report,
+            maximum_findings,
+            VerificationFinding {
+                kind: VerificationFindingKind::ManifestClaimsChangedDuringVerification,
+                object_id: None,
+                manifest_sequence: None,
+                metadata_subject: None,
+                message: format!(
+                    "retained metadata changed during manifest claim replay (SQLite change counter {change_counter_at_start} to {change_counter_at_end})"
+                ),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn verify_manifest_metadata_claims(
+    library: &Library,
+    stored: &StoredManifest,
+    maximum_findings: usize,
+    report: &mut VerificationReport,
+) -> Result<(), VerificationError> {
+    let manifest = &stored.manifest;
+    for claim in &manifest.introduced_revisions {
+        report.manifest_revision_claims_examined = report
+            .manifest_revision_claims_examined
+            .checked_add(1)
+            .ok_or(VerificationError::CounterOverflow(
+                "manifest revision claims examined",
+            ))?;
+        let revision = library.revision(manifest.wiki_id, claim.revision_id)?;
+        match revision {
+            None => push_finding(
+                report,
+                maximum_findings,
+                VerificationFinding {
+                    kind: VerificationFindingKind::ManifestRevisionClaimMissing,
+                    object_id: Some(claim.content_object_id),
+                    manifest_sequence: Some(manifest.sequence),
+                    metadata_subject: None,
+                    message: format!(
+                        "manifested revision {} for page {} is absent from retained metadata",
+                        claim.revision_id.get(),
+                        claim.page_id.get()
+                    ),
+                },
+            ),
+            Some(revision) => {
+                if revision.page_id != claim.page_id {
+                    push_finding(
+                        report,
+                        maximum_findings,
+                        VerificationFinding {
+                            kind: VerificationFindingKind::ManifestRevisionClaimPageMismatch,
+                            object_id: Some(claim.content_object_id),
+                            manifest_sequence: Some(manifest.sequence),
+                            metadata_subject: None,
+                            message: format!(
+                                "manifested revision {} belonged to page {}, but retained metadata assigns it to page {}",
+                                claim.revision_id.get(),
+                                claim.page_id.get(),
+                                revision.page_id.get()
+                            ),
+                        },
+                    );
+                }
+                if revision.content_object_id != claim.content_object_id {
+                    push_finding(
+                        report,
+                        maximum_findings,
+                        VerificationFinding {
+                            kind: VerificationFindingKind::ManifestRevisionClaimObjectMismatch,
+                            object_id: Some(revision.content_object_id),
+                            manifest_sequence: Some(manifest.sequence),
+                            metadata_subject: None,
+                            message: format!(
+                                "manifested revision {} selected object {}, but retained metadata selects {}",
+                                claim.revision_id.get(),
+                                claim.content_object_id,
+                                revision.content_object_id
+                            ),
+                        },
+                    );
+                }
+            }
+        }
+        if library.page(manifest.wiki_id, claim.page_id)?.is_none() {
+            push_finding(
+                report,
+                maximum_findings,
+                VerificationFinding {
+                    kind: VerificationFindingKind::ManifestRevisionClaimPageMissing,
+                    object_id: Some(claim.content_object_id),
+                    manifest_sequence: Some(manifest.sequence),
+                    metadata_subject: None,
+                    message: format!(
+                        "manifested revision {} refers to retained page {} that is absent",
+                        claim.revision_id.get(),
+                        claim.page_id.get()
+                    ),
+                },
+            );
+        }
+    }
+
+    for head in &manifest.page_heads {
+        let Some(revision_id) = head.revision_id else {
+            continue;
+        };
+        report.manifest_page_head_claims_examined = report
+            .manifest_page_head_claims_examined
+            .checked_add(1)
+            .ok_or(VerificationError::CounterOverflow(
+                "manifest page-head claims examined",
+            ))?;
+        if library.page(manifest.wiki_id, head.page_id)?.is_none() {
+            push_finding(
+                report,
+                maximum_findings,
+                VerificationFinding {
+                    kind: VerificationFindingKind::ManifestPageHeadClaimPageMissing,
+                    object_id: None,
+                    manifest_sequence: Some(manifest.sequence),
+                    metadata_subject: None,
+                    message: format!(
+                        "manifested positive head for page {} has no retained page metadata",
+                        head.page_id.get()
+                    ),
+                },
+            );
+        }
+        match library.revision(manifest.wiki_id, revision_id)? {
+            None => push_finding(
+                report,
+                maximum_findings,
+                VerificationFinding {
+                    kind: VerificationFindingKind::ManifestPageHeadClaimRevisionMissing,
+                    object_id: None,
+                    manifest_sequence: Some(manifest.sequence),
+                    metadata_subject: None,
+                    message: format!(
+                        "manifested head revision {} for page {} is absent from retained metadata",
+                        revision_id.get(),
+                        head.page_id.get()
+                    ),
+                },
+            ),
+            Some(revision) if revision.page_id != head.page_id => push_finding(
+                report,
+                maximum_findings,
+                VerificationFinding {
+                    kind: VerificationFindingKind::ManifestPageHeadClaimRevisionPageMismatch,
+                    object_id: Some(revision.content_object_id),
+                    manifest_sequence: Some(manifest.sequence),
+                    metadata_subject: None,
+                    message: format!(
+                        "manifested head revision {} belonged to page {}, but retained metadata assigns it to page {}",
+                        revision_id.get(),
+                        head.page_id.get(),
+                        revision.page_id.get()
+                    ),
+                },
+            ),
+            Some(_) => {}
         }
     }
     Ok(())
@@ -1798,6 +2011,69 @@ mod tests {
         (directory, library)
     }
 
+    fn manifested_revision_history() -> (TempDir, Library) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut library = Library::open(directory.path()).expect("library");
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "manifest claims")
+            .expect("collection");
+        let page_id = PageId::new(10).expect("page");
+        let title = PageTitle::new("Manifest claim page").expect("title");
+        for (revision, parent, timestamp, source, candidate, kind) in [
+            (
+                20,
+                None,
+                "2026-08-21T00:00:00Z",
+                b"manifested historical source".as_slice(),
+                100,
+                SyncRunKind::Bootstrap,
+            ),
+            (
+                21,
+                Some(20),
+                "2026-08-22T00:00:00Z",
+                b"manifested current source".as_slice(),
+                101,
+                SyncRunKind::Update,
+            ),
+        ] {
+            library
+                .capture_current_revision(
+                    wiki_id,
+                    collection_id,
+                    &CurrentRevisionCapture {
+                        page_id,
+                        namespace: 0,
+                        title: &title,
+                        revision_id: RevisionId::new(revision).expect("revision"),
+                        parent_id: parent.map(|id| RevisionId::new(id).expect("parent")),
+                        timestamp,
+                        author: Some("Fixture author"),
+                        author_id: Some(1),
+                        comment: Some("manifest claim fixture"),
+                        minor: false,
+                        upstream_sha1: None,
+                        content_model: "wikitext",
+                        source,
+                    },
+                )
+                .expect("capture revision");
+            let run_id = library
+                .start_or_resume_sync_run(wiki_id, Some(collection_id), kind, candidate)
+                .expect("start run")
+                .status
+                .run_id;
+            library
+                .complete_sync_run(run_id, Some("manifest-claim-cursor"))
+                .expect("complete run");
+            library.append_sync_manifest(run_id).expect("manifest run");
+        }
+        (directory, library)
+    }
+
     fn metadata_fixture() -> (TempDir, Library) {
         let directory = tempfile::tempdir().expect("temporary directory");
         let mut library = Library::open(directory.path()).expect("library");
@@ -2079,6 +2355,143 @@ mod tests {
         assert_eq!(report.manifests_identity_verified, 3);
         assert_eq!(report.finding_count, 0);
         assert!(report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn manifest_claim_verification_accepts_a_historical_non_current_head() {
+        let (_directory, library) = manifested_revision_history();
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert_eq!(report.manifest_revision_claims_examined, 2);
+        assert_eq!(report.manifest_page_head_claims_examined, 2);
+        assert_eq!(report.finding_count, 0);
+        assert!(report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn manifest_claim_scan_becomes_partial_when_retained_metadata_changes() {
+        let (_directory, library) = manifested_revision_history();
+        let mut report = verify_library(&library, VerificationScope::Full).expect("verification");
+        let findings_before = report.finding_count;
+        let change_counter = library
+            .integrity_metadata_change_counter()
+            .expect("change counter");
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .execute(
+                "UPDATE pages SET current_title = 'Changed during claim scan'
+                 WHERE wiki_id = 1 AND page_id = 10",
+                [],
+            )
+            .expect("change retained metadata");
+
+        record_manifest_claim_scan_stability(
+            &library,
+            change_counter,
+            DEFAULT_MAX_RETAINED_FINDINGS,
+            &mut report,
+        )
+        .expect("stability finding");
+
+        assert_eq!(report.coverage, VerificationCoverage::Partial);
+        assert_eq!(report.finding_count, findings_before + 1);
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestClaimsChangedDuringVerification
+        }));
+        assert!(!report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn manifest_claim_verification_reports_missing_revision_and_page_rows() {
+        let (_directory, library) = manifested_revision_history();
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .execute(
+                "DELETE FROM revisions WHERE wiki_id = 1 AND revision_id = 20",
+                [],
+            )
+            .expect("delete manifested revision");
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for corruption fixture");
+        connection
+            .execute("DELETE FROM pages WHERE wiki_id = 1 AND page_id = 10", [])
+            .expect("delete manifested page");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestRevisionClaimMissing
+                && finding.manifest_sequence == Some(1)
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestRevisionClaimPageMissing
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestPageHeadClaimPageMissing
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestPageHeadClaimRevisionMissing
+                && finding.manifest_sequence == Some(1)
+        }));
+        assert!(!report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn manifest_claim_verification_reports_changed_object_and_page_ownership() {
+        let (_directory, mut library) = manifested_revision_history();
+        let replacement = library
+            .put_bytes(ObjectKind::Wikitext, b"replacement canonical object")
+            .expect("replacement object");
+        let wiki_id = wikisync_core::WikiId::new(1).expect("wiki");
+        let collection_id = CollectionId::new(1).expect("collection");
+        let other_title = PageTitle::new("Other page").expect("title");
+        library
+            .capture_current_revision(
+                wiki_id,
+                collection_id,
+                &CurrentRevisionCapture {
+                    page_id: PageId::new(11).expect("other page"),
+                    namespace: 0,
+                    title: &other_title,
+                    revision_id: RevisionId::new(30).expect("other revision"),
+                    parent_id: None,
+                    timestamp: "2026-08-23T00:00:00Z",
+                    author: Some("Fixture author"),
+                    author_id: Some(1),
+                    comment: Some("other page"),
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: b"other page source",
+                },
+            )
+            .expect("capture other page");
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .execute(
+                "UPDATE revisions SET page_id = 11, content_object_id = ?1
+                 WHERE wiki_id = 1 AND revision_id = 20",
+                [replacement.id.to_string()],
+            )
+            .expect("tamper manifested revision");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestRevisionClaimPageMismatch
+                && finding.manifest_sequence == Some(1)
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestRevisionClaimObjectMismatch
+                && finding.manifest_sequence == Some(1)
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::ManifestPageHeadClaimRevisionPageMismatch
+                && finding.manifest_sequence == Some(1)
+        }));
+        assert!(!report.is_verified_since_capture());
     }
 
     #[test]

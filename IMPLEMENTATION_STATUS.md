@@ -362,6 +362,36 @@ Optional-thumbnail capture now forms an end-to-end, default-off stable-v1 path:
   historical, and collection exports use explicit v2 schemas with deterministic
   attributed media sections and deduplicated hash-addressed private media files.
 
+The destructive-purge safety foundation now also includes:
+
+- a documented, still-pending product and threat-model contract that defines purge as
+  collection-exclusive canonical-payload reclamation for a tombstoned collection
+  while retaining audit metadata and hashes. It requires exact preview confirmation,
+  explains shared-reference and pack-delta constraints, and makes no personal-data,
+  backup, snapshot, SSD-remnant, or secure-erasure promise;
+- schema migration 14 with a durable, bounded purge authorization and future cleanup
+  journal. A deterministic read-only preview closes over retained collection
+  membership, cross-page/object deduplication, media references, other manifest
+  scopes, active verified locations, pack partitions, and the current manifest head,
+  then commits the exact
+  name, generation, tombstone, inventory, estimates, and pack work into a
+  domain-separated BLAKE3 fingerprint;
+- tombstone-only authorization that requires the exact name and fingerprint plus
+  separate payload-only/audit-retention and external-copy acknowledgements. It
+  rederives the complete closure inside an immediate transaction, rejects stale
+  catalog/head/location state without partial journal writes, is idempotent for an
+  exact retry, and exposes bounded journal pagination; and
+- full verification replay of every readable synchronization manifest's introduced
+  revision claims and positive historical page-head claims against retained page,
+  revision, ownership, and exact content-object metadata. Missing or changed claims
+  now have distinct structured findings, while a legitimately superseded historical
+  head remains valid.
+
+This foundation performs no destructive action. No object location, pack, manifest,
+canonical byte, or audit row is removed. The authenticated purge event, authorized-
+absence verification, retained-subset replacement packs, cleanup/resume executor, and
+CLI/daemon/GUI workflow remain unfinished.
+
 Credential-free beta packaging readiness now includes:
 
 - deterministic, bounded macOS and Linux release-candidate archives containing the
@@ -413,8 +443,9 @@ non-destructive collection CLI/GUI surface, user-facing external
 signing/trusted-anchor workflows, historical export, and periodic dynamic-category
 membership reconciliation are implemented.
 Full verification now covers stable scans of every logical canonical object, the
-manifest chain and eligible-run coverage, and the current-schema metadata pointers
-listed above, including media objects and placements. A separately retained signed
+manifest chain and eligible-run coverage, retained introduced-revision and positive
+historical page-head claims, and the current-schema metadata pointers listed above,
+including media objects and placements. A separately retained signed
 trusted head can authenticate the observed revision/manifest chain and schema-2 media
 snapshot through the library API; schema-1 manifests explicitly provide no media
 coverage. The schema has no `derived_cache` inventory,
@@ -426,23 +457,22 @@ protection when the anchor is kept with and can be replaced alongside the librar
 
 ## Next checkpoint
 
-The next locally actionable stable-v1 item is the separately confirmed destructive
-purge design. It must not be implemented as ordinary row/file deletion: the current
-schema has no authenticated purge event, full verification does not yet reconcile
-every manifested text revision/page claim against current storage, and selective pack
-deletion can strand retained delta dependents. A naive purge could therefore remove
-manifested canonical content while later verification incorrectly appears clean.
+The next locally actionable stable-v1 checkpoint is the authenticated purge event.
+Schema 14 now provides the non-destructive, generation/head/catalog-bound preview and
+authorization journal, and full verification now reconciles manifested revision/page
+claims against retained metadata. The next manifest schema must remain able to read
+schema-1/2 synchronization entries while adding a typed purge event that commits the
+exact journal identity and inventory before any payload can become absent.
 
-The safe checkpoint is to define and implement a backward-readable manifest event for
-authorized purge, a durable preview/authorization/cleanup journal, bounded shared-
-reference closure, manifest-aware findings for unexplained versus authorized absence,
-and verified replacement-pack activation before old packed bytes are retired. The
-product contract must first confirm that purge means collection-exclusive payload and
-storage reclamation while retaining audit metadata and hashes; complete personal-
-metadata erasure and secure erasure of backups, snapshots, or SSD remnants are
-different promises and cannot be inferred. CLI/GUI commit must remain preview-first,
-generation/head/catalog-bound, tombstone-only, and require explicit name, fingerprint,
-and backup acknowledgements through the same direct/daemon writer boundary.
+After that event is durable, full verification must distinguish exact authenticated
+authorized absence from unexplained loss, stale/mismatched journals, shared-reference
+violations, and pending cleanup without weakening strict byte-verification language.
+Only then can the executor build and fully verify retained-subset replacement packs,
+activate them before retiring mixed old packs, remove authorized loose/whole-pack
+payload through restartable journal phases, and expose the separate preview-first
+CLI/daemon/GUI workflow. The product surfaces must keep exact name/fingerprint and
+payload-retention/external-copy acknowledgements and must not repurpose non-destructive
+`collection remove`.
 
 Credentialed Apple signing/notarization, protected production release identities and
 independent trust distribution, native release validation, clean-system assessment,

@@ -4,7 +4,7 @@
 //! are compressed into a temporary file, made durable, and atomically installed
 //! before the SQLite transaction records their location.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -40,6 +40,7 @@ const MIGRATION_10: &str = include_str!("../migrations/0010_collection_status.sq
 const MIGRATION_11: &str = include_str!("../migrations/0011_pack_affinity.sql");
 const MIGRATION_12: &str = include_str!("../migrations/0012_thumbnail_media.sql");
 const MIGRATION_13: &str = include_str!("../migrations/0013_dump_imports.sql");
+const MIGRATION_14: &str = include_str!("../migrations/0014_purge_journal.sql");
 const OBJECT_DOMAIN: &[u8] = b"wikisync-object-v1\0";
 const DATABASE_NAME: &str = "library.sqlite3";
 const MANIFEST_DOMAIN: &[u8] = b"wikisync-manifest-v1\0";
@@ -70,6 +71,7 @@ const MAX_SUPPORTED_PACK_OBJECTS: u32 = 1_000_000;
 const MAX_MEDIA_METADATA_TEXT_BYTES: usize = 16 * 1024;
 const MAX_MEDIA_SOURCE_HASH_BYTES: usize = 128;
 const MAX_THUMBNAIL_BYTES_PER_PIXEL: u64 = 8;
+const PURGE_PREVIEW_DOMAIN: &[u8] = b"wikisync-purge-preview-v1\0";
 
 /// Default upper bound for one uncompressed canonical object (64 MiB).
 pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
@@ -100,6 +102,18 @@ pub const MAX_MANIFEST_PAGE_SIZE: u32 = 1_000;
 
 /// Maximum metadata-reference records returned by one integrity enumeration call.
 pub const MAX_INTEGRITY_METADATA_PAGE_SIZE: u32 = 1_000;
+
+/// Maximum number of collection-exclusive canonical objects in one purge operation.
+pub const MAX_PURGE_OBJECTS: u32 = 100_000;
+
+/// Maximum number of active verified physical locations bound by one purge preview.
+pub const MAX_PURGE_LOCATIONS: u32 = 1_000_000;
+
+/// Maximum number of immutable packs affected by one purge preview.
+pub const MAX_PURGE_AFFECTED_PACKS: u32 = 10_000;
+
+/// Largest page accepted by [`Library::purge_objects_after`].
+pub const MAX_PURGE_OBJECT_PAGE_SIZE: u32 = 1_000;
 
 /// Default maximum number of source requests in flight across one library process.
 pub const DEFAULT_MAX_CONCURRENT_REQUESTS: u32 = 4;
@@ -1136,6 +1150,91 @@ pub struct LogicalObject {
     pub media_type: String,
     /// Persisted metadata verification state.
     pub verification_state: ObjectVerificationState,
+}
+
+/// Deterministic, non-destructive preview of collection-exclusive canonical payload.
+///
+/// The preview retains logical metadata and hashes. Its byte estimate covers verified
+/// loose copies and packs whose complete object inventory is exclusive to the target;
+/// mixed packs require a later verified replacement-pack phase before their old bytes
+/// become reclaimable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PurgePreview {
+    pub collection_id: CollectionId,
+    pub collection_name: String,
+    pub collection_generation: u64,
+    pub tombstoned_at: u64,
+    pub manifest_head_sequence: Option<u64>,
+    pub manifest_head_id: Option<ManifestId>,
+    pub fingerprint: String,
+    pub object_count: u64,
+    pub wikitext_object_count: u64,
+    pub media_object_count: u64,
+    pub logical_bytes: u64,
+    pub reclaimable_bytes: u64,
+    pub loose_object_count: u64,
+    pub affected_pack_count: u64,
+    pub whole_pack_count: u64,
+    pub mixed_pack_count: u64,
+}
+
+/// One logical object durably selected by an authorized purge journal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PurgeObject {
+    pub object: StoredObject,
+}
+
+/// Explicit confirmations required before a purge preview becomes durable work.
+#[derive(Clone, Copy, Debug)]
+pub struct PurgeAuthorization<'a> {
+    /// Exact tombstoned collection name shown by the preview.
+    pub collection_name: &'a str,
+    /// Exact domain-separated preview fingerprint shown to the operator.
+    pub preview_fingerprint: &'a str,
+    /// Confirms that only local payload representations are in scope; audit metadata
+    /// and hashes remain.
+    pub payload_only_acknowledged: bool,
+    /// Confirms that backups, snapshots, exports, and storage-device remnants are not
+    /// erased by this operation.
+    pub backups_not_erased_acknowledged: bool,
+}
+
+/// Durable authorization receipt for later restartable repacking and cleanup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedPurge {
+    pub purge_id: u64,
+    pub preview: PurgePreview,
+    pub authorized_at: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PurgeCandidate {
+    id: ObjectId,
+    kind: ObjectKind,
+    uncompressed_length: u64,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PurgeLocationFingerprint {
+    object_id: ObjectId,
+    storage_kind: String,
+    encoding: String,
+    relative_path: String,
+    compressed_length: u64,
+    base_object_id: Option<ObjectId>,
+    pack_generation: Option<u64>,
+    pack_id: Option<String>,
+    pack_index_checksum: Option<String>,
+    pack_offset: Option<u64>,
+    delta_depth: Option<u16>,
+}
+
+#[derive(Clone, Debug)]
+struct PurgePackSnapshot {
+    pack_id: String,
+    purged_object_count: u64,
+    retained_object_count: u64,
+    reclaimable_bytes: u64,
 }
 
 /// Persisted logical-object verification state.
@@ -2251,6 +2350,222 @@ impl Library {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Computes a bounded deterministic preview of canonical payload referenced only
+    /// by one tombstoned collection.
+    ///
+    /// This does not write the journal or remove metadata, object locations, or files.
+    /// Pages shared with any other retained collection are excluded, as are logical
+    /// objects referenced by any page outside the exclusive target-page closure.
+    pub fn preview_collection_purge(
+        &self,
+        collection_id: CollectionId,
+    ) -> Result<PurgePreview, StoreError> {
+        let manifests = self.validated_manifest_chain()?;
+        let (manifest_head, protected_manifest_objects) =
+            purge_manifest_binding(&manifests, collection_id);
+        compute_purge_preview(
+            &self.connection,
+            collection_id,
+            manifest_head,
+            &protected_manifest_objects,
+        )
+        .map(|(preview, _, _)| preview)
+    }
+
+    /// Durably authorizes the exact currently valid purge preview.
+    ///
+    /// Authorization re-runs the exclusive-reference closure in an immediate SQLite
+    /// transaction and snapshots every selected logical object and affected pack.
+    /// It remains non-destructive: later checkpoints perform verified replacement-pack
+    /// activation, authenticated manifest publication, and restartable file cleanup.
+    /// Retrying the exact authorization returns the existing unfinished receipt.
+    pub fn authorize_collection_purge(
+        &mut self,
+        collection_id: CollectionId,
+        authorization: PurgeAuthorization<'_>,
+    ) -> Result<AuthorizedPurge, StoreError> {
+        self.ensure_writable()?;
+        if !authorization.payload_only_acknowledged
+            || !authorization.backups_not_erased_acknowledged
+        {
+            return Err(StoreError::PurgeAcknowledgementsRequired);
+        }
+        authorization
+            .preview_fingerprint
+            .parse::<ManifestId>()
+            .map_err(|_| StoreError::InvalidPurgeFingerprint)?;
+
+        let manifests = self.validated_manifest_chain()?;
+        let (manifest_head, protected_manifest_objects) =
+            purge_manifest_binding(&manifests, collection_id);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let current = compute_purge_preview(
+            &transaction,
+            collection_id,
+            manifest_head,
+            &protected_manifest_objects,
+        )
+        .map_err(|error| match error {
+            StoreError::NoExclusivePurgePayload(id) if id == collection_id => {
+                StoreError::StalePurgePreview(collection_id)
+            }
+            StoreError::PurgeObjectUnavailable(_) => StoreError::StalePurgePreview(collection_id),
+            other => other,
+        })?;
+
+        if let Some(existing) = authorized_purge_for_collection(&transaction, collection_id)? {
+            if existing.preview.collection_name == authorization.collection_name
+                && existing.preview.fingerprint == authorization.preview_fingerprint
+            {
+                if current.0 != existing.preview {
+                    return Err(StoreError::StalePurgePreview(collection_id));
+                }
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(StoreError::PurgeAlreadyPending(collection_id));
+        }
+
+        let (preview, candidates, packs) = current;
+        if preview.collection_name != authorization.collection_name
+            || preview.fingerprint != authorization.preview_fingerprint
+        {
+            return Err(StoreError::StalePurgePreview(collection_id));
+        }
+
+        let now = unix_time()?;
+        transaction.execute(
+            "INSERT INTO purge_operations (
+                collection_id, collection_name, collection_generation, tombstoned_at,
+                manifest_head_sequence, manifest_head_id, preview_fingerprint,
+                object_count, wikitext_object_count, media_object_count, logical_bytes,
+                reclaimable_bytes, loose_object_count, affected_pack_count,
+                whole_pack_count, mixed_pack_count, state,
+                acknowledged_collection_name, acknowledged_preview_fingerprint,
+                payload_only_acknowledged, backups_not_erased_acknowledged,
+                created_at, authorized_at, updated_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, 'authorized', ?2, ?7, 1, 1, ?17, ?17, ?17
+             )",
+            params![
+                to_sql_integer(collection_id.get())?,
+                preview.collection_name,
+                to_sql_integer(preview.collection_generation)?,
+                to_sql_integer(preview.tombstoned_at)?,
+                preview
+                    .manifest_head_sequence
+                    .map(to_sql_integer)
+                    .transpose()?,
+                preview.manifest_head_id.map(|id| id.to_string()),
+                preview.fingerprint,
+                to_sql_integer(preview.object_count)?,
+                to_sql_integer(preview.wikitext_object_count)?,
+                to_sql_integer(preview.media_object_count)?,
+                to_sql_integer(preview.logical_bytes)?,
+                to_sql_integer(preview.reclaimable_bytes)?,
+                to_sql_integer(preview.loose_object_count)?,
+                to_sql_integer(preview.affected_pack_count)?,
+                to_sql_integer(preview.whole_pack_count)?,
+                to_sql_integer(preview.mixed_pack_count)?,
+                now,
+            ],
+        )?;
+        let raw_purge_id = transaction.last_insert_rowid();
+        let purge_id = sql_u64(raw_purge_id, "invalid purge ID")?;
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO purge_objects (
+                    purge_id, object_id, object_kind, uncompressed_length
+                 ) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for candidate in &candidates {
+                insert.execute(params![
+                    raw_purge_id,
+                    candidate.id.to_string(),
+                    candidate.kind.database_value(),
+                    to_sql_integer(candidate.uncompressed_length)?,
+                ])?;
+            }
+        }
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO purge_pack_work (
+                    purge_id, old_pack_id, purged_object_count,
+                    retained_object_count, replacement_pack_id, state
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, 'pending')",
+            )?;
+            for pack in &packs {
+                insert.execute(params![
+                    raw_purge_id,
+                    pack.pack_id,
+                    to_sql_integer(pack.purged_object_count)?,
+                    to_sql_integer(pack.retained_object_count)?,
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(AuthorizedPurge {
+            purge_id,
+            preview,
+            authorized_at: sql_u64(now, "invalid purge authorization time")?,
+        })
+    }
+
+    /// Returns a bounded page of the logical-object journal for an authorized purge.
+    pub fn purge_objects_after(
+        &self,
+        purge_id: u64,
+        after: Option<ObjectId>,
+        limit: u32,
+    ) -> Result<Vec<PurgeObject>, StoreError> {
+        if !(1..=MAX_PURGE_OBJECT_PAGE_SIZE).contains(&limit) {
+            return Err(StoreError::InvalidConfig(
+                "purge object page size must be between 1 and 1,000",
+            ));
+        }
+        let exists: bool = self.connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM purge_operations WHERE purge_id = ?1)",
+            [to_sql_integer(purge_id)?],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::PurgeNotFound(purge_id));
+        }
+        let after = after.map(|id| id.to_string()).unwrap_or_default();
+        let mut statement = self.connection.prepare(
+            "SELECT object_id, object_kind, uncompressed_length
+             FROM purge_objects
+             WHERE purge_id = ?1 AND object_id > ?2
+             ORDER BY object_id LIMIT ?3",
+        )?;
+        let rows = statement
+            .query_map(params![to_sql_integer(purge_id)?, after, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(id, kind, length)| {
+                Ok(PurgeObject {
+                    object: StoredObject {
+                        id: id
+                            .parse()
+                            .map_err(|_| StoreError::CorruptMetadata("invalid purge object ID"))?,
+                        kind: ObjectKind::from_database(&kind)?,
+                        uncompressed_length: sql_u64(length, "invalid purge object length")?,
+                    },
+                })
+            })
+            .collect()
     }
 
     /// Creates a new collection and atomically commits its complete initial policy.
@@ -9394,7 +9709,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
          ) STRICT;",
     )?;
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > 13 {
+    if version > 14 {
         return Err(StoreError::UnsupportedSchemaVersion(version));
     }
     if version == 0 {
@@ -9552,6 +9867,18 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
         transaction.pragma_update(None, "user_version", 13)?;
         transaction.commit()?;
     }
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 13 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(MIGRATION_14)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (14, 'purge-journal', ?1)",
+            [unix_time()?],
+        )?;
+        transaction.pragma_update(None, "user_version", 14)?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -9603,6 +9930,570 @@ fn ensure_collection_active(
         CollectionStatus::Active => Ok(()),
         CollectionStatus::Tombstoned => Err(StoreError::CollectionTombstoned(collection_id)),
     }
+}
+
+fn purge_manifest_binding(
+    manifests: &[StoredManifest],
+    collection_id: CollectionId,
+) -> (Option<(u64, ManifestId)>, HashSet<ObjectId>) {
+    let head = manifests
+        .last()
+        .map(|stored| (stored.manifest.sequence, stored.id));
+    let mut revision_objects = HashMap::new();
+    for stored in manifests {
+        for revision in &stored.manifest.introduced_revisions {
+            revision_objects.insert(
+                (stored.manifest.wiki_id, revision.revision_id),
+                revision.content_object_id,
+            );
+        }
+    }
+    let mut protected = HashSet::new();
+    for stored in manifests {
+        if stored.manifest.collection_id == Some(collection_id) {
+            continue;
+        }
+        for revision in &stored.manifest.introduced_revisions {
+            protected.insert(revision.content_object_id);
+        }
+        for head in &stored.manifest.page_heads {
+            if let Some(revision_id) = head.revision_id
+                && let Some(object_id) =
+                    revision_objects.get(&(stored.manifest.wiki_id, revision_id))
+            {
+                protected.insert(*object_id);
+            }
+        }
+        if let Some(snapshot) = &stored.manifest.media_snapshot {
+            protected.extend(
+                snapshot
+                    .inventory
+                    .iter()
+                    .map(|media| media.content_object_id),
+            );
+            protected.extend(
+                snapshot
+                    .placements
+                    .iter()
+                    .map(|placement| placement.content_object_id),
+            );
+        }
+    }
+    (head, protected)
+}
+
+fn compute_purge_preview(
+    connection: &Connection,
+    collection_id: CollectionId,
+    manifest_head: Option<(u64, ManifestId)>,
+    protected_manifest_objects: &HashSet<ObjectId>,
+) -> Result<(PurgePreview, Vec<PurgeCandidate>, Vec<PurgePackSnapshot>), StoreError> {
+    let raw_collection_id = to_sql_integer(collection_id.get())?;
+    let collection = connection
+        .query_row(
+            "SELECT name, generation, status, tombstoned_at
+             FROM collections WHERE collection_id = ?1",
+            [raw_collection_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(StoreError::CollectionNotFound(collection_id))?;
+    if stored_collection_status(&collection.2)? != CollectionStatus::Tombstoned {
+        return Err(StoreError::CollectionMustBeTombstoned(collection_id));
+    }
+    let tombstoned_at = collection.3.ok_or(StoreError::CorruptMetadata(
+        "tombstoned collection lacks tombstone time",
+    ))?;
+    validate_purge_text(&collection.0)?;
+
+    // Pages remain target-exclusive only when no other retained collection membership
+    // row names the same stable wiki/page identity. Removed membership is intentional
+    // audit scope and therefore participates on both sides of this closure.
+    let mut statement = connection.prepare(
+        "WITH target_pages AS (
+             SELECT wiki_id, page_id
+             FROM collection_resolved_members
+             WHERE collection_id = ?1
+         ), exclusive_pages AS (
+             SELECT target.wiki_id, target.page_id
+             FROM target_pages AS target
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM collection_resolved_members AS other
+                 WHERE other.wiki_id = target.wiki_id
+                   AND other.page_id = target.page_id
+                   AND other.collection_id != ?1
+             )
+         ), seeds(object_id) AS (
+             SELECT revision.content_object_id
+             FROM revisions AS revision
+             JOIN exclusive_pages AS target
+               ON target.wiki_id = revision.wiki_id
+              AND target.page_id = revision.page_id
+             UNION
+             SELECT placement.content_object_id
+             FROM page_media AS placement
+             JOIN revisions AS revision
+               ON revision.wiki_id = placement.wiki_id
+              AND revision.revision_id = placement.revision_id
+             JOIN exclusive_pages AS target
+               ON target.wiki_id = revision.wiki_id
+              AND target.page_id = revision.page_id
+         )
+         SELECT object.object_id, object.object_kind, object.uncompressed_length
+         FROM seeds
+         JOIN content_objects AS object USING (object_id)
+         WHERE object.verification_state = 'verified'
+         AND ((
+             object.object_kind = 'wikitext'
+             AND NOT EXISTS (
+                 SELECT 1 FROM revisions AS retained
+                 WHERE retained.content_object_id = object.object_id
+                   AND NOT EXISTS (
+                       SELECT 1 FROM exclusive_pages AS target
+                       WHERE target.wiki_id = retained.wiki_id
+                         AND target.page_id = retained.page_id
+                   )
+             )
+         ) OR (
+             object.object_kind = 'media'
+             AND NOT EXISTS (
+                 SELECT 1
+                 FROM page_media AS retained_placement
+                 JOIN revisions AS retained_revision
+                   ON retained_revision.wiki_id = retained_placement.wiki_id
+                  AND retained_revision.revision_id = retained_placement.revision_id
+                 WHERE retained_placement.content_object_id = object.object_id
+                   AND NOT EXISTS (
+                       SELECT 1 FROM exclusive_pages AS target
+                       WHERE target.wiki_id = retained_revision.wiki_id
+                         AND target.page_id = retained_revision.page_id
+                   )
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM media AS catalog
+                 WHERE catalog.content_object_id = object.object_id
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM page_media AS target_placement
+                       JOIN revisions AS target_revision
+                         ON target_revision.wiki_id = target_placement.wiki_id
+                        AND target_revision.revision_id = target_placement.revision_id
+                       JOIN exclusive_pages AS target
+                         ON target.wiki_id = target_revision.wiki_id
+                        AND target.page_id = target_revision.page_id
+                       WHERE target_placement.wiki_id = catalog.wiki_id
+                         AND target_placement.source_media_id = catalog.source_media_id
+                         AND target_placement.source_sha1 = catalog.source_sha1
+                         AND target_placement.content_object_id = catalog.content_object_id
+                   )
+             )
+         ))
+         ORDER BY object.object_id
+         LIMIT ?2",
+    )?;
+    let rows = statement.query_map(
+        params![raw_collection_id, i64::from(MAX_PURGE_OBJECTS) + 1],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (id, kind, length) = row?;
+        candidates.push(PurgeCandidate {
+            id: id
+                .parse()
+                .map_err(|_| StoreError::CorruptMetadata("invalid purge candidate ID"))?,
+            kind: ObjectKind::from_database(&kind)?,
+            uncompressed_length: sql_u64(length, "invalid purge candidate length")?,
+        });
+    }
+    if candidates.len() > MAX_PURGE_OBJECTS as usize {
+        return Err(StoreError::PurgeLimitExceeded);
+    }
+    candidates.retain(|candidate| !protected_manifest_objects.contains(&candidate.id));
+    if candidates.is_empty() {
+        return Err(StoreError::NoExclusivePurgePayload(collection_id));
+    }
+
+    let mut locations = Vec::new();
+    let mut affected_packs: BTreeMap<String, HashSet<ObjectId>> = BTreeMap::new();
+    let mut loose_object_count = 0_u64;
+    let mut reclaimable_bytes = 0_u64;
+    let mut total_location_count = 0_u64;
+    let mut location_statement = connection.prepare(
+        "SELECT location.storage_kind, location.encoding, location.relative_path,
+                location.compressed_length, location.base_object_id,
+                location.pack_generation, location.pack_id, location.pack_offset,
+                location.delta_depth, pack.index_checksum
+         FROM object_locations AS location
+         LEFT JOIN packs AS pack ON pack.pack_id = location.pack_id
+         WHERE location.object_id = ?1
+           AND location.verification_state = 'verified'
+           AND (location.storage_kind = 'loose' OR pack.state = 'verified')
+         ORDER BY location.storage_kind, location.relative_path, location.location_id",
+    )?;
+    for candidate in &candidates {
+        let rows = location_statement.query_map([candidate.id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
+        })?;
+        let mut candidate_location_count = 0_u64;
+        let mut has_loose = false;
+        for row in rows {
+            let (
+                storage_kind,
+                encoding,
+                relative_path,
+                compressed_length,
+                base_object_id,
+                pack_generation,
+                pack_id,
+                pack_offset,
+                delta_depth,
+                pack_index_checksum,
+            ) = row?;
+            let compressed_length = sql_u64(compressed_length, "invalid purge location length")?;
+            if storage_kind == "loose" {
+                has_loose = true;
+                reclaimable_bytes = reclaimable_bytes
+                    .checked_add(compressed_length)
+                    .ok_or(StoreError::PurgeLimitExceeded)?;
+            } else if let Some(pack_id) = &pack_id {
+                affected_packs
+                    .entry(pack_id.clone())
+                    .or_default()
+                    .insert(candidate.id);
+            }
+            locations.push(PurgeLocationFingerprint {
+                object_id: candidate.id,
+                storage_kind,
+                encoding,
+                relative_path,
+                compressed_length,
+                base_object_id: base_object_id
+                    .map(|id| {
+                        id.parse()
+                            .map_err(|_| StoreError::CorruptMetadata("invalid purge delta base ID"))
+                    })
+                    .transpose()?,
+                pack_generation: pack_generation
+                    .map(|value| sql_u64(value, "invalid purge pack generation"))
+                    .transpose()?,
+                pack_id,
+                pack_index_checksum,
+                pack_offset: pack_offset
+                    .map(|value| sql_u64(value, "invalid purge pack offset"))
+                    .transpose()?,
+                delta_depth: delta_depth
+                    .map(|value| {
+                        u16::try_from(value)
+                            .map_err(|_| StoreError::CorruptMetadata("invalid purge delta depth"))
+                    })
+                    .transpose()?,
+            });
+            candidate_location_count += 1;
+            total_location_count += 1;
+            if total_location_count > u64::from(MAX_PURGE_LOCATIONS) {
+                return Err(StoreError::PurgeLocationLimitExceeded);
+            }
+        }
+        if candidate_location_count == 0 {
+            return Err(StoreError::PurgeObjectUnavailable(candidate.id));
+        }
+        if has_loose {
+            loose_object_count += 1;
+        }
+    }
+    locations.sort();
+
+    let mut pack_snapshots = Vec::with_capacity(affected_packs.len());
+    if affected_packs.len() > MAX_PURGE_AFFECTED_PACKS as usize {
+        return Err(StoreError::PurgePackLimitExceeded);
+    }
+    for (pack_id, purged_ids) in affected_packs {
+        let (object_count, location_count, record_bytes): (i64, i64, i64) = connection.query_row(
+            "SELECT pack.object_count,
+                        COUNT(location.location_id),
+                        COALESCE(SUM(location.compressed_length), 0)
+                 FROM packs AS pack
+                 LEFT JOIN object_locations AS location
+                   ON location.pack_id = pack.pack_id
+                  AND location.verification_state = 'verified'
+                 WHERE pack.pack_id = ?1 AND pack.state = 'verified'
+                 GROUP BY pack.pack_id",
+            [&pack_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let object_count = sql_u64(object_count, "invalid purge pack object count")?;
+        let location_count = sql_u64(location_count, "invalid purge pack location count")?;
+        if object_count != location_count || purged_ids.len() as u64 > object_count {
+            return Err(StoreError::CorruptMetadata(
+                "purge pack object count disagrees with locations",
+            ));
+        }
+        let purged_object_count = purged_ids.len() as u64;
+        let retained_object_count = object_count - purged_object_count;
+        let pack_reclaimable = if retained_object_count == 0 {
+            PACK_HEADER_LENGTH
+                .checked_add(sql_u64(record_bytes, "invalid purge pack byte count")?)
+                .and_then(|bytes| bytes.checked_add(INDEX_HEADER_LENGTH))
+                .and_then(|bytes| {
+                    INDEX_ENTRY_LENGTH
+                        .checked_mul(object_count)
+                        .and_then(|index| bytes.checked_add(index))
+                })
+                .ok_or(StoreError::PurgeLimitExceeded)?
+        } else {
+            0
+        };
+        reclaimable_bytes = reclaimable_bytes
+            .checked_add(pack_reclaimable)
+            .ok_or(StoreError::PurgeLimitExceeded)?;
+        pack_snapshots.push(PurgePackSnapshot {
+            pack_id,
+            purged_object_count,
+            retained_object_count,
+            reclaimable_bytes: pack_reclaimable,
+        });
+    }
+
+    let wikitext_object_count = candidates
+        .iter()
+        .filter(|candidate| candidate.kind == ObjectKind::Wikitext)
+        .count() as u64;
+    let media_object_count = candidates.len() as u64 - wikitext_object_count;
+    let logical_bytes = candidates.iter().try_fold(0_u64, |total, candidate| {
+        total
+            .checked_add(candidate.uncompressed_length)
+            .ok_or(StoreError::PurgeLimitExceeded)
+    })?;
+    let whole_pack_count = pack_snapshots
+        .iter()
+        .filter(|pack| pack.retained_object_count == 0)
+        .count() as u64;
+    let affected_pack_count = pack_snapshots.len() as u64;
+    let mixed_pack_count = affected_pack_count - whole_pack_count;
+    let (manifest_head_sequence, manifest_head_id) = manifest_head.unzip();
+
+    let mut preview = PurgePreview {
+        collection_id,
+        collection_name: collection.0,
+        collection_generation: sql_u64(collection.1, "invalid purge collection generation")?,
+        tombstoned_at: sql_u64(tombstoned_at, "invalid purge tombstone time")?,
+        manifest_head_sequence,
+        manifest_head_id,
+        fingerprint: String::new(),
+        object_count: candidates.len() as u64,
+        wikitext_object_count,
+        media_object_count,
+        logical_bytes,
+        reclaimable_bytes,
+        loose_object_count,
+        affected_pack_count,
+        whole_pack_count,
+        mixed_pack_count,
+    };
+    preview.fingerprint =
+        purge_preview_fingerprint(&preview, &candidates, &locations, &pack_snapshots);
+    Ok((preview, candidates, pack_snapshots))
+}
+
+fn purge_preview_fingerprint(
+    preview: &PurgePreview,
+    candidates: &[PurgeCandidate],
+    locations: &[PurgeLocationFingerprint],
+    packs: &[PurgePackSnapshot],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(PURGE_PREVIEW_DOMAIN);
+    hash_manifest_field(&mut hasher, &preview.collection_id.get().to_string());
+    hash_manifest_field(&mut hasher, &preview.collection_name);
+    hash_manifest_field(&mut hasher, &preview.collection_generation.to_string());
+    hash_manifest_field(&mut hasher, &preview.tombstoned_at.to_string());
+    hash_manifest_optional_field(
+        &mut hasher,
+        preview
+            .manifest_head_sequence
+            .map(|value| value.to_string())
+            .as_deref(),
+    );
+    hash_manifest_optional_field(
+        &mut hasher,
+        preview.manifest_head_id.map(|id| id.to_string()).as_deref(),
+    );
+    for candidate in candidates {
+        hash_manifest_field(&mut hasher, &candidate.id.to_string());
+        hash_manifest_field(&mut hasher, candidate.kind.database_value());
+        hash_manifest_field(&mut hasher, &candidate.uncompressed_length.to_string());
+        hash_manifest_field(&mut hasher, "verified");
+    }
+    for location in locations {
+        hash_manifest_field(&mut hasher, &location.object_id.to_string());
+        hash_manifest_field(&mut hasher, &location.storage_kind);
+        hash_manifest_field(&mut hasher, &location.encoding);
+        hash_manifest_field(&mut hasher, &location.relative_path);
+        hash_manifest_field(&mut hasher, &location.compressed_length.to_string());
+        hash_manifest_optional_field(
+            &mut hasher,
+            location.base_object_id.map(|id| id.to_string()).as_deref(),
+        );
+        hash_manifest_optional_field(
+            &mut hasher,
+            location
+                .pack_generation
+                .map(|value| value.to_string())
+                .as_deref(),
+        );
+        hash_manifest_optional_field(&mut hasher, location.pack_id.as_deref());
+        hash_manifest_optional_field(&mut hasher, location.pack_index_checksum.as_deref());
+        hash_manifest_optional_field(
+            &mut hasher,
+            location
+                .pack_offset
+                .map(|value| value.to_string())
+                .as_deref(),
+        );
+        hash_manifest_optional_field(
+            &mut hasher,
+            location
+                .delta_depth
+                .map(|value| value.to_string())
+                .as_deref(),
+        );
+    }
+    for pack in packs {
+        hash_manifest_field(&mut hasher, &pack.pack_id);
+        hash_manifest_field(&mut hasher, &pack.purged_object_count.to_string());
+        hash_manifest_field(&mut hasher, &pack.retained_object_count.to_string());
+        hash_manifest_field(&mut hasher, &pack.reclaimable_bytes.to_string());
+    }
+    format!("b3:{}", hasher.finalize().to_hex())
+}
+
+fn authorized_purge_for_collection(
+    connection: &Connection,
+    collection_id: CollectionId,
+) -> Result<Option<AuthorizedPurge>, StoreError> {
+    type Row = (
+        i64,
+        String,
+        i64,
+        i64,
+        Option<i64>,
+        Option<String>,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    );
+    let row: Option<Row> = connection
+        .query_row(
+            "SELECT purge_id, collection_name, collection_generation, tombstoned_at,
+                    manifest_head_sequence, manifest_head_id, preview_fingerprint,
+                    object_count, wikitext_object_count, media_object_count,
+                    logical_bytes, reclaimable_bytes, loose_object_count,
+                    affected_pack_count, whole_pack_count, mixed_pack_count, authorized_at
+             FROM purge_operations
+             WHERE collection_id = ?1
+               AND state IN ('authorized', 'repacking', 'cleaning')",
+            [to_sql_integer(collection_id.get())?],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                    row.get(16)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(|row| {
+        let manifest_head_id = row
+            .5
+            .map(|id| {
+                id.parse().map_err(|_| {
+                    StoreError::CorruptMetadata("invalid purge manifest head identity")
+                })
+            })
+            .transpose()?;
+        Ok(AuthorizedPurge {
+            purge_id: sql_u64(row.0, "invalid purge ID")?,
+            preview: PurgePreview {
+                collection_id,
+                collection_name: row.1,
+                collection_generation: sql_u64(row.2, "invalid purge collection generation")?,
+                tombstoned_at: sql_u64(row.3, "invalid purge tombstone time")?,
+                manifest_head_sequence: row
+                    .4
+                    .map(|value| sql_u64(value, "invalid purge manifest sequence"))
+                    .transpose()?,
+                manifest_head_id,
+                fingerprint: row.6,
+                object_count: sql_u64(row.7, "invalid purge object count")?,
+                wikitext_object_count: sql_u64(row.8, "invalid purge wikitext count")?,
+                media_object_count: sql_u64(row.9, "invalid purge media count")?,
+                logical_bytes: sql_u64(row.10, "invalid purge logical bytes")?,
+                reclaimable_bytes: sql_u64(row.11, "invalid purge reclaimable bytes")?,
+                loose_object_count: sql_u64(row.12, "invalid purge loose count")?,
+                affected_pack_count: sql_u64(row.13, "invalid purge pack count")?,
+                whole_pack_count: sql_u64(row.14, "invalid purge whole pack count")?,
+                mixed_pack_count: sql_u64(row.15, "invalid purge mixed pack count")?,
+            },
+            authorized_at: sql_u64(row.16, "invalid purge authorization time")?,
+        })
+    })
+    .transpose()
+}
+
+fn validate_purge_text(value: &str) -> Result<(), StoreError> {
+    if value.trim().is_empty() || value.len() > MAX_MEDIA_METADATA_TEXT_BYTES {
+        return Err(StoreError::InvalidConfig(
+            "purge collection name is empty or exceeds 16 KiB",
+        ));
+    }
+    Ok(())
 }
 
 fn stored_collection(
@@ -10243,6 +11134,28 @@ pub enum StoreError {
     CollectionNotFound(CollectionId),
     /// A mutation or synchronization was requested for a retained collection tombstone.
     CollectionTombstoned(CollectionId),
+    /// Destructive payload cleanup was previewed for a collection still being tracked.
+    CollectionMustBeTombstoned(CollectionId),
+    /// No logical payload is exclusive to the requested tombstoned collection.
+    NoExclusivePurgePayload(CollectionId),
+    /// A collection-exclusive payload preview exceeded its hard object/work bound.
+    PurgeLimitExceeded,
+    /// A purge preview exceeded its hard active-location scan bound.
+    PurgeLocationLimitExceeded,
+    /// A purge preview affected more immutable packs than one operation supports.
+    PurgePackLimitExceeded,
+    /// A selected logical object has no active verified physical representation.
+    PurgeObjectUnavailable(ObjectId),
+    /// The operator did not provide both mandatory scope and backup confirmations.
+    PurgeAcknowledgementsRequired,
+    /// A supplied preview fingerprint was not a canonical BLAKE3 identity.
+    InvalidPurgeFingerprint,
+    /// The collection tombstone, manifest head, references, or locations changed.
+    StalePurgePreview(CollectionId),
+    /// A different unfinished purge journal already owns this collection.
+    PurgeAlreadyPending(CollectionId),
+    /// No durable purge journal exists for the requested identity.
+    PurgeNotFound(u64),
     /// An administrative preview was based on an older collection generation.
     StaleCollectionGeneration {
         /// Collection whose preview is stale.
@@ -10474,6 +11387,43 @@ impl fmt::Display for StoreError {
             }
             Self::CollectionTombstoned(collection_id) => {
                 write!(formatter, "collection {collection_id} is no longer tracked")
+            }
+            Self::CollectionMustBeTombstoned(collection_id) => write!(
+                formatter,
+                "collection {collection_id} must be tombstoned before payload purge"
+            ),
+            Self::NoExclusivePurgePayload(collection_id) => write!(
+                formatter,
+                "collection {collection_id} has no exclusive canonical payload to purge"
+            ),
+            Self::PurgeLimitExceeded => {
+                formatter.write_str("purge preview exceeds supported bounds")
+            }
+            Self::PurgeLocationLimitExceeded => {
+                formatter.write_str("purge preview exceeds the verified-location bound")
+            }
+            Self::PurgePackLimitExceeded => {
+                formatter.write_str("purge preview exceeds the affected-pack bound")
+            }
+            Self::PurgeObjectUnavailable(object_id) => write!(
+                formatter,
+                "purge candidate {object_id} has no active verified representation"
+            ),
+            Self::PurgeAcknowledgementsRequired => formatter
+                .write_str("purge requires payload-only and backup/remnant acknowledgements"),
+            Self::InvalidPurgeFingerprint => {
+                formatter.write_str("purge preview fingerprint is invalid")
+            }
+            Self::StalePurgePreview(collection_id) => write!(
+                formatter,
+                "collection {collection_id} purge preview is stale; preview again; no changes were committed"
+            ),
+            Self::PurgeAlreadyPending(collection_id) => write!(
+                formatter,
+                "collection {collection_id} already has a different unfinished purge"
+            ),
+            Self::PurgeNotFound(purge_id) => {
+                write!(formatter, "purge journal {purge_id} was not found")
             }
             Self::StaleCollectionGeneration {
                 collection_id,
@@ -10765,6 +11715,40 @@ mod tests {
             .expect("capture fixture page");
     }
 
+    fn capture_test_page_source(
+        library: &mut Library,
+        wiki_id: WikiId,
+        collection_id: CollectionId,
+        page_id: u64,
+        revision_id: u64,
+        title: &str,
+        source: &[u8],
+    ) -> ObjectId {
+        let title = PageTitle::new(title).expect("fixture title");
+        library
+            .capture_current_revision(
+                wiki_id,
+                collection_id,
+                &CurrentRevisionCapture {
+                    page_id: PageId::new(page_id).expect("fixture page ID"),
+                    namespace: 0,
+                    title: &title,
+                    revision_id: RevisionId::new(revision_id).expect("fixture revision ID"),
+                    parent_id: None,
+                    timestamp: "2026-08-24T10:00:00Z",
+                    author: None,
+                    author_id: None,
+                    comment: None,
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source,
+                },
+            )
+            .expect("capture fixture page")
+            .id
+    }
+
     fn integrity_media_fixture() -> (tempfile::TempDir, Library, ObjectId) {
         let (directory, mut library) = test_library();
         let wiki_id = library
@@ -10942,7 +11926,7 @@ mod tests {
         let before = filesystem_snapshot(directory.path());
 
         let mut library = Library::open_read_only(directory.path()).expect("read-only library");
-        assert_eq!(library.schema_version().expect("schema version"), 13);
+        assert_eq!(library.schema_version().expect("schema version"), 14);
         assert_eq!(library.wikis().expect("wikis")[0].wiki_id, wiki_id);
         assert_eq!(library.logical_object_count().expect("object count"), 1);
         assert_eq!(
@@ -11044,13 +12028,13 @@ mod tests {
     #[test]
     fn migration_is_applied_once_and_keeps_locations_separate() {
         let (directory, library) = test_library();
-        assert_eq!(library.schema_version().expect("schema version"), 13);
-        assert_eq!(migration_count(&library), 13);
+        assert_eq!(library.schema_version().expect("schema version"), 14);
+        assert_eq!(migration_count(&library), 14);
 
         drop(library);
         let reopened = Library::open(directory.path()).expect("reopen library");
-        assert_eq!(reopened.schema_version().expect("schema version"), 13);
-        assert_eq!(migration_count(&reopened), 13);
+        assert_eq!(reopened.schema_version().expect("schema version"), 14);
+        assert_eq!(migration_count(&reopened), 14);
 
         let logical_columns: Vec<String> = reopened
             .connection()
@@ -11065,6 +12049,54 @@ mod tests {
                 .iter()
                 .any(|column| column == "relative_path")
         );
+    }
+
+    #[test]
+    fn version_thirteen_library_adds_empty_purge_journal_without_data_loss() {
+        let (directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Migration fixture")
+            .expect("collection");
+        capture_test_page(
+            &mut library,
+            wiki_id,
+            collection_id,
+            1,
+            10,
+            "2026-08-24T10:00:00Z",
+            "Migration fixture page",
+        );
+        drop(library);
+
+        let connection = Connection::open(directory.path().join(DATABASE_NAME)).expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .expect("foreign keys");
+        connection
+            .execute_batch(
+                "DROP INDEX page_media_by_content_object;
+                 DROP INDEX collection_resolved_members_by_page;
+                 DROP TABLE purge_pack_work;
+                 DROP TABLE purge_objects;
+                 DROP INDEX one_unfinished_purge_per_collection;
+                 DROP TABLE purge_operations;
+                 DELETE FROM schema_migrations WHERE version = 14;
+                 PRAGMA user_version = 13;",
+            )
+            .expect("downgrade purge fixture");
+        drop(connection);
+
+        let upgraded = Library::open(directory.path()).expect("upgrade v13 library");
+        assert_eq!(upgraded.schema_version().expect("schema version"), 14);
+        assert_eq!(migration_count(&upgraded), 14);
+        assert_eq!(table_count(&upgraded, "purge_operations"), 0);
+        assert_eq!(table_count(&upgraded, "purge_objects"), 0);
+        assert_eq!(table_count(&upgraded, "purge_pack_work"), 0);
+        assert_eq!(table_count(&upgraded, "revisions"), 1);
+        assert_eq!(upgraded.logical_object_count().expect("objects"), 1);
     }
 
     #[test]
@@ -11223,7 +12255,12 @@ mod tests {
             .expect("open database for version-eight fixture");
         connection
             .execute_batch(
-                "DROP TABLE dump_import_pages;
+                "DROP INDEX page_media_by_content_object;
+                 DROP INDEX collection_resolved_members_by_page;
+                 DROP TABLE purge_pack_work;
+                 DROP TABLE purge_objects;
+                 DROP TABLE purge_operations;
+                 DROP TABLE dump_import_pages;
                  DROP TABLE dump_imports;
                  DROP TABLE page_media;
                  DROP TABLE media;
@@ -11239,15 +12276,15 @@ mod tests {
                  ALTER TABLE collections DROP COLUMN status;
                  ALTER TABLE collections DROP COLUMN generation;
                  ALTER TABLE collections DROP COLUMN tombstoned_at;
-                 DELETE FROM schema_migrations WHERE version IN (9, 10, 11, 12, 13);
+                 DELETE FROM schema_migrations WHERE version IN (9, 10, 11, 12, 13, 14);
                  PRAGMA user_version = 8;",
             )
             .expect("downgrade fixture metadata");
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade version eight library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 13);
-        assert_eq!(migration_count(&upgraded), 13);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 14);
+        assert_eq!(migration_count(&upgraded), 14);
         assert_eq!(
             upgraded
                 .network_transfer_policy()
@@ -11278,7 +12315,12 @@ mod tests {
             .expect("open database for version-nine fixture");
         connection
             .execute_batch(
-                "DROP TABLE dump_import_pages;
+                "DROP INDEX page_media_by_content_object;
+                 DROP INDEX collection_resolved_members_by_page;
+                 DROP TABLE purge_pack_work;
+                 DROP TABLE purge_objects;
+                 DROP TABLE purge_operations;
+                 DROP TABLE dump_import_pages;
                  DROP TABLE dump_imports;
                  DROP TABLE page_media;
                  DROP TABLE media;
@@ -11293,15 +12335,15 @@ mod tests {
                  ALTER TABLE collections DROP COLUMN status;
                  ALTER TABLE collections DROP COLUMN generation;
                  ALTER TABLE collections DROP COLUMN tombstoned_at;
-                 DELETE FROM schema_migrations WHERE version IN (10, 11, 12, 13);
+                 DELETE FROM schema_migrations WHERE version IN (10, 11, 12, 13, 14);
                  PRAGMA user_version = 9;",
             )
             .expect("downgrade fixture metadata");
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade version nine fixture");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 13);
-        assert_eq!(migration_count(&upgraded), 13);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 14);
+        assert_eq!(migration_count(&upgraded), 14);
         let collection = upgraded
             .collection(collection_id)
             .expect("collection lookup")
@@ -11349,7 +12391,12 @@ mod tests {
             .expect("open database for version-eleven fixture");
         connection
             .execute_batch(
-                "DROP TABLE dump_import_pages;
+                "DROP INDEX page_media_by_content_object;
+                 DROP INDEX collection_resolved_members_by_page;
+                 DROP TABLE purge_pack_work;
+                 DROP TABLE purge_objects;
+                 DROP TABLE purge_operations;
+                 DROP TABLE dump_import_pages;
                  DROP TABLE dump_imports;
                  DROP TABLE page_media;
                  DROP TABLE media;
@@ -11359,15 +12406,15 @@ mod tests {
                  ALTER TABLE collection_configuration DROP COLUMN thumbnail_max_images_per_revision;
                  ALTER TABLE collection_configuration DROP COLUMN thumbnail_max_edge_pixels;
                  ALTER TABLE collection_configuration DROP COLUMN image_policy;
-                 DELETE FROM schema_migrations WHERE version IN (12, 13);
+                 DELETE FROM schema_migrations WHERE version IN (12, 13, 14);
                  PRAGMA user_version = 11;",
             )
             .expect("downgrade fixture metadata");
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade version eleven library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 13);
-        assert_eq!(migration_count(&upgraded), 13);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 14);
+        assert_eq!(migration_count(&upgraded), 14);
         assert_eq!(
             upgraded
                 .collection_configuration(collection_id)
@@ -11427,8 +12474,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 13);
-        assert_eq!(migration_count(&upgraded), 13);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 14);
+        assert_eq!(migration_count(&upgraded), 14);
         assert_eq!(table_count(&upgraded, "revisions"), 0);
     }
 
@@ -11464,8 +12511,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 13);
-        assert_eq!(migration_count(&upgraded), 13);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 14);
+        assert_eq!(migration_count(&upgraded), 14);
         assert_eq!(table_count(&upgraded, "search_documents"), 0);
         let fts_definition: String = upgraded
             .connection()
@@ -12677,6 +13724,332 @@ mod tests {
                 .expect("expected metadata count")
         );
         assert!(metadata.iter().all(|record| record.issues.is_empty()));
+    }
+
+    #[test]
+    fn purge_preview_requires_tombstone_and_excludes_shared_references() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let target = library
+            .create_explicit_collection(wiki_id, "Target archive")
+            .expect("target collection");
+        let retained = library
+            .create_explicit_collection(wiki_id, "Retained archive")
+            .expect("retained collection");
+        let exclusive = capture_test_page_source(
+            &mut library,
+            wiki_id,
+            target,
+            10,
+            100,
+            "Exclusive page",
+            b"exclusive payload",
+        );
+        let duplicated = capture_test_page_source(
+            &mut library,
+            wiki_id,
+            target,
+            11,
+            110,
+            "Target duplicate",
+            b"shared bytes",
+        );
+        assert_eq!(
+            duplicated,
+            capture_test_page_source(
+                &mut library,
+                wiki_id,
+                retained,
+                20,
+                200,
+                "Retained duplicate",
+                b"shared bytes",
+            )
+        );
+        capture_test_page_source(
+            &mut library,
+            wiki_id,
+            target,
+            30,
+            300,
+            "Shared page",
+            b"shared page payload",
+        );
+        capture_test_page_source(
+            &mut library,
+            wiki_id,
+            retained,
+            30,
+            300,
+            "Shared page",
+            b"shared page payload",
+        );
+
+        assert!(matches!(
+            library.preview_collection_purge(target),
+            Err(StoreError::CollectionMustBeTombstoned(id)) if id == target
+        ));
+        library
+            .tombstone_collection(target)
+            .expect("tombstone target");
+        let preview = library
+            .preview_collection_purge(target)
+            .expect("exclusive purge preview");
+        assert_eq!(preview.object_count, 1);
+        assert_eq!(preview.wikitext_object_count, 1);
+        assert_eq!(preview.media_object_count, 0);
+        assert_eq!(preview.logical_bytes, b"exclusive payload".len() as u64);
+        assert_eq!(preview.loose_object_count, 1);
+        assert_eq!(preview.affected_pack_count, 0);
+        assert_eq!(preview.collection_name, "Target archive");
+        assert!(preview.tombstoned_at > 0);
+        assert!(
+            preview.fingerprint.parse::<ManifestId>().is_ok(),
+            "preview fingerprint is a canonical BLAKE3 identity"
+        );
+        assert_eq!(
+            library.read_object(exclusive).expect("exclusive bytes"),
+            b"exclusive payload"
+        );
+        assert_eq!(
+            library.read_object(duplicated).expect("retained bytes"),
+            b"shared bytes"
+        );
+    }
+
+    #[test]
+    fn purge_preview_excludes_source_wide_manifest_text_and_media_claims() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let target = library
+            .create_explicit_collection(wiki_id, "Manifest-protected target")
+            .expect("target collection");
+        capture_test_page_source(
+            &mut library,
+            wiki_id,
+            target,
+            60,
+            600,
+            "Manifest protected page",
+            b"manifest protected text",
+        );
+        let file_title = PageTitle::new("File:Manifest-protected.png").expect("file title");
+        library
+            .capture_revision_thumbnail(
+                wiki_id,
+                PageId::new(60).expect("page ID"),
+                RevisionId::new(600).expect("revision ID"),
+                ThumbnailPolicy::new(640, 8, 1024).expect("thumbnail policy"),
+                &ThumbnailCapture {
+                    media_id: MediaId::new(9060).expect("media ID"),
+                    file_title: &file_title,
+                    source_sha1: "abcdef0123456789abcdef0123456789",
+                    original_url: "https://upload.wikimedia.org/manifest-protected.png",
+                    description_url:
+                        "https://commons.wikimedia.org/wiki/File:Manifest-protected.png",
+                    author: "Fixture photographer",
+                    attribution: "Fixture photographer / Wikimedia Commons",
+                    license_name: "CC BY-SA 4.0",
+                    license_url: Some("https://creativecommons.org/licenses/by-sa/4.0/"),
+                    width: 1,
+                    height: 1,
+                    mime_type: ThumbnailMimeType::Png,
+                    captured_at: 1_776_000_000,
+                    source: VALID_PNG,
+                },
+                RevisionMediaPlacement {
+                    index: 0,
+                    kind: MediaPlacementKind::Lead,
+                    caption: Some("Manifest-protected media"),
+                    alt_text: Some("Fixture alternative"),
+                },
+            )
+            .expect("capture media");
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, None, SyncRunKind::Update, 100)
+            .expect("source-wide run")
+            .status
+            .run_id;
+        library
+            .complete_sync_run(run_id, None)
+            .expect("complete source-wide run");
+        let manifest = library.append_sync_manifest(run_id).expect("manifest");
+        assert_eq!(manifest.manifest.collection_id, None);
+        assert_eq!(manifest.manifest.introduced_revisions.len(), 1);
+        assert_eq!(
+            manifest
+                .manifest
+                .media_snapshot
+                .as_ref()
+                .expect("media snapshot")
+                .inventory
+                .len(),
+            1
+        );
+        library
+            .tombstone_collection(target)
+            .expect("tombstone target");
+        assert!(matches!(
+            library.preview_collection_purge(target),
+            Err(StoreError::NoExclusivePurgePayload(id)) if id == target
+        ));
+    }
+
+    #[test]
+    fn purge_authorization_is_stale_safe_idempotent_bounded_and_non_destructive() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let target = library
+            .create_explicit_collection(wiki_id, "Confirmed target")
+            .expect("target collection");
+        let retained = library
+            .create_explicit_collection(wiki_id, "Pack neighbor")
+            .expect("retained collection");
+        let target_object = capture_test_page_source(
+            &mut library,
+            wiki_id,
+            target,
+            40,
+            400,
+            "Target packed page",
+            b"target packed payload",
+        );
+        capture_test_page_source(
+            &mut library,
+            wiki_id,
+            retained,
+            50,
+            500,
+            "Retained packed page",
+            b"retained packed payload",
+        );
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, Some(target), SyncRunKind::Bootstrap, 100)
+            .expect("start run")
+            .status
+            .run_id;
+        library
+            .complete_sync_run(run_id, None)
+            .expect("complete run");
+        let manifest = library.append_sync_manifest(run_id).expect("manifest");
+        library
+            .tombstone_collection(target)
+            .expect("tombstone target");
+
+        let stale = library
+            .preview_collection_purge(target)
+            .expect("loose preview");
+        assert_eq!(
+            stale.manifest_head_sequence,
+            Some(manifest.manifest.sequence)
+        );
+        assert_eq!(stale.manifest_head_id, Some(manifest.id));
+        let pack = library
+            .pack_loose_objects()
+            .expect("pack candidates")
+            .expect("new pack");
+        assert!(matches!(
+            library.authorize_collection_purge(
+                target,
+                PurgeAuthorization {
+                    collection_name: &stale.collection_name,
+                    preview_fingerprint: &stale.fingerprint,
+                    payload_only_acknowledged: true,
+                    backups_not_erased_acknowledged: true,
+                }
+            ),
+            Err(StoreError::StalePurgePreview(id)) if id == target
+        ));
+        assert_eq!(table_count(&library, "purge_operations"), 0);
+
+        let preview = library
+            .preview_collection_purge(target)
+            .expect("packed preview");
+        assert_eq!(preview.affected_pack_count, 1);
+        assert_eq!(preview.whole_pack_count, 0);
+        assert_eq!(preview.mixed_pack_count, 1);
+        assert_eq!(preview.loose_object_count, 1);
+        assert!(matches!(
+            library.authorize_collection_purge(
+                target,
+                PurgeAuthorization {
+                    collection_name: &preview.collection_name,
+                    preview_fingerprint: &preview.fingerprint,
+                    payload_only_acknowledged: false,
+                    backups_not_erased_acknowledged: true,
+                }
+            ),
+            Err(StoreError::PurgeAcknowledgementsRequired)
+        ));
+
+        let authorization = PurgeAuthorization {
+            collection_name: &preview.collection_name,
+            preview_fingerprint: &preview.fingerprint,
+            payload_only_acknowledged: true,
+            backups_not_erased_acknowledged: true,
+        };
+        let receipt = library
+            .authorize_collection_purge(target, authorization)
+            .expect("authorize purge");
+        let repeated = library
+            .authorize_collection_purge(target, authorization)
+            .expect("idempotent authorization");
+        assert_eq!(repeated, receipt);
+        library
+            .connection()
+            .execute(
+                "UPDATE content_objects SET verification_state = 'corrupt'
+                 WHERE object_id = ?1",
+                [target_object.to_string()],
+            )
+            .expect("change logical verification state");
+        assert!(matches!(
+            library.authorize_collection_purge(target, authorization),
+            Err(StoreError::StalePurgePreview(id)) if id == target
+        ));
+        library
+            .connection()
+            .execute(
+                "UPDATE content_objects SET verification_state = 'verified'
+                 WHERE object_id = ?1",
+                [target_object.to_string()],
+            )
+            .expect("restore logical verification state");
+        assert_eq!(table_count(&library, "purge_operations"), 1);
+        assert_eq!(table_count(&library, "purge_objects"), 1);
+        assert_eq!(table_count(&library, "purge_pack_work"), 1);
+        let objects = library
+            .purge_objects_after(receipt.purge_id, None, 1)
+            .expect("purge object page");
+        assert_eq!(objects[0].object.id, target_object);
+        assert!(matches!(
+            library.purge_objects_after(receipt.purge_id, None, 0),
+            Err(StoreError::InvalidConfig(_))
+        ));
+        assert_eq!(
+            library
+                .read_object(target_object)
+                .expect("payload retained"),
+            b"target packed payload"
+        );
+        assert!(library.contains(target_object).expect("location retained"));
+        assert_eq!(
+            library
+                .connection()
+                .query_row(
+                    "SELECT state FROM packs WHERE pack_id = ?1",
+                    [&pack.pack_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("pack state"),
+            "verified"
+        );
     }
 
     #[test]

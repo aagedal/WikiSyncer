@@ -429,9 +429,45 @@ the maintained current export.
 must warn about retained suppressed material and legal obligations. Diagnostic
 redaction must remain an explicit versioned allowlist, and users must review bundles
 before sharing them. Define bounded log retention and verify no telemetry endpoints
-or unexpected outbound requests in release binaries. Purge, if later implemented, must
-be a separately authorized destructive workflow with preview and clear limits on
-recoverability from packs/backups.
+or unexpected outbound requests in release binaries. Destructive purge is not
+implemented. Its required preview, authorization, shared-reference, authenticated-
+absence, crash-recovery, and erasure-limit contract is defined in
+`docs/operations/destructive-purge.md`; no product surface may claim it before the
+implementation and failure-path tests satisfy that contract.
+
+### Destructive purge authorization and recoverability (pending)
+
+**Scenario.** A user or local client mistakes non-destructive collection removal for
+data erasure; an unauthorized, stale, or partial purge removes shared or manifested
+canonical content; a crash strands retained pack deltas; or the product implies that
+unlinking local files removed sensitive material from backups or physical media.
+
+**Required controls.** Purge remains a distinct tombstone-only operation. A complete
+non-mutating preview must bind the exact collection name and generation, current
+manifest head, complete logical/physical catalog fingerprint, exclusive/shared
+closure, and estimated reclamation into a typed preview fingerprint. Commit requires
+the exact name and fingerprint plus explicit acknowledgements that audit metadata and
+hashes remain and that external copies are unaffected. The daemon or direct writer
+revalidates every binding under the single-writer boundary; client UI state is not
+authorization.
+
+Before any payload becomes absent, a typed predecessor-linked purge event must
+authenticate a durable journal inventory. Mixed packs are rewritten into fully
+verified replacement generations for all retained entries and delta dependencies
+before the old generation is retired. Shared or uncertain references are retained.
+Journal phases are monotonic and idempotent, restart before conflicting work, and
+allow verification to distinguish unexplained loss, authorized absence, and pending
+cleanup. An older reader that cannot interpret the event fails visibly rather than
+silently accepting a shortened archive.
+
+**Residual risk and non-promises.** Audit metadata and hashes remain deliberately,
+including collection, page/revision, author/comment, membership, run, manifest, and
+journal evidence. Shared payload remains. Purge neither contacts the source nor
+removes copies from backups, filesystem/VM snapshots, exports, synchronized storage,
+logs, crash artifacts, or other systems. File unlinking and pack retirement are not
+secure erase and cannot prove removal from SSD wear leveling, copy-on-write history,
+journaled blocks, caches, swap, or forensic remnants. Full-disk encryption and
+separate retention/media-destruction controls remain external responsibilities.
 
 ## Present versus pending control register
 
@@ -450,6 +486,7 @@ recoverability from packs/backups.
 | Full verify contract | **Partial** | Loose/pack/delta objects, manifest identity/chain/run coverage, revision/page/object/media reachability, authenticated v2 media inventory/placements, page heads, checkpoint run/scope/boundary, search/FTS pointers, and search transformer versions are checked with bounded stable scans. An exact external head comparison detects a different restored head. The current schema has no derived-cache table; contentless FTS bodies, full revision-chain policy completeness, older v1 media coverage, and broader database truncation detection remain limited |
 | Loopback-only read-only reader | **Present, confidentiality gap** | Non-loopback addresses are rejected and only GET routes exist; localhost is unauthenticated and not an OS-user boundary |
 | Daemon single-writer authorization | **Partial** | Versioned bounded Unix IPC, `0600` sockets inside the private library, cooperative writer leases, scheduling, signal cancellation, advisory-lock stale-socket recovery, GUI/CLI forwarding, and exclusion/recovery tests exist; peer-credential review and hostile same-UID analysis remain |
+| Destructive purge | **Contract defined; implementation pending** | `collection remove` remains non-destructive. The future workflow must pass preview/authorization staleness, tombstone-only, shared-reference, manifest/journal recovery, replacement-pack, verification, and explicit non-erasure tests before exposure in CLI/GUI/daemon |
 | Locked/audited dependencies | **Partial** | Lockfile, cargo-deny policy, locked CI tests; formal audit response, immutable CI action pins, SBOM/provenance remain |
 | Signed beta packages | **Credential-free substrate present; credentialed release pending** | Deterministic bounded macOS/Linux candidate archives, exact signed-set verification, detached OpenSSH Ed25519 checksum-signing hooks, a defined Linux archive/repository/key-distribution trust model, deterministic macOS Mach-O/signing plans, fail-closed Developer ID/receipt/final-archive validation, eleven packaging tests, and a no-secret/no-publish native CI dry run are present. Real Apple Developer ID signing, timestamping, notarization and clean-host Gatekeeper evidence; protected release identities and independent trust-anchor distribution; credentialed native validation; and signed publication remain |
 | Safe optional media | **Present, default-off** | Bounded discovery/download, source-bound CDN policy, passive-raster validation, hard collection budgets, immutable attribution/licensing metadata, media-aware manifests/full verification, local-only reader serving, and attributed deterministic exports are fixture-tested. Higher-resolution/active media remain unsupported |
@@ -511,6 +548,11 @@ result on macOS and Ubuntu. Deferred items must be disabled and accurately docum
 14. **Media decision:** media remains disabled, or its bounded decode/rasterization,
     MIME handling, CSP, source/license/attribution, budget, and malicious corpus tests
     all pass. Text synchronization must remain usable when media fails.
+15. **Destructive purge:** purge remains unavailable, or complete preview binding,
+    exact confirmations, tombstone-only enforcement, shared-reference closure,
+    authenticated purge events, restartable cleanup, replacement-pack activation,
+    authorized-absence verification, and non-erasure language pass direct/daemon and
+    CLI/GUI failure-path tests.
 
 ## Review triggers
 
