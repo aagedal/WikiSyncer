@@ -35,6 +35,17 @@ impl FixtureResponse {
         }
     }
 
+    pub fn partial(body: &'static str, content_range: &'static str) -> Self {
+        Self {
+            status: 206,
+            body,
+            retry_after: None,
+            // The fixture only uses this private slot as Content-Range for a 206.
+            location: Some(content_range.to_owned()),
+            delay: Duration::ZERO,
+        }
+    }
+
     pub const fn delayed_json(body: &'static str, delay: Duration) -> Self {
         Self {
             status: 200,
@@ -149,6 +160,7 @@ fn read_request(stream: &mut TcpStream) -> String {
 fn write_response(stream: &mut TcpStream, response: &FixtureResponse) {
     let reason = match response.status {
         200 => "OK",
+        206 => "Partial Content",
         302 => "Found",
         429 => "Too Many Requests",
         503 => "Service Unavailable",
@@ -161,8 +173,13 @@ fn write_response(stream: &mut TcpStream, response: &FixtureResponse) {
     let location = response
         .location
         .as_ref()
-        .map(|location| format!("Location: {location}\r\n"))
-        .unwrap_or_default();
+        .map_or_else(String::new, |value| {
+            if response.status == 206 {
+                format!("Content-Range: {value}\r\n")
+            } else {
+                format!("Location: {value}\r\n")
+            }
+        });
     let headers = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{}{}Content-Length: {}\r\nConnection: close\r\n\r\n",
         response.status,

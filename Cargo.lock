@@ -3716,7 +3716,11 @@ dependencies = [
 name = "wikisync-mediawiki"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "bytes",
  "bzip2",
+ "fs2",
+ "libc",
  "quick-xml",
  "reqwest",
  "serde",
@@ -3754,9 +3758,12 @@ dependencies = [
 name = "wikisync-sync"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "bzip2",
  "sha1",
  "tempfile",
  "tokio",
+ "url",
  "wikisync-content",
  "wikisync-core",
  "wikisync-mediawiki",

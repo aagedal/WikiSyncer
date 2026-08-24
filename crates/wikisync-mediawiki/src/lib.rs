@@ -6,9 +6,14 @@
 //! may repeat the same bounded request, but it has an explicit attempt ceiling and a
 //! shared circuit breaker for persistent retryable failures.
 
+mod acquisition;
 mod dump;
 mod media;
 
+pub use acquisition::{
+    CURRENT_DUMP_ARTIFACT_KIND, CURRENT_DUMP_INDEX_SCHEMA, DumpAcquisitionError,
+    DumpAcquisitionLimits, DumpDigest, TrustedDumpIndex, VerifiedDumpArtifact, VerifiedDumpSet,
+};
 pub use dump::{
     DumpError, DumpFilter, DumpLimits, DumpNamespace, DumpPage, DumpReader, DumpRevision,
     DumpSiteInfo,
@@ -967,6 +972,16 @@ impl MediaWikiClient {
             circuit: Arc::new(CircuitBreaker::new()),
             transport_limits,
         })
+    }
+
+    /// Returns the validated, normalized Action API endpoint that defines this
+    /// client's source identity.
+    ///
+    /// The returned URL is immutable and cannot contain credentials, a query, or a
+    /// fragment because [`ClientConfig::new`] rejects those forms.
+    #[must_use]
+    pub fn endpoint(&self) -> &Url {
+        self.config.endpoint()
     }
 
     /// Resolves and normalizes a bounded set of titles, following redirects.
@@ -1982,6 +1997,21 @@ mod tests {
                 Err(ConfigError::UnsafeDestination)
             ));
         }
+    }
+
+    #[test]
+    fn client_exposes_immutable_normalized_source_endpoint() {
+        let config = ClientConfig::new("https://EN.WIKIPEDIA.ORG:443/w/api.php", "WikiSyncer/0.1")
+            .expect("validated source config");
+        let client = MediaWikiClient::new(config).expect("client");
+
+        assert_eq!(
+            client.endpoint().as_str(),
+            "https://en.wikipedia.org/w/api.php"
+        );
+        assert!(client.endpoint().username().is_empty());
+        assert!(client.endpoint().query().is_none());
+        assert!(client.endpoint().fragment().is_none());
     }
 
     #[test]

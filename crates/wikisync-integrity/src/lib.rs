@@ -4,7 +4,7 @@
 //! identities recorded when they were captured. It does not establish that an
 //! upstream statement is true, unbiased, complete, or still publicly available.
 //! Full verification also checks reference consistency exposed by the current
-//! schema. Schema version 12 has no persistent derived-cache table, so no report from
+//! schema. Schema version 13 has no persistent derived-cache table, so no report from
 //! this version claims derived-cache inventory or cache-body verification.
 
 use std::collections::{HashMap, HashSet};

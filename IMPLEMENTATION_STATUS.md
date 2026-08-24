@@ -280,9 +280,21 @@ Stable contracts, pack tuning, and dump-import foundations now also include:
   decoding and pull-based XML parsing without whole-dump disk decompression. It has
   explicit compressed/decompressed/page/text/XML/cardinality limits, namespace and
   content-model filters, strict scalar/structure handling, suppressed-contributor
-  protection, and offline fixtures. Authenticated dump/index acquisition, durable
-  import/resume, selection integration, and the post-bootstrap Action API race closure
-  are not yet implemented.
+  protection, and offline fixtures;
+- authenticated, restartable acquisition from a caller-retained BLAKE3 index anchor.
+  The strict bounded index transitively commits the ordered dump artifacts, database,
+  generated timestamp, lengths, and BLAKE3 identities. Downloads reuse the existing
+  source-bound DNS, proxy, redirect, concurrency, byte-rate, aggregate-byte, and
+  timeout policy; validate exact range resumption; publish private regular files
+  durably without overwrite; and re-hash the opened handle before import; and
+- schema migration 13 plus a current-and-future dump-bootstrap application path with
+  exact dump-set/configuration/generation binding, monotonic multipart resume cursors,
+  idempotent selected-page ledgers, aggregate parser limits, hard collection budgets,
+  stable-page-ID filtering, source/client/site validation, and atomic permanent-failure
+  terminalization. Every selected ID is queried after the scan; absent pages use the
+  Action API and changed imported heads reuse forward-gap reconciliation so all public
+  intermediate revisions are durable before the bootstrap checkpoint and manifest
+  complete. Ordinary bootstrap jobs cannot be adopted as dump work.
 
 Optional-thumbnail capture now forms an end-to-end, default-off stable-v1 path:
 
@@ -355,12 +367,13 @@ Credential-free beta packaging readiness now includes:
 Workspace formatting, warning-denied Clippy, and all workspace tests pass. The
 `cargo-deny` subcommand is unavailable in this environment. All thirteen packaging
 tests, release-workflow YAML parsing, and the final packaging verification pass.
-This checkpoint adds no new package version. The dump reader adds direct `bzip2` and
-`quick-xml` dependencies; bounded raster validation adds `image` with only JPEG/PNG
-features; and store/integrity add workspace-path dependencies needed to share that
-validation and media identity policy. Their locked sources and licenses match the
-repository policy, but the unavailable `cargo-deny` executable prevented rerunning
-the automated policy audit. Milestone 4 delivery is still partial: actual Apple
+This checkpoint adds no new package version. Dump parsing/acquisition now directly
+uses `bzip2`, `quick-xml`, `blake3`, `bytes`, `fs2`, and `libc`; sync test coverage
+adds fixture-only `blake3` and `bzip2`, and source comparison uses `url`. Bounded
+raster validation continues to use `image` with only JPEG/PNG features. Their locked
+sources and licenses match the repository policy, but the unavailable `cargo-deny`
+executable prevented rerunning the automated policy audit. Milestone 4 delivery is
+still partial: actual Apple
 signing/notarization, production Linux/macOS identities and independent trust
 distribution, credentialed native validation, clean-system Gatekeeper assessment,
 and signed artifact publication remain.
@@ -369,9 +382,11 @@ and signed artifact publication remain.
 
 The ordered first implementation backlog (items 1–13) is complete. The broader
 milestone delivery lists are not all closed: destructive purge is not implemented,
-credentialed platform packages remain outstanding, pack tuning, the initial
-stable-contract definition, and optional thumbnail media are implemented, while dump
-bootstrap remains partial Milestone 5 work. Daemon-owned source administration, the planned
+credentialed platform packages remain outstanding, while pack tuning, the initial
+stable-contract definition, optional thumbnail media, and the authenticated durable
+dump-bootstrap library path are implemented. Dump bootstrap remains partial Milestone
+5 product work until it is exposed through the daemon and user-facing administration.
+Daemon-owned source administration, the planned
 non-destructive collection CLI/GUI surface, user-facing external
 signing/trusted-anchor workflows, historical export, and periodic dynamic-category
 membership reconciliation are implemented.
@@ -389,11 +404,13 @@ protection when the anchor is kept with and can be replaced alongside the librar
 
 ## Next checkpoint
 
-For locally actionable stable-v1 work, connect the streaming dump reader to
-authenticated dump/index acquisition, durable selection-aware import/resume, and the
-Action API race-window closure. Keep acquisition bounded and restartable, authenticate
-the dump/index before import, preserve canonical object identity and hard collection
-budgets, and use fixture-backed tests rather than live Wikimedia services.
+For locally actionable stable-v1 work, expose authenticated current-dump bootstrap
+through the single-writer daemon and an explicit CLI/GUI workflow. The workflow must
+preview source, trusted index identity, scope, transfer/storage limits, and hard
+collection budgets; must never treat a co-located legacy checksum as an independent
+trust anchor; and must preserve the typed `VerifiedDumpSet` boundary already enforced
+by the library path. Add fixture-backed direct/daemon forwarding, restart, and status
+tests without depending on live Wikimedia services.
 
 Credentialed Apple signing/notarization, protected production release identities and
 independent trust distribution, native release validation, clean-system assessment,

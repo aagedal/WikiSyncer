@@ -5,6 +5,7 @@ use std::thread::{self, JoinHandle};
 
 #[derive(Clone, Debug)]
 pub struct FixtureResponse {
+    pub status: u16,
     pub body: Vec<u8>,
     pub content_type: &'static str,
 }
@@ -12,6 +13,7 @@ pub struct FixtureResponse {
 impl FixtureResponse {
     pub fn json(body: impl AsRef<str>) -> Self {
         Self {
+            status: 200,
             body: body.as_ref().as_bytes().to_vec(),
             content_type: "application/json",
         }
@@ -19,8 +21,17 @@ impl FixtureResponse {
 
     pub fn bytes(body: impl Into<Vec<u8>>, content_type: &'static str) -> Self {
         Self {
+            status: 200,
             body: body.into(),
             content_type,
+        }
+    }
+
+    pub fn status_json(status: u16, body: impl AsRef<str>) -> Self {
+        Self {
+            status,
+            body: body.as_ref().as_bytes().to_vec(),
+            content_type: "application/json",
         }
     }
 }
@@ -34,9 +45,14 @@ pub struct FixtureServer {
 
 impl FixtureServer {
     pub fn start(responses: Vec<FixtureResponse>) -> Self {
+        Self::start_generated(move |_| responses)
+    }
+
+    pub fn start_generated(responses: impl FnOnce(&str) -> Vec<FixtureResponse>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
         let address = listener.local_addr().expect("fixture server address");
         let endpoint = format!("http://{address}/w/api.php");
+        let responses = responses(&endpoint);
         let response_endpoint = endpoint.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&requests);
@@ -98,7 +114,8 @@ fn write_response(stream: &mut TcpStream, response: FixtureResponse, endpoint: &
         response.body
     };
     let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} Fixture\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        response.status,
         response.content_type,
         body.len()
     );

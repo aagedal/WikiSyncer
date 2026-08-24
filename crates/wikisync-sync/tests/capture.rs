@@ -1,19 +1,29 @@
 mod support;
 
+use bzip2::Compression;
+use bzip2::write::BzEncoder;
+use std::io::Write;
+use std::time::Duration;
 use support::{FixtureResponse, FixtureServer};
 use wikisync_core::{
     CollectionBudget, CollectionRemovalPolicy, CollectionRule, HistoryPolicy, ImagePolicy,
     InclusionReason, PageId, PageTitle, RevisionId, ThumbnailPolicy, TitleSelection,
 };
-use wikisync_mediawiki::{ClientConfig, MediaWikiClient};
+use wikisync_mediawiki::{
+    ClientConfig, DumpAcquisitionLimits, DumpDigest, DumpLimits, MediaWikiClient, RetryPolicy,
+    TrustedDumpIndex,
+};
 use wikisync_search::{SearchIndex, SearchQuery, SqliteSearchIndex};
-use wikisync_store::{Library, SyncRunKind, SyncRunState};
+use wikisync_store::{
+    CollectionPreviewCommit, DumpImportState, Library, ObjectId, ObjectKind,
+    ResolvedCollectionMember, SyncRunKind, SyncRunState,
+};
 use wikisync_sync::{
     CaptureError, CategoryPreviewError, CategoryPreviewLimits, CollectionPreviewError,
-    DynamicMembershipReconciliation, DynamicMembershipReconciliationError, ReconciliationLimits,
-    capture_committed_collection, capture_explicit_titles, capture_revision_history,
-    commit_collection_preview, parse_title_list, preview_category_selection,
-    preview_collection_rule, reconcile_collection_heads,
+    DumpBootstrapError, DynamicMembershipReconciliation, DynamicMembershipReconciliationError,
+    ReconciliationLimits, bootstrap_collection_from_verified_dump, capture_committed_collection,
+    capture_explicit_titles, capture_revision_history, commit_collection_preview, parse_title_list,
+    preview_category_selection, preview_collection_rule, reconcile_collection_heads,
     reconcile_collection_heads_with_cancellation, reconcile_collection_heads_with_limits,
     reconcile_dynamic_collection_membership,
 };
@@ -102,6 +112,276 @@ const VALID_PNG: &[u8] = &[
     0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
     0xae, 0x42, 0x60, 0x82,
 ];
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authenticated_dump_bootstrap_filters_selection_and_closes_its_race_window() {
+    let server = FixtureServer::start_generated(|endpoint| {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" version="0.11" xml:lang="en">
+  <siteinfo>
+    <sitename>Fixture Wikipedia</sitename><dbname>enwiki</dbname>
+    <base>{endpoint}</base><generator>MediaWiki fixture</generator><case>first-letter</case>
+    <namespaces><namespace key="0" case="first-letter" /></namespaces>
+  </siteinfo>
+  <page><title>Alpha</title><ns>0</ns><id>10</id><revision>
+    <id>100</id><parentid>99</parentid><timestamp>2026-08-23T10:00:00Z</timestamp>
+    <contributor><username>Fixture editor</username><id>42</id></contributor>
+    <comment>dump head</comment><model>wikitext</model><format>text/x-wiki</format>
+    <text bytes="5" xml:space="preserve">Alpha</text>
+  </revision></page>
+  <page><title>Not selected</title><ns>0</ns><id>20</id><revision>
+    <id>200</id><timestamp>2026-08-23T10:01:00Z</timestamp>
+    <contributor><username>Fixture editor</username></contributor>
+    <model>wikitext</model><format>text/x-wiki</format>
+    <text bytes="7" xml:space="preserve">Ignored</text>
+  </revision></page>
+</mediawiki>"#
+        );
+        let mut encoder = BzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(xml.as_bytes()).expect("compress XML");
+        let artifact = encoder.finish().expect("finish bzip2 member");
+        let artifact_digest = blake3::hash(&artifact).to_hex().to_string();
+        let index = format!(
+            r#"{{"schema":"wikisync-current-dump-index-v1","database":"enwiki","generated_at":"2026-08-23T10:02:00Z","artifacts":[{{"kind":"pages-meta-current-multistream","path":"fixture-current.xml.bz2","bytes":{},"blake3":"{artifact_digest}"}}]}}"#,
+            artifact.len()
+        );
+        let unchanged = r#"{
+          "batchcomplete":true,"query":{"pages":[{
+            "pageid":10,"ns":0,"title":"Alpha","revisions":[{
+              "revid":100,"parentid":99,"timestamp":"2026-08-23T10:00:00Z","size":5
+            }]
+          }]}}
+        "#;
+        let missing = r#"{
+          "batchcomplete":true,"query":{"pages":[{
+            "pageid":-1,"ns":0,"title":"","missing":true
+          }]}}
+        "#;
+        vec![
+            FixtureResponse::json(index),
+            FixtureResponse::bytes(artifact, "application/x-bzip2"),
+            FixtureResponse::json(unchanged),
+            FixtureResponse::status_json(503, "{}"),
+            FixtureResponse::json(missing),
+            FixtureResponse::json(unchanged),
+            FixtureResponse::json(missing),
+        ]
+    });
+    let retry_policy = RetryPolicy::new(1, Duration::from_millis(1), Duration::from_millis(1))
+        .expect("single-attempt retry policy");
+    let client = MediaWikiClient::new(
+        ClientConfig::new(server.endpoint(), "WikiSyncer/0.1 dump-bootstrap-test")
+            .expect("client configuration")
+            .with_retry_policy(retry_policy),
+    )
+    .expect("client");
+    let cache = tempfile::tempdir().expect("dump cache");
+    let index_body = {
+        // Recreate only the authenticated index bytes to derive the out-of-band trust
+        // anchor. The artifact response itself remains available solely via acquisition.
+        let endpoint = server.endpoint();
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" version="0.11" xml:lang="en">
+  <siteinfo>
+    <sitename>Fixture Wikipedia</sitename><dbname>enwiki</dbname>
+    <base>{endpoint}</base><generator>MediaWiki fixture</generator><case>first-letter</case>
+    <namespaces><namespace key="0" case="first-letter" /></namespaces>
+  </siteinfo>
+  <page><title>Alpha</title><ns>0</ns><id>10</id><revision>
+    <id>100</id><parentid>99</parentid><timestamp>2026-08-23T10:00:00Z</timestamp>
+    <contributor><username>Fixture editor</username><id>42</id></contributor>
+    <comment>dump head</comment><model>wikitext</model><format>text/x-wiki</format>
+    <text bytes="5" xml:space="preserve">Alpha</text>
+  </revision></page>
+  <page><title>Not selected</title><ns>0</ns><id>20</id><revision>
+    <id>200</id><timestamp>2026-08-23T10:01:00Z</timestamp>
+    <contributor><username>Fixture editor</username></contributor>
+    <model>wikitext</model><format>text/x-wiki</format>
+    <text bytes="7" xml:space="preserve">Ignored</text>
+  </revision></page>
+</mediawiki>"#
+        );
+        let mut encoder = BzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(xml.as_bytes()).expect("compress XML");
+        let artifact = encoder.finish().expect("finish bzip2 member");
+        format!(
+            r#"{{"schema":"wikisync-current-dump-index-v1","database":"enwiki","generated_at":"2026-08-23T10:02:00Z","artifacts":[{{"kind":"pages-meta-current-multistream","path":"fixture-current.xml.bz2","bytes":{},"blake3":"{}"}}]}}"#,
+            artifact.len(),
+            blake3::hash(&artifact).to_hex()
+        )
+    };
+    let trust = TrustedDumpIndex::new(
+        server.endpoint(),
+        DumpDigest::from_hex(blake3::hash(index_body.as_bytes()).to_hex().as_ref())
+            .expect("index digest"),
+        "enwiki",
+    )
+    .expect("trust anchor");
+    let dump_set = client
+        .acquire_current_dump_set(&trust, cache.path(), DumpAcquisitionLimits::default())
+        .await
+        .expect("authenticated dump acquisition");
+
+    let directory = tempfile::tempdir().expect("temporary library");
+    let mut library = Library::open(directory.path()).expect("library");
+    let wiki_id = library
+        .register_wiki(server.endpoint(), "en")
+        .expect("wiki");
+    let alpha = PageTitle::new("Alpha").unwrap();
+    let gone = PageTitle::new("Gone").unwrap();
+    let selection = TitleSelection::new([alpha.clone(), gone.clone()]).unwrap();
+    let rule = CollectionRule::ExplicitTitles(selection);
+    let members = [
+        ResolvedCollectionMember {
+            page_id: PageId::new(10).unwrap(),
+            namespace: 0,
+            title: alpha.clone(),
+            inclusion_reason: InclusionReason::ExplicitTitle(alpha.clone()),
+        },
+        ResolvedCollectionMember {
+            page_id: PageId::new(30).unwrap(),
+            namespace: 0,
+            title: gone.clone(),
+            inclusion_reason: InclusionReason::ExplicitTitle(gone),
+        },
+    ];
+    let budget = CollectionBudget::unlimited()
+        .with_maximum_pages(2)
+        .unwrap()
+        .with_maximum_bytes(5)
+        .unwrap();
+    let (collection_id, _) = library
+        .create_collection_from_preview(
+            wiki_id,
+            "Dump selection",
+            CollectionPreviewCommit {
+                rule: &rule,
+                history_policy: HistoryPolicy::CurrentAndFuture,
+                budget,
+                removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+                members: &members,
+                missing_titles: &[],
+                predicted_canonical_bytes: Some(5),
+            },
+        )
+        .expect("collection");
+
+    let other_server = FixtureServer::start(vec![]);
+    let other_client = MediaWikiClient::new(
+        ClientConfig::new(
+            other_server.endpoint(),
+            "WikiSyncer/0.1 wrong-dump-closure-source-test",
+        )
+        .expect("other client configuration"),
+    )
+    .expect("other client");
+    let error = bootstrap_collection_from_verified_dump(
+        &other_client,
+        &mut library,
+        collection_id,
+        &dump_set,
+        DumpLimits::default(),
+    )
+    .await
+    .expect_err("closure client must match the durable wiki source");
+    assert!(matches!(error, DumpBootstrapError::ClientEndpointMismatch));
+    assert!(library.sync_run_statuses(10).unwrap().is_empty());
+    other_server.finish();
+
+    let error = bootstrap_collection_from_verified_dump(
+        &client,
+        &mut library,
+        collection_id,
+        &dump_set,
+        DumpLimits::default(),
+    )
+    .await
+    .expect_err("retryable closure failure");
+    assert!(matches!(
+        error,
+        DumpBootstrapError::Capture(CaptureError::Source(_))
+    ));
+    let interrupted = library.sync_run_statuses(1).unwrap().remove(0);
+    assert_eq!(interrupted.state, SyncRunState::Running);
+    assert_eq!(interrupted.succeeded_jobs, 1);
+    assert_eq!(interrupted.failed_jobs, 1);
+    let import = library
+        .dump_import_status(interrupted.run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(import.state, DumpImportState::Failed);
+    assert!(import.retryable);
+    assert_eq!(import.pages_scanned, 2);
+    assert_eq!(import.imported_pages, 1);
+    assert_eq!(import.imported_canonical_bytes, 5);
+    assert_eq!(
+        library
+            .sync_checkpoints()
+            .unwrap()
+            .into_iter()
+            .find(|checkpoint| checkpoint.collection_id == Some(collection_id))
+            .unwrap()
+            .committed_through,
+        0
+    );
+
+    let resumed = bootstrap_collection_from_verified_dump(
+        &client,
+        &mut library,
+        collection_id,
+        &dump_set,
+        DumpLimits::default(),
+    )
+    .await
+    .expect("resumed dump bootstrap");
+    assert!(resumed.resumed);
+    assert_eq!(resumed.status.run_id, interrupted.run_id);
+    assert_eq!(resumed.pages_imported, 0);
+    assert_eq!(resumed.pages_reused, 0);
+    assert_eq!(resumed.pages_absent_from_dump, 1);
+    assert_eq!(resumed.closure.pages_checked, 1);
+    assert_eq!(resumed.closure.missing_pages, 1);
+    assert_eq!(resumed.import.state, DumpImportState::Succeeded);
+    assert_eq!(resumed.import.pages_scanned, 2);
+    assert_eq!(
+        library
+            .revision(wiki_id, RevisionId::new(100).unwrap())
+            .unwrap()
+            .unwrap()
+            .content_object_id,
+        ObjectId::for_bytes(ObjectKind::Wikitext, b"Alpha")
+    );
+    assert!(
+        library
+            .page(wiki_id, PageId::new(20).unwrap())
+            .unwrap()
+            .is_none()
+    );
+
+    let idempotent = bootstrap_collection_from_verified_dump(
+        &client,
+        &mut library,
+        collection_id,
+        &dump_set,
+        DumpLimits::default(),
+    )
+    .await
+    .expect("idempotent dump bootstrap");
+    assert_eq!(idempotent.pages_imported, 0);
+    assert_eq!(idempotent.pages_reused, 1);
+    assert_eq!(library.logical_object_count().unwrap(), 1);
+    let checkpoint = library
+        .sync_checkpoints()
+        .unwrap()
+        .into_iter()
+        .find(|checkpoint| checkpoint.collection_id == Some(collection_id))
+        .unwrap();
+    assert_eq!(checkpoint.last_run_id, Some(idempotent.status.run_id));
+    assert!(checkpoint.committed_through >= resumed.status.checkpoint_candidate);
+    assert_eq!(server.finish().len(), 7);
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn category_preview_handles_continuation_recursion_cycles_and_deduplication() {

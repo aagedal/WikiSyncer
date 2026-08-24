@@ -362,6 +362,16 @@ impl<R: Read> DumpReader<R> {
         self.pages_yielded
     }
 
+    /// Number of decompressed XML bytes consumed through the parser's current
+    /// buffer position, including the site-info prologue and filtered pages.
+    ///
+    /// The value is monotonic for this reader and lets multipart callers enforce a
+    /// set-wide decompressed-byte ceiling without exposing the underlying decoder.
+    #[must_use]
+    pub fn decompressed_bytes_read(&self) -> u64 {
+        self.reader.buffer_position()
+    }
+
     fn read_site_info(&mut self) -> Result<(), DumpError> {
         let mut builder = SiteInfoBuilder::default();
         let mut namespace: Option<NamespaceBuilder> = None;

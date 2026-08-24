@@ -1,5 +1,12 @@
 //! Synchronization planning, checkpoints, reconciliation, and jobs.
 
+mod dump_bootstrap;
+
+pub use dump_bootstrap::{
+    DumpBootstrapError, DumpBootstrapReport, DumpClosureReport,
+    bootstrap_collection_from_verified_dump,
+};
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;

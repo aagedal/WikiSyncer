@@ -4230,7 +4230,7 @@ mod tests {
 
         let created = load_library_snapshot(&root, true).expect("create library");
         assert_eq!(created.path, root);
-        assert_eq!(created.schema_version, 12);
+        assert_eq!(created.schema_version, 13);
         assert!(root.join(DATABASE_NAME).is_file());
 
         let reopened = load_library_snapshot(&root, false).expect("reopen library");

@@ -39,6 +39,7 @@ const MIGRATION_9: &str = include_str!("../migrations/0009_network_transfer_poli
 const MIGRATION_10: &str = include_str!("../migrations/0010_collection_status.sql");
 const MIGRATION_11: &str = include_str!("../migrations/0011_pack_affinity.sql");
 const MIGRATION_12: &str = include_str!("../migrations/0012_thumbnail_media.sql");
+const MIGRATION_13: &str = include_str!("../migrations/0013_dump_imports.sql");
 const OBJECT_DOMAIN: &[u8] = b"wikisync-object-v1\0";
 const DATABASE_NAME: &str = "library.sqlite3";
 const MANIFEST_DOMAIN: &[u8] = b"wikisync-manifest-v1\0";
@@ -1492,6 +1493,112 @@ pub struct StartedSyncRun {
     pub resumed: bool,
 }
 
+/// Identity and selection binding required to claim a current-page dump import.
+///
+/// `dump_digest` is the BLAKE3 identity of the authenticated dump-set index that
+/// transitively commits the ordered artifact digests and lengths, encoded as `b3:`
+/// followed by 64 lowercase hexadecimal digits. The caller must authenticate every
+/// committed artifact before starting canonical import.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DumpImportRequest<'a> {
+    /// Running, collection-scoped bootstrap synchronization run.
+    pub run_id: u64,
+    /// Authenticated dump-set/index identity.
+    pub dump_digest: &'a str,
+    /// Exact total compressed length of the authenticated dump-set artifacts.
+    pub dump_compressed_bytes: u64,
+    /// Collection generation used to resolve the imported selection.
+    pub collection_generation: u64,
+    /// Source timestamp captured before dump import, used for race-window closure.
+    pub bootstrap_started_at: u64,
+}
+
+/// Lifecycle of one durable current-page dump import.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DumpImportState {
+    /// The current writer has claimed the import and may advance it.
+    Running,
+    /// Every artifact in the authenticated dump set was scanned successfully.
+    Succeeded,
+    /// Import stopped with a retained structured failure.
+    Failed,
+}
+
+impl DumpImportState {
+    /// Returns the stable lowercase SQLite and status representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            _ => Err(StoreError::CorruptMetadata("unknown dump import state")),
+        }
+    }
+}
+
+/// Durable status and exact resume identity for one current-page dump import.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DumpImportStatus {
+    /// Local durable import identity.
+    pub import_id: u64,
+    /// Owning bootstrap synchronization run.
+    pub run_id: u64,
+    /// Source wiki identity.
+    pub wiki_id: WikiId,
+    /// Collection whose resolved selection is being populated.
+    pub collection_id: CollectionId,
+    /// BLAKE3 digest of the authenticated dump-set index.
+    pub dump_digest: String,
+    /// Exact total compressed length of the authenticated dump-set artifacts.
+    pub dump_compressed_bytes: u64,
+    /// Collection generation to which the import is bound.
+    pub collection_generation: u64,
+    /// Immutable synchronization configuration hash captured by the owning run.
+    pub configuration_hash: String,
+    /// Source timestamp from immediately before dump import began.
+    pub bootstrap_started_at: u64,
+    /// Current lifecycle state.
+    pub state: DumpImportState,
+    /// Number of complete dump pages scanned; this is the sequential resume cursor.
+    pub pages_scanned: u64,
+    /// Number of distinct selected pages durably recorded for this import.
+    pub imported_pages: u64,
+    /// Sum of canonical source bytes for distinct selected pages.
+    pub imported_canonical_bytes: u64,
+    /// Number of times a writer has claimed this import.
+    pub attempt_count: u32,
+    /// Whether a failed import may be reclaimed.
+    pub retryable: bool,
+    /// Local creation time.
+    pub created_at: u64,
+    /// Most recent claim time.
+    pub claimed_at: u64,
+    /// Most recent durable progress or state-change time.
+    pub updated_at: u64,
+    /// Local completion/failure time.
+    pub finished_at: Option<u64>,
+    /// Most recently recorded failure, if the import failed.
+    pub latest_error: Option<SyncFailure>,
+}
+
+/// Result of atomically claiming new or restartable dump-import work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartedDumpImport {
+    /// Current durable import status.
+    pub status: DumpImportStatus,
+    /// Whether the exact durable identity existed before this claim.
+    pub resumed: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PackEncoding {
     Full,
@@ -1649,6 +1756,33 @@ struct RecordedPack {
     generation: u64,
     object_count: u64,
 }
+
+#[derive(Debug)]
+struct DumpImportRow {
+    import_id: i64,
+    run_id: i64,
+    wiki_id: i64,
+    collection_id: i64,
+    dump_digest: String,
+    dump_compressed_bytes: i64,
+    collection_generation: i64,
+    configuration_hash: String,
+    bootstrap_started_at: i64,
+    state: String,
+    pages_scanned: i64,
+    imported_pages: i64,
+    imported_canonical_bytes: i64,
+    attempt_count: i64,
+    retryable: bool,
+    error_code: Option<String>,
+    error_message: Option<String>,
+    created_at: i64,
+    claimed_at: i64,
+    updated_at: i64,
+    finished_at: Option<i64>,
+}
+
+type DumpImportRunBinding = (i64, Option<i64>, String, String, i64, Option<String>);
 
 /// One WikiSyncer library and its SQLite connection.
 #[derive(Debug)]
@@ -3282,6 +3416,423 @@ impl Library {
         Ok(StartedSyncRun { status, resumed })
     }
 
+    /// Atomically claims a new or restartable authenticated current-page dump import.
+    ///
+    /// The import is bound to the exact dump digest and length, the collection's
+    /// current generation, the owning run's immutable configuration hash, and the
+    /// bootstrap race-window timestamp. A restart with any different binding is
+    /// rejected rather than silently discarding or reinterpreting the cursor. A run
+    /// that already has synchronization jobs but no dump-import identity is also
+    /// rejected, because it belongs to a different bootstrap coordinator.
+    pub fn claim_or_resume_dump_import(
+        &mut self,
+        request: DumpImportRequest<'_>,
+    ) -> Result<StartedDumpImport, StoreError> {
+        validate_dump_digest(request.dump_digest)?;
+        if request.dump_compressed_bytes == 0 {
+            return Err(StoreError::InvalidDumpIdentity(
+                "authenticated dump length must be positive",
+            ));
+        }
+        if request.collection_generation == 0 {
+            return Err(StoreError::InvalidDumpIdentity(
+                "collection generation must be positive",
+            ));
+        }
+        let raw_run_id = to_sql_integer(request.run_id)?;
+        let raw_dump_bytes = to_sql_integer(request.dump_compressed_bytes)?;
+        let raw_generation = to_sql_integer(request.collection_generation)?;
+        let raw_bootstrap_started_at = to_sql_integer(request.bootstrap_started_at)?;
+        let now = unix_time()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run: Option<DumpImportRunBinding> = transaction
+            .query_row(
+                "SELECT wiki_id, collection_id, run_kind, state,
+                        checkpoint_candidate, configuration_hash
+                 FROM sync_runs WHERE run_id = ?1",
+                [raw_run_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((raw_wiki_id, raw_collection_id, run_kind, run_state, candidate, run_hash)) = run
+        else {
+            return Err(StoreError::SyncRunNotRunning(request.run_id));
+        };
+        if run_state != SyncRunState::Running.as_str() {
+            return Err(StoreError::SyncRunNotRunning(request.run_id));
+        }
+        let Some(raw_collection_id) = raw_collection_id else {
+            return Err(StoreError::DumpImportRequiresCollectionBootstrap(
+                request.run_id,
+            ));
+        };
+        if run_kind != SyncRunKind::Bootstrap.as_str() {
+            return Err(StoreError::DumpImportRequiresCollectionBootstrap(
+                request.run_id,
+            ));
+        }
+        if candidate != raw_bootstrap_started_at {
+            return Err(StoreError::DumpImportBootstrapStartMismatch {
+                run_id: request.run_id,
+                expected: sql_u64(candidate, "invalid bootstrap checkpoint candidate")?,
+                actual: request.bootstrap_started_at,
+            });
+        }
+        let wiki_id = sql_id(raw_wiki_id, "invalid dump import wiki ID")?;
+        let collection_id = sql_id(raw_collection_id, "invalid dump import collection ID")?;
+        let configuration_hash =
+            run_hash.ok_or(StoreError::SyncRunConfigurationUnavailable(request.run_id))?;
+        let (current_generation, status): (i64, String) = transaction.query_row(
+            "SELECT generation, status FROM collections WHERE collection_id = ?1",
+            [raw_collection_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if stored_collection_status(&status)? == CollectionStatus::Tombstoned {
+            return Err(StoreError::CollectionTombstoned(collection_id));
+        }
+        if current_generation != raw_generation {
+            return Err(StoreError::StaleCollectionGeneration {
+                collection_id,
+                expected: request.collection_generation,
+                actual: sql_u64(current_generation, "invalid collection generation")?,
+            });
+        }
+        let current_hash =
+            manifest_configuration_hash_for(&transaction, wiki_id, Some(collection_id))?;
+        if current_hash != configuration_hash {
+            return Err(StoreError::StaleDumpImportConfiguration {
+                run_id: request.run_id,
+            });
+        }
+
+        let existing: Option<DumpImportRow> = transaction
+            .query_row(
+                &format!("{} WHERE run_id = ?1", dump_import_status_query()),
+                [raw_run_id],
+                dump_import_status_row,
+            )
+            .optional()?;
+        let (raw_import_id, resumed) = if let Some(existing) = existing {
+            let import_id = sql_u64(existing.import_id, "invalid dump import ID")?;
+            if existing.wiki_id != raw_wiki_id
+                || existing.collection_id != raw_collection_id
+                || existing.dump_digest != request.dump_digest
+                || existing.dump_compressed_bytes != raw_dump_bytes
+                || existing.collection_generation != raw_generation
+                || existing.configuration_hash != configuration_hash
+                || existing.bootstrap_started_at != raw_bootstrap_started_at
+            {
+                return Err(StoreError::DumpImportIdentityMismatch { import_id });
+            }
+            match DumpImportState::from_database(&existing.state)? {
+                DumpImportState::Succeeded => (existing.import_id, true),
+                DumpImportState::Failed if !existing.retryable => {
+                    return Err(StoreError::DumpImportNotRestartable(import_id));
+                }
+                DumpImportState::Running | DumpImportState::Failed => {
+                    let next_attempt = u32::try_from(existing.attempt_count)
+                        .ok()
+                        .and_then(|attempt| attempt.checked_add(1))
+                        .ok_or(StoreError::DumpImportProgressOverflow)?;
+                    transaction.execute(
+                        "UPDATE dump_imports
+                         SET state = 'running', attempt_count = ?2,
+                             retryable = 1, error_code = NULL, error_message = NULL,
+                             claimed_at = ?3, updated_at = ?3, finished_at = NULL
+                         WHERE import_id = ?1",
+                        params![existing.import_id, next_attempt, now],
+                    )?;
+                    (existing.import_id, true)
+                }
+            }
+        } else {
+            let existing_jobs: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM sync_jobs WHERE run_id = ?1",
+                [raw_run_id],
+                |row| row.get(0),
+            )?;
+            if existing_jobs != 0 {
+                return Err(StoreError::DumpImportRunHasExistingJobs {
+                    run_id: request.run_id,
+                    jobs: sql_u64(existing_jobs, "invalid existing sync-job count")?,
+                });
+            }
+            transaction.execute(
+                "INSERT INTO dump_imports (
+                    run_id, wiki_id, collection_id, dump_digest,
+                    dump_compressed_bytes, collection_generation, configuration_hash,
+                    bootstrap_started_at, state, created_at, claimed_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                           'running', ?9, ?9, ?9)",
+                params![
+                    raw_run_id,
+                    raw_wiki_id,
+                    raw_collection_id,
+                    request.dump_digest,
+                    raw_dump_bytes,
+                    raw_generation,
+                    configuration_hash,
+                    raw_bootstrap_started_at,
+                    now,
+                ],
+            )?;
+            (transaction.last_insert_rowid(), false)
+        };
+        let raw = transaction.query_row(
+            &format!("{} WHERE import_id = ?1", dump_import_status_query()),
+            [raw_import_id],
+            dump_import_status_row,
+        )?;
+        let status = stored_dump_import_status(raw)?;
+        transaction.commit()?;
+        Ok(StartedDumpImport { status, resumed })
+    }
+
+    /// Durably advances the sequential page cursor without recording an import.
+    pub fn record_dump_import_progress(
+        &mut self,
+        import_id: u64,
+        pages_scanned: u64,
+    ) -> Result<DumpImportStatus, StoreError> {
+        let raw_import_id = to_sql_integer(import_id)?;
+        let raw_pages_scanned = to_sql_integer(pages_scanned)?;
+        let now = unix_time()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_dump_progress_can_advance(&transaction, import_id, raw_import_id, pages_scanned)?;
+        transaction.execute(
+            "UPDATE dump_imports SET pages_scanned = ?2, updated_at = ?3
+             WHERE import_id = ?1 AND state = 'running'",
+            params![raw_import_id, raw_pages_scanned, now],
+        )?;
+        let status = dump_import_status_by_id(&transaction, raw_import_id)?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    /// Atomically advances the cursor and idempotently records one selected page.
+    ///
+    /// The page and revision must already be durable, belong to the import's wiki,
+    /// and remain active in the bound collection. Repeating an identical record only
+    /// advances the cursor; a different revision or byte length for the same page is
+    /// rejected.
+    pub fn record_dump_imported_page(
+        &mut self,
+        import_id: u64,
+        pages_scanned: u64,
+        page_id: PageId,
+        revision_id: RevisionId,
+        canonical_bytes: u64,
+    ) -> Result<DumpImportStatus, StoreError> {
+        let raw_import_id = to_sql_integer(import_id)?;
+        let raw_pages_scanned = to_sql_integer(pages_scanned)?;
+        let raw_page_id = to_sql_integer(page_id.get())?;
+        let raw_revision_id = to_sql_integer(revision_id.get())?;
+        let raw_canonical_bytes = to_sql_integer(canonical_bytes)?;
+        let now = unix_time()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (raw_wiki_id, raw_collection_id, current_pages, current_bytes) =
+            ensure_dump_progress_can_advance(
+                &transaction,
+                import_id,
+                raw_import_id,
+                pages_scanned,
+            )?;
+        let existing: Option<(i64, i64)> = transaction
+            .query_row(
+                "SELECT revision_id, canonical_bytes FROM dump_import_pages
+                 WHERE import_id = ?1 AND page_id = ?2",
+                params![raw_import_id, raw_page_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (imported_pages, imported_bytes) = if let Some((revision, bytes)) = existing {
+            if revision != raw_revision_id || bytes != raw_canonical_bytes {
+                return Err(StoreError::ConflictingDumpImportPage { page_id });
+            }
+            (current_pages, current_bytes)
+        } else {
+            let selected_and_captured: bool = transaction.query_row(
+                "SELECT EXISTS (
+                    SELECT 1
+                    FROM collection_resolved_members AS member
+                    JOIN revisions AS revision
+                      ON revision.wiki_id = member.wiki_id
+                     AND revision.page_id = member.page_id
+                    WHERE member.collection_id = ?1
+                      AND member.wiki_id = ?2
+                      AND member.page_id = ?3
+                      AND member.membership_state = 'active'
+                      AND revision.revision_id = ?4
+                      AND revision.source_size = ?5
+                 )",
+                params![
+                    raw_collection_id,
+                    raw_wiki_id,
+                    raw_page_id,
+                    raw_revision_id,
+                    raw_canonical_bytes,
+                ],
+                |row| row.get(0),
+            )?;
+            if !selected_and_captured {
+                return Err(StoreError::InvalidDumpImportPage {
+                    page_id,
+                    revision_id,
+                });
+            }
+            transaction.execute(
+                "INSERT INTO dump_import_pages (
+                    import_id, wiki_id, page_id, revision_id, canonical_bytes, recorded_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    raw_import_id,
+                    raw_wiki_id,
+                    raw_page_id,
+                    raw_revision_id,
+                    raw_canonical_bytes,
+                    now,
+                ],
+            )?;
+            (
+                current_pages
+                    .checked_add(1)
+                    .ok_or(StoreError::DumpImportProgressOverflow)?,
+                current_bytes
+                    .checked_add(raw_canonical_bytes)
+                    .ok_or(StoreError::DumpImportProgressOverflow)?,
+            )
+        };
+        transaction.execute(
+            "UPDATE dump_imports
+             SET pages_scanned = ?2, imported_pages = ?3,
+                 imported_canonical_bytes = ?4, updated_at = ?5
+             WHERE import_id = ?1 AND state = 'running'",
+            params![
+                raw_import_id,
+                raw_pages_scanned,
+                imported_pages,
+                imported_bytes,
+                now,
+            ],
+        )?;
+        let status = dump_import_status_by_id(&transaction, raw_import_id)?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    /// Atomically marks a fully scanned authenticated dump set successful.
+    pub fn complete_dump_import(
+        &mut self,
+        import_id: u64,
+        pages_scanned: u64,
+    ) -> Result<DumpImportStatus, StoreError> {
+        let raw_import_id = to_sql_integer(import_id)?;
+        let raw_pages_scanned = to_sql_integer(pages_scanned)?;
+        let now = unix_time()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_dump_progress_can_advance(&transaction, import_id, raw_import_id, pages_scanned)?;
+        transaction.execute(
+            "UPDATE dump_imports
+             SET state = 'succeeded', pages_scanned = ?2, retryable = 0,
+                 updated_at = ?3, finished_at = ?3
+             WHERE import_id = ?1 AND state = 'running'",
+            params![raw_import_id, raw_pages_scanned, now],
+        )?;
+        let status = dump_import_status_by_id(&transaction, raw_import_id)?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    /// Atomically retains a structured dump-import failure for status and restart.
+    ///
+    /// A non-retryable failure also cancels the owning running synchronization run in
+    /// this same transaction. Callers must not separately cancel that run afterward.
+    pub fn fail_dump_import(
+        &mut self,
+        import_id: u64,
+        code: &str,
+        message: &str,
+        retryable: bool,
+    ) -> Result<DumpImportStatus, StoreError> {
+        validate_sync_text(code, "dump import error code")?;
+        validate_sync_text(message, "dump import error message")?;
+        let raw_import_id = to_sql_integer(import_id)?;
+        let now = unix_time()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let raw_run_id: Option<i64> = transaction
+            .query_row(
+                "SELECT run_id FROM dump_imports
+                 WHERE import_id = ?1 AND state = 'running'",
+                [raw_import_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(raw_run_id) = raw_run_id else {
+            return Err(StoreError::DumpImportNotRunning(import_id));
+        };
+        transaction.execute(
+            "UPDATE dump_imports
+             SET state = 'failed', retryable = ?2, error_code = ?3,
+                 error_message = ?4, updated_at = ?5, finished_at = ?5
+             WHERE import_id = ?1 AND state = 'running'",
+            params![raw_import_id, retryable, code, message, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO sync_errors (
+                run_id, job_id, code, message, retryable, occurred_at
+             ) VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
+            params![raw_run_id, code, message, retryable, now],
+        )?;
+        if !retryable {
+            let changed = transaction.execute(
+                "UPDATE sync_runs SET state = 'cancelled', finished_at = ?2
+                 WHERE run_id = ?1 AND state = 'running'",
+                params![raw_run_id, now],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::SyncRunNotRunning(sql_u64(
+                    raw_run_id,
+                    "invalid dump import sync-run ID",
+                )?));
+            }
+        }
+        let status = dump_import_status_by_id(&transaction, raw_import_id)?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    /// Returns durable dump-import status for one synchronization run.
+    pub fn dump_import_status(&self, run_id: u64) -> Result<Option<DumpImportStatus>, StoreError> {
+        self.connection
+            .query_row(
+                &format!("{} WHERE run_id = ?1", dump_import_status_query()),
+                [to_sql_integer(run_id)?],
+                dump_import_status_row,
+            )
+            .optional()?
+            .map(stored_dump_import_status)
+            .transpose()
+    }
+
     /// Adds one idempotent job to a running synchronization operation.
     ///
     /// Repeating the same key and payload returns the original job. Reusing a key
@@ -3460,12 +4011,21 @@ impl Library {
         let Some((raw_wiki_id, raw_collection_id, candidate, run_kind)) = run else {
             return Err(StoreError::SyncRunNotRunning(run_id));
         };
-        let incomplete: i64 = transaction.query_row(
+        let incomplete_jobs: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM sync_jobs
              WHERE run_id = ?1 AND state != 'succeeded'",
             [raw_run_id],
             |row| row.get(0),
         )?;
+        let incomplete_imports: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM dump_imports
+             WHERE run_id = ?1 AND state != 'succeeded'",
+            [raw_run_id],
+            |row| row.get(0),
+        )?;
+        let incomplete = incomplete_jobs
+            .checked_add(incomplete_imports)
+            .ok_or(StoreError::DumpImportProgressOverflow)?;
         if incomplete != 0 {
             return Err(StoreError::IncompleteSyncRun {
                 run_id,
@@ -3505,14 +4065,29 @@ impl Library {
 
     /// Cancels a running operation without changing its source checkpoint.
     pub fn cancel_sync_run(&mut self, run_id: u64) -> Result<(), StoreError> {
-        let changed = self.connection.execute(
+        let raw_run_id = to_sql_integer(run_id)?;
+        let now = unix_time()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
             "UPDATE sync_runs SET state = 'cancelled', finished_at = ?2
              WHERE run_id = ?1 AND state = 'running'",
-            params![to_sql_integer(run_id)?, unix_time()?],
+            params![raw_run_id, now],
         )?;
         if changed != 1 {
             return Err(StoreError::SyncRunNotRunning(run_id));
         }
+        transaction.execute(
+            "UPDATE dump_imports
+             SET state = 'failed', retryable = 0,
+                 error_code = 'sync-run-cancelled',
+                 error_message = 'owning synchronization run was cancelled',
+                 updated_at = ?2, finished_at = ?2
+             WHERE run_id = ?1 AND state = 'running'",
+            params![raw_run_id, now],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -7025,6 +7600,168 @@ fn stored_sync_run_status(row: SyncRunStatusRow) -> Result<SyncRunStatus, StoreE
     })
 }
 
+fn dump_import_status_query() -> &'static str {
+    "SELECT import_id, run_id, wiki_id, collection_id, dump_digest,
+            dump_compressed_bytes, collection_generation, configuration_hash,
+            bootstrap_started_at, state, pages_scanned, imported_pages,
+            imported_canonical_bytes, attempt_count, retryable, error_code,
+            error_message, created_at, claimed_at, updated_at, finished_at
+     FROM dump_imports"
+}
+
+fn dump_import_status_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DumpImportRow> {
+    Ok(DumpImportRow {
+        import_id: row.get(0)?,
+        run_id: row.get(1)?,
+        wiki_id: row.get(2)?,
+        collection_id: row.get(3)?,
+        dump_digest: row.get(4)?,
+        dump_compressed_bytes: row.get(5)?,
+        collection_generation: row.get(6)?,
+        configuration_hash: row.get(7)?,
+        bootstrap_started_at: row.get(8)?,
+        state: row.get(9)?,
+        pages_scanned: row.get(10)?,
+        imported_pages: row.get(11)?,
+        imported_canonical_bytes: row.get(12)?,
+        attempt_count: row.get(13)?,
+        retryable: row.get(14)?,
+        error_code: row.get(15)?,
+        error_message: row.get(16)?,
+        created_at: row.get(17)?,
+        claimed_at: row.get(18)?,
+        updated_at: row.get(19)?,
+        finished_at: row.get(20)?,
+    })
+}
+
+fn stored_dump_import_status(row: DumpImportRow) -> Result<DumpImportStatus, StoreError> {
+    let state = DumpImportState::from_database(&row.state)?;
+    let finished_at = row
+        .finished_at
+        .map(|value| sql_u64(value, "invalid dump import finish time"))
+        .transpose()?;
+    let latest_error = match (row.error_code, row.error_message, finished_at) {
+        (None, None, _) => None,
+        (Some(code), Some(message), Some(occurred_at)) if state == DumpImportState::Failed => {
+            Some(SyncFailure {
+                code,
+                message,
+                retryable: row.retryable,
+                occurred_at,
+            })
+        }
+        _ => {
+            return Err(StoreError::CorruptMetadata("incomplete dump import error"));
+        }
+    };
+    Ok(DumpImportStatus {
+        import_id: sql_u64(row.import_id, "invalid dump import ID")?,
+        run_id: sql_u64(row.run_id, "invalid dump import run ID")?,
+        wiki_id: sql_id(row.wiki_id, "invalid dump import wiki ID")?,
+        collection_id: sql_id(row.collection_id, "invalid dump import collection ID")?,
+        dump_digest: row.dump_digest,
+        dump_compressed_bytes: sql_u64(
+            row.dump_compressed_bytes,
+            "invalid compressed dump length",
+        )?,
+        collection_generation: sql_u64(
+            row.collection_generation,
+            "invalid dump import collection generation",
+        )?,
+        configuration_hash: row.configuration_hash,
+        bootstrap_started_at: sql_u64(
+            row.bootstrap_started_at,
+            "invalid dump bootstrap start time",
+        )?,
+        state,
+        pages_scanned: sql_u64(row.pages_scanned, "invalid dump page cursor")?,
+        imported_pages: sql_u64(row.imported_pages, "invalid imported page count")?,
+        imported_canonical_bytes: sql_u64(
+            row.imported_canonical_bytes,
+            "invalid imported canonical byte count",
+        )?,
+        attempt_count: u32::try_from(row.attempt_count)
+            .map_err(|_| StoreError::CorruptMetadata("invalid dump import attempt count"))?,
+        retryable: row.retryable,
+        created_at: sql_u64(row.created_at, "invalid dump import creation time")?,
+        claimed_at: sql_u64(row.claimed_at, "invalid dump import claim time")?,
+        updated_at: sql_u64(row.updated_at, "invalid dump import update time")?,
+        finished_at,
+        latest_error,
+    })
+}
+
+fn dump_import_status_by_id(
+    connection: &Connection,
+    raw_import_id: i64,
+) -> Result<DumpImportStatus, StoreError> {
+    let raw = connection
+        .query_row(
+            &format!("{} WHERE import_id = ?1", dump_import_status_query()),
+            [raw_import_id],
+            dump_import_status_row,
+        )
+        .optional()?;
+    raw.map(stored_dump_import_status)
+        .transpose()?
+        .ok_or_else(|| {
+            StoreError::DumpImportNotRunning(u64::try_from(raw_import_id).unwrap_or_default())
+        })
+}
+
+fn ensure_dump_progress_can_advance(
+    connection: &Connection,
+    import_id: u64,
+    raw_import_id: i64,
+    pages_scanned: u64,
+) -> Result<(i64, i64, i64, i64), StoreError> {
+    let current: Option<(i64, i64, i64, i64, i64)> = connection
+        .query_row(
+            "SELECT wiki_id, collection_id, pages_scanned,
+                    imported_pages, imported_canonical_bytes
+             FROM dump_imports WHERE import_id = ?1 AND state = 'running'",
+            [raw_import_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((wiki_id, collection_id, current_cursor, imported_pages, imported_bytes)) = current
+    else {
+        return Err(StoreError::DumpImportNotRunning(import_id));
+    };
+    let current_cursor = sql_u64(current_cursor, "invalid dump page cursor")?;
+    if pages_scanned < current_cursor {
+        return Err(StoreError::DumpImportProgressRegression {
+            import_id,
+            current: current_cursor,
+            requested: pages_scanned,
+        });
+    }
+    Ok((wiki_id, collection_id, imported_pages, imported_bytes))
+}
+
+fn validate_dump_digest(value: &str) -> Result<(), StoreError> {
+    if value.len() != 67
+        || !value.starts_with("b3:")
+        || !value.as_bytes()[3..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err(StoreError::InvalidDumpIdentity(
+            "dump digest must be b3: followed by 64 lowercase hexadecimal digits",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_sync_text(value: &str, label: &'static str) -> Result<(), StoreError> {
     const MAX_SYNC_TEXT_BYTES: usize = 8 * 1024;
     if value.trim().is_empty()
@@ -8657,7 +9394,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
          ) STRICT;",
     )?;
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > 12 {
+    if version > 13 {
         return Err(StoreError::UnsupportedSchemaVersion(version));
     }
     if version == 0 {
@@ -8801,6 +9538,18 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
             [unix_time()?],
         )?;
         transaction.pragma_update(None, "user_version", 12)?;
+        transaction.commit()?;
+    }
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 12 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(MIGRATION_13)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (13, 'dump-imports', ?1)",
+            [unix_time()?],
+        )?;
+        transaction.pragma_update(None, "user_version", 13)?;
         transaction.commit()?;
     }
     Ok(())
@@ -9578,6 +10327,63 @@ pub enum StoreError {
     },
     /// A durable job key was reused for different work.
     ConflictingSyncJobKey(String),
+    /// A dump identity or authenticated length was malformed or empty.
+    InvalidDumpIdentity(&'static str),
+    /// Dump import was requested for a non-bootstrap or source-wide run.
+    DumpImportRequiresCollectionBootstrap(u64),
+    /// The dump race-window timestamp did not match its run checkpoint candidate.
+    DumpImportBootstrapStartMismatch {
+        /// Owning synchronization run.
+        run_id: u64,
+        /// Durable checkpoint candidate captured at run start.
+        expected: u64,
+        /// Timestamp supplied by the import caller.
+        actual: u64,
+    },
+    /// The collection/configuration changed after the owning run began.
+    StaleDumpImportConfiguration {
+        /// Owning synchronization run.
+        run_id: u64,
+    },
+    /// An existing resume record has a different immutable identity binding.
+    DumpImportIdentityMismatch {
+        /// Existing local dump-import identity.
+        import_id: u64,
+    },
+    /// A bootstrap run already contains work from a different coordinator.
+    DumpImportRunHasExistingJobs {
+        /// Incompatible running synchronization run.
+        run_id: u64,
+        /// Durable jobs present before any dump-import identity existed.
+        jobs: u64,
+    },
+    /// A failed dump import was explicitly classified as non-retryable.
+    DumpImportNotRestartable(u64),
+    /// A dump import was absent or no longer accepts progress updates.
+    DumpImportNotRunning(u64),
+    /// A sequential dump cursor attempted to move backwards.
+    DumpImportProgressRegression {
+        /// Local dump-import identity.
+        import_id: u64,
+        /// Current durable cursor.
+        current: u64,
+        /// Regressing cursor requested by the caller.
+        requested: u64,
+    },
+    /// A selected page ledger entry was reused with different revision/byte data.
+    ConflictingDumpImportPage {
+        /// Stable remote page identity.
+        page_id: PageId,
+    },
+    /// An imported page/revision was not durable and active in the bound selection.
+    InvalidDumpImportPage {
+        /// Stable remote page identity.
+        page_id: PageId,
+        /// Current revision read from the dump.
+        revision_id: RevisionId,
+    },
+    /// Durable dump-import counts overflow SQLite's supported range.
+    DumpImportProgressOverflow,
     /// A synchronization run was absent or no longer accepts work.
     SyncRunNotRunning(u64),
     /// Another synchronization operation already owns the same checkpoint scope.
@@ -9762,6 +10568,62 @@ impl fmt::Display for StoreError {
                     formatter,
                     "sync job key {key:?} identifies conflicting work"
                 )
+            }
+            Self::InvalidDumpIdentity(message) => {
+                write!(formatter, "invalid authenticated dump identity: {message}")
+            }
+            Self::DumpImportRequiresCollectionBootstrap(run_id) => write!(
+                formatter,
+                "sync run {run_id} is not a collection-scoped bootstrap dump import"
+            ),
+            Self::DumpImportBootstrapStartMismatch {
+                run_id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "dump import for sync run {run_id} started at {actual}, but its durable bootstrap boundary is {expected}"
+            ),
+            Self::StaleDumpImportConfiguration { run_id } => write!(
+                formatter,
+                "sync run {run_id} no longer matches the durable collection configuration; the dump import cannot resume"
+            ),
+            Self::DumpImportIdentityMismatch { import_id } => write!(
+                formatter,
+                "dump import {import_id} cannot resume with a different dump, selection, configuration, or bootstrap boundary"
+            ),
+            Self::DumpImportRunHasExistingJobs { run_id, jobs } => write!(
+                formatter,
+                "sync run {run_id} already contains {jobs} jobs from incompatible bootstrap work and cannot adopt a dump import"
+            ),
+            Self::DumpImportNotRestartable(import_id) => write!(
+                formatter,
+                "dump import {import_id} failed permanently and cannot be resumed"
+            ),
+            Self::DumpImportNotRunning(import_id) => {
+                write!(formatter, "dump import {import_id} is not running")
+            }
+            Self::DumpImportProgressRegression {
+                import_id,
+                current,
+                requested,
+            } => write!(
+                formatter,
+                "dump import {import_id} cursor cannot move backwards from {current} to {requested}"
+            ),
+            Self::ConflictingDumpImportPage { page_id } => write!(
+                formatter,
+                "dump import page {page_id} conflicts with its previously recorded revision or byte length"
+            ),
+            Self::InvalidDumpImportPage {
+                page_id,
+                revision_id,
+            } => write!(
+                formatter,
+                "dump import page {page_id} revision {revision_id} is not durable and active in the bound collection"
+            ),
+            Self::DumpImportProgressOverflow => {
+                formatter.write_str("dump import progress exceeds the supported SQLite range")
             }
             Self::SyncRunNotRunning(run_id) => {
                 write!(formatter, "sync run {run_id} is not running")
@@ -10080,7 +10942,7 @@ mod tests {
         let before = filesystem_snapshot(directory.path());
 
         let mut library = Library::open_read_only(directory.path()).expect("read-only library");
-        assert_eq!(library.schema_version().expect("schema version"), 12);
+        assert_eq!(library.schema_version().expect("schema version"), 13);
         assert_eq!(library.wikis().expect("wikis")[0].wiki_id, wiki_id);
         assert_eq!(library.logical_object_count().expect("object count"), 1);
         assert_eq!(
@@ -10182,13 +11044,13 @@ mod tests {
     #[test]
     fn migration_is_applied_once_and_keeps_locations_separate() {
         let (directory, library) = test_library();
-        assert_eq!(library.schema_version().expect("schema version"), 12);
-        assert_eq!(migration_count(&library), 12);
+        assert_eq!(library.schema_version().expect("schema version"), 13);
+        assert_eq!(migration_count(&library), 13);
 
         drop(library);
         let reopened = Library::open(directory.path()).expect("reopen library");
-        assert_eq!(reopened.schema_version().expect("schema version"), 12);
-        assert_eq!(migration_count(&reopened), 12);
+        assert_eq!(reopened.schema_version().expect("schema version"), 13);
+        assert_eq!(migration_count(&reopened), 13);
 
         let logical_columns: Vec<String> = reopened
             .connection()
@@ -10361,7 +11223,9 @@ mod tests {
             .expect("open database for version-eight fixture");
         connection
             .execute_batch(
-                "DROP TABLE page_media;
+                "DROP TABLE dump_import_pages;
+                 DROP TABLE dump_imports;
+                 DROP TABLE page_media;
                  DROP TABLE media;
                  DROP TRIGGER collection_configuration_image_policy_insert;
                  DROP TRIGGER collection_configuration_image_policy_update;
@@ -10375,15 +11239,15 @@ mod tests {
                  ALTER TABLE collections DROP COLUMN status;
                  ALTER TABLE collections DROP COLUMN generation;
                  ALTER TABLE collections DROP COLUMN tombstoned_at;
-                 DELETE FROM schema_migrations WHERE version IN (9, 10, 11, 12);
+                 DELETE FROM schema_migrations WHERE version IN (9, 10, 11, 12, 13);
                  PRAGMA user_version = 8;",
             )
             .expect("downgrade fixture metadata");
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade version eight library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 12);
-        assert_eq!(migration_count(&upgraded), 12);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 13);
+        assert_eq!(migration_count(&upgraded), 13);
         assert_eq!(
             upgraded
                 .network_transfer_policy()
@@ -10414,7 +11278,9 @@ mod tests {
             .expect("open database for version-nine fixture");
         connection
             .execute_batch(
-                "DROP TABLE page_media;
+                "DROP TABLE dump_import_pages;
+                 DROP TABLE dump_imports;
+                 DROP TABLE page_media;
                  DROP TABLE media;
                  DROP TRIGGER collection_configuration_image_policy_insert;
                  DROP TRIGGER collection_configuration_image_policy_update;
@@ -10427,15 +11293,15 @@ mod tests {
                  ALTER TABLE collections DROP COLUMN status;
                  ALTER TABLE collections DROP COLUMN generation;
                  ALTER TABLE collections DROP COLUMN tombstoned_at;
-                 DELETE FROM schema_migrations WHERE version IN (10, 11, 12);
+                 DELETE FROM schema_migrations WHERE version IN (10, 11, 12, 13);
                  PRAGMA user_version = 9;",
             )
             .expect("downgrade fixture metadata");
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade version nine fixture");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 12);
-        assert_eq!(migration_count(&upgraded), 12);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 13);
+        assert_eq!(migration_count(&upgraded), 13);
         let collection = upgraded
             .collection(collection_id)
             .expect("collection lookup")
@@ -10483,7 +11349,9 @@ mod tests {
             .expect("open database for version-eleven fixture");
         connection
             .execute_batch(
-                "DROP TABLE page_media;
+                "DROP TABLE dump_import_pages;
+                 DROP TABLE dump_imports;
+                 DROP TABLE page_media;
                  DROP TABLE media;
                  DROP TRIGGER collection_configuration_image_policy_insert;
                  DROP TRIGGER collection_configuration_image_policy_update;
@@ -10491,15 +11359,15 @@ mod tests {
                  ALTER TABLE collection_configuration DROP COLUMN thumbnail_max_images_per_revision;
                  ALTER TABLE collection_configuration DROP COLUMN thumbnail_max_edge_pixels;
                  ALTER TABLE collection_configuration DROP COLUMN image_policy;
-                 DELETE FROM schema_migrations WHERE version = 12;
+                 DELETE FROM schema_migrations WHERE version IN (12, 13);
                  PRAGMA user_version = 11;",
             )
             .expect("downgrade fixture metadata");
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade version eleven library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 12);
-        assert_eq!(migration_count(&upgraded), 12);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 13);
+        assert_eq!(migration_count(&upgraded), 13);
         assert_eq!(
             upgraded
                 .collection_configuration(collection_id)
@@ -10559,8 +11427,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 12);
-        assert_eq!(migration_count(&upgraded), 12);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 13);
+        assert_eq!(migration_count(&upgraded), 13);
         assert_eq!(table_count(&upgraded, "revisions"), 0);
     }
 
@@ -10596,8 +11464,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 12);
-        assert_eq!(migration_count(&upgraded), 12);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 13);
+        assert_eq!(migration_count(&upgraded), 13);
         assert_eq!(table_count(&upgraded, "search_documents"), 0);
         let fts_definition: String = upgraded
             .connection()
@@ -13874,6 +14742,345 @@ mod tests {
             .append_missing_sync_manifests(1)
             .expect("repair manifest");
         assert_eq!(repaired[0].manifest.configuration_hash, original_hash);
+    }
+
+    #[test]
+    fn dump_import_resume_is_exact_monotonic_and_page_idempotent() {
+        let (directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let title = PageTitle::new("Dump page").expect("title");
+        let page_id = PageId::new(10).expect("page ID");
+        let revision_id = RevisionId::new(100).expect("revision ID");
+        let rule = CollectionRule::ExplicitTitles(
+            TitleSelection::new([title.clone()]).expect("selection"),
+        );
+        let collection_id = library
+            .create_collection(
+                wiki_id,
+                "Dump fixture",
+                &rule,
+                HistoryPolicy::CurrentAndFuture,
+                CollectionBudget::unlimited(),
+                CollectionRemovalPolicy::StopTrackingRetainHistory,
+            )
+            .expect("collection");
+        let member = ResolvedCollectionMember {
+            page_id,
+            namespace: 0,
+            title: title.clone(),
+            inclusion_reason: InclusionReason::ExplicitTitle(title.clone()),
+        };
+        library
+            .commit_resolved_membership(collection_id, std::slice::from_ref(&member))
+            .expect("resolve member");
+        let generation = library
+            .collection(collection_id)
+            .expect("collection")
+            .expect("present")
+            .generation;
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 1_000)
+            .expect("start bootstrap")
+            .status
+            .run_id;
+        let digest = format!("b3:{}", "a".repeat(64));
+        let request = DumpImportRequest {
+            run_id,
+            dump_digest: &digest,
+            dump_compressed_bytes: 4_096,
+            collection_generation: generation,
+            bootstrap_started_at: 1_000,
+        };
+        let started = library
+            .claim_or_resume_dump_import(request)
+            .expect("claim import");
+        assert!(!started.resumed);
+        assert_eq!(started.status.state, DumpImportState::Running);
+        assert_eq!(started.status.attempt_count, 1);
+        let import_id = started.status.import_id;
+        assert!(matches!(
+            library.complete_sync_run(run_id, None),
+            Err(StoreError::IncompleteSyncRun {
+                run_id: incomplete,
+                incomplete_jobs: 1,
+            }) if incomplete == run_id
+        ));
+
+        let other_digest = format!("b3:{}", "b".repeat(64));
+        assert!(matches!(
+            library.claim_or_resume_dump_import(DumpImportRequest {
+                dump_digest: &other_digest,
+                ..request
+            }),
+            Err(StoreError::DumpImportIdentityMismatch {
+                import_id: existing
+            }) if existing == import_id
+        ));
+
+        capture_test_page(
+            &mut library,
+            wiki_id,
+            collection_id,
+            page_id.get(),
+            revision_id.get(),
+            "2026-08-23T10:00:00Z",
+            title.as_str(),
+        );
+        let recorded = library
+            .record_dump_imported_page(
+                import_id,
+                3,
+                page_id,
+                revision_id,
+                title.as_str().len() as u64,
+            )
+            .expect("record imported page");
+        assert_eq!(recorded.pages_scanned, 3);
+        assert_eq!(recorded.imported_pages, 1);
+        assert_eq!(
+            recorded.imported_canonical_bytes,
+            title.as_str().len() as u64
+        );
+        let repeated = library
+            .record_dump_imported_page(
+                import_id,
+                4,
+                page_id,
+                revision_id,
+                title.as_str().len() as u64,
+            )
+            .expect("repeat identical page");
+        assert_eq!(repeated.pages_scanned, 4);
+        assert_eq!(repeated.imported_pages, 1);
+        assert!(matches!(
+            library.record_dump_imported_page(
+                import_id,
+                4,
+                page_id,
+                revision_id,
+                title.as_str().len() as u64 + 1,
+            ),
+            Err(StoreError::ConflictingDumpImportPage { page_id: conflict })
+                if conflict == page_id
+        ));
+        assert!(matches!(
+            library.record_dump_import_progress(import_id, 3),
+            Err(StoreError::DumpImportProgressRegression { .. })
+        ));
+        library
+            .fail_dump_import(import_id, "interrupted", "fixture interruption", true)
+            .expect("fail retryably");
+        assert!(matches!(
+            library.record_dump_import_progress(import_id, 5),
+            Err(StoreError::DumpImportNotRunning(id)) if id == import_id
+        ));
+        drop(library);
+
+        let mut reopened = Library::open(directory.path()).expect("reopen");
+        let resumed_run = reopened
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 2_000)
+            .expect("resume bootstrap");
+        assert!(resumed_run.resumed);
+        let resumed = reopened
+            .claim_or_resume_dump_import(request)
+            .expect("resume import");
+        assert!(resumed.resumed);
+        assert_eq!(resumed.status.attempt_count, 2);
+        assert_eq!(resumed.status.pages_scanned, 4);
+        let repeated = reopened
+            .record_dump_imported_page(
+                import_id,
+                5,
+                page_id,
+                revision_id,
+                title.as_str().len() as u64,
+            )
+            .expect("repeat after restart");
+        assert_eq!(repeated.pages_scanned, 5);
+        assert_eq!(repeated.imported_pages, 1);
+        let completed = reopened
+            .complete_dump_import(import_id, 10)
+            .expect("complete import");
+        assert_eq!(completed.state, DumpImportState::Succeeded);
+        assert_eq!(completed.pages_scanned, 10);
+        reopened
+            .complete_sync_run(run_id, None)
+            .expect("complete owning sync run");
+        assert!(matches!(
+            reopened.record_dump_import_progress(import_id, 11),
+            Err(StoreError::DumpImportNotRunning(id)) if id == import_id
+        ));
+        assert_eq!(
+            reopened
+                .dump_import_status(run_id)
+                .expect("status")
+                .expect("present"),
+            completed
+        );
+    }
+
+    #[test]
+    fn dump_import_rejects_stale_selection_configuration_and_permanent_failure() {
+        let (directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let title = PageTitle::new("Selected dump page").expect("title");
+        let page_id = PageId::new(11).expect("page ID");
+        let rule = CollectionRule::ExplicitTitles(
+            TitleSelection::new([title.clone()]).expect("selection"),
+        );
+        let collection_id = library
+            .create_collection(
+                wiki_id,
+                "Stale dump fixture",
+                &rule,
+                HistoryPolicy::CurrentAndFuture,
+                CollectionBudget::unlimited(),
+                CollectionRemovalPolicy::StopTrackingRetainHistory,
+            )
+            .expect("collection");
+        let member = ResolvedCollectionMember {
+            page_id,
+            namespace: 0,
+            title: title.clone(),
+            inclusion_reason: InclusionReason::ExplicitTitle(title),
+        };
+        library
+            .commit_resolved_membership(collection_id, std::slice::from_ref(&member))
+            .expect("resolve member");
+        let generation = library
+            .collection(collection_id)
+            .expect("collection")
+            .expect("present")
+            .generation;
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 2_000)
+            .expect("start bootstrap")
+            .status
+            .run_id;
+        let digest = format!("b3:{}", "c".repeat(64));
+        let request = DumpImportRequest {
+            run_id,
+            dump_digest: &digest,
+            dump_compressed_bytes: 8_192,
+            collection_generation: generation,
+            bootstrap_started_at: 2_000,
+        };
+        let import_id = library
+            .claim_or_resume_dump_import(request)
+            .expect("claim")
+            .status
+            .import_id;
+        library
+            .commit_resolved_membership(collection_id, std::slice::from_ref(&member))
+            .expect("advance generation");
+        assert!(matches!(
+            library.claim_or_resume_dump_import(request),
+            Err(StoreError::StaleCollectionGeneration { .. })
+        ));
+        library
+            .fail_dump_import(import_id, "bad-dump", "fixture permanent failure", false)
+            .expect("fail permanently");
+        drop(library);
+
+        let mut reopened = Library::open(directory.path()).expect("reopen after permanent failure");
+        let run = reopened
+            .sync_run_status(run_id)
+            .expect("run status")
+            .expect("run exists");
+        assert_eq!(run.state, SyncRunState::Cancelled);
+        let import = reopened
+            .dump_import_status(run_id)
+            .expect("import status")
+            .expect("import exists");
+        assert_eq!(import.state, DumpImportState::Failed);
+        assert!(!import.retryable);
+        assert!(matches!(
+            reopened.claim_or_resume_dump_import(request),
+            Err(StoreError::SyncRunNotRunning(id)) if id == run_id
+        ));
+    }
+
+    #[test]
+    fn dump_import_does_not_adopt_bootstrap_jobs_without_an_import_identity() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Incompatible bootstrap")
+            .expect("collection");
+        let generation = library
+            .collection(collection_id)
+            .expect("collection")
+            .expect("present")
+            .generation;
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 4_000)
+            .expect("start bootstrap")
+            .status
+            .run_id;
+        library
+            .enqueue_sync_job(run_id, "api-bootstrap:1", "capture-current", Some("1"))
+            .expect("existing API bootstrap job");
+        let digest = format!("b3:{}", "e".repeat(64));
+        assert!(matches!(
+            library.claim_or_resume_dump_import(DumpImportRequest {
+                run_id,
+                dump_digest: &digest,
+                dump_compressed_bytes: 2_048,
+                collection_generation: generation,
+                bootstrap_started_at: 4_000,
+            }),
+            Err(StoreError::DumpImportRunHasExistingJobs {
+                run_id: incompatible,
+                jobs: 1,
+            }) if incompatible == run_id
+        ));
+        assert!(
+            library
+                .dump_import_status(run_id)
+                .expect("status query")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dump_import_rejects_configuration_change_without_generation_change() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Transfer policy fixture")
+            .expect("collection");
+        let generation = library
+            .collection(collection_id)
+            .expect("collection")
+            .expect("present")
+            .generation;
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 3_000)
+            .expect("start bootstrap")
+            .status
+            .run_id;
+        library
+            .update_network_transfer_policy(NetworkTransferPolicy::new(2, None, false).unwrap())
+            .expect("change transfer policy");
+        let digest = format!("b3:{}", "d".repeat(64));
+        assert!(matches!(
+            library.claim_or_resume_dump_import(DumpImportRequest {
+                run_id,
+                dump_digest: &digest,
+                dump_compressed_bytes: 1_024,
+                collection_generation: generation,
+                bootstrap_started_at: 3_000,
+            }),
+            Err(StoreError::StaleDumpImportConfiguration { run_id: stale }) if stale == run_id
+        ));
     }
 
     #[test]

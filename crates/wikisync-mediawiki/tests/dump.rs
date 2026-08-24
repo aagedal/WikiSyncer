@@ -61,6 +61,11 @@ fn reads_concatenated_bzip2_members_and_yields_filtered_current_pages() {
     assert!(reader.next().is_none());
     assert_eq!(reader.pages_examined(), 4);
     assert_eq!(reader.pages_yielded(), 2);
+    assert_eq!(
+        reader.decompressed_bytes_read(),
+        CURRENT_PAGES.len() as u64,
+        "the completed parser position accounts for the full decompressed XML"
+    );
 }
 
 #[test]
