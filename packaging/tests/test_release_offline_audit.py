@@ -2,9 +2,11 @@ import importlib.util
 import pathlib
 import platform
 import shutil
+import signal
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -92,6 +94,85 @@ int main(void) {
         self.assertIsNone(audit.local_path("data:image/png;base64,AA=="))
         with self.assertRaises(audit.AuditError):
             audit.local_path("https://example.invalid/remote.js")
+
+    def test_gui_capability_reports_linux_display_limit_honestly(self):
+        audit = load_audit_module()
+        self.assertEqual(
+            audit.gui_launch_limitation({}, system="Linux"),
+            "no DISPLAY or WAYLAND_DISPLAY graphical session",
+        )
+        self.assertIsNone(
+            audit.gui_launch_limitation({"DISPLAY": ":99"}, system="Linux")
+        )
+        self.assertIsNone(
+            audit.gui_launch_limitation(
+                {"WAYLAND_DISPLAY": "wayland-0"}, system="Linux"
+            )
+        )
+
+    def test_release_binary_set_requires_the_packaged_gui(self):
+        audit = load_audit_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            binary_directory = pathlib.Path(temporary)
+            for name in ("wikisync", "wikisyncd"):
+                binary = binary_directory / name
+                binary.touch(mode=0o755)
+            with self.assertRaisesRegex(audit.AuditError, "wikisync-gui"):
+                audit.ensure_binaries(binary_directory)
+
+    def test_gui_observation_uses_default_launch_and_is_bounded(self):
+        audit = load_audit_module()
+
+        class RunningProcess:
+            returncode = None
+
+            def __init__(self):
+                self.signal = None
+
+            def poll(self):
+                return self.returncode
+
+            def send_signal(self, sent_signal):
+                self.signal = sent_signal
+                self.returncode = -sent_signal
+
+            def wait(self, timeout):
+                del timeout
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -signal.SIGKILL
+
+        process = RunningProcess()
+        with mock.patch.object(audit.subprocess, "Popen", return_value=process) as popen:
+            audit.observe_gui_launch(
+                pathlib.Path("/candidate/bin/wikisync-gui"),
+                pathlib.Path("/tmp/offline-library"),
+                {"AUDIT_SENTINEL": "yes"},
+                observation_seconds=0.0,
+            )
+
+        self.assertEqual(process.signal, signal.SIGTERM)
+        arguments, keywords = popen.call_args
+        self.assertEqual(arguments[0], ["/candidate/bin/wikisync-gui"])
+        self.assertEqual(keywords["env"]["WIKISYNC_LIBRARY"], "/tmp/offline-library")
+        self.assertEqual(keywords["env"]["AUDIT_SENTINEL"], "yes")
+
+    def test_gui_observation_rejects_an_early_exit(self):
+        audit = load_audit_module()
+        process = mock.Mock()
+        process.poll.return_value = 7
+        process.returncode = 7
+        process.communicate.return_value = ("", "display initialization failed")
+        with mock.patch.object(audit.subprocess, "Popen", return_value=process):
+            with self.assertRaisesRegex(audit.AuditError, "GUI exited during"):
+                audit.observe_gui_launch(
+                    pathlib.Path("/candidate/bin/wikisync-gui"),
+                    pathlib.Path("/tmp/offline-library"),
+                    {},
+                    observation_seconds=1.0,
+                )
+        process.send_signal.assert_not_called()
 
 
 if __name__ == "__main__":

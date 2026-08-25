@@ -31,7 +31,7 @@ use wikisync_store::{
 use wikisync_sync::{CategoryPreviewLimits, preview_category_selection};
 use wikisyncd::{
     ApplicationHandler, Mutation, OperationControl, RequestHandler, SourceAdministration,
-    SourceAdministrationOutcome, WriterAccess, administer_source_direct,
+    SourceAdministrationOutcome, WriterAccess, administer_source_direct, application_user_agent,
 };
 
 use trust::{AnchorComparison, AnchorWriteMode};
@@ -277,11 +277,8 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                 } => {
                     let _validated = ClientConfig::new(
                         &api_endpoint,
-                        format!(
-                            "WikiSyncer/{} ({})",
-                            env!("CARGO_PKG_VERSION"),
-                            env!("CARGO_PKG_REPOSITORY")
-                        ),
+                        application_user_agent()
+                            .map_err(|error| CliError::message(error.to_string()))?,
                     )?;
                     let outcome = administer_source(
                         &library_root,
@@ -571,11 +568,7 @@ fn category_preview(
 ) -> Result<(), CliError> {
     let config = ClientConfig::new(
         api_endpoint,
-        format!(
-            "WikiSyncer/{} ({})",
-            env!("CARGO_PKG_VERSION"),
-            env!("CARGO_PKG_REPOSITORY")
-        ),
+        application_user_agent().map_err(|error| CliError::message(error.to_string()))?,
     )?;
     let client = MediaWikiClient::new(config)?;
     let runtime = tokio::runtime::Builder::new_current_thread()

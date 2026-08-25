@@ -40,9 +40,9 @@ use wikisyncd::{
     CollectionPurgeOutcome, CollectionPurgeRequest, MeteredNetworkState, Mutation,
     OperationControl, RequestHandler, SourceAdministration, SourceAdministrationOutcome,
     WriterAccess, WriterLease, administer_collection_direct, administer_source_direct,
-    bootstrap_collection_from_current_dump_direct_async, collection_purge_mutation,
-    decode_collection_purge_outcome, detect_metered_network, next_occurrence_after,
-    set_collection_schedule_mutation, set_network_transfer_policy_mutation,
+    application_user_agent, bootstrap_collection_from_current_dump_direct_async,
+    collection_purge_mutation, decode_collection_purge_outcome, detect_metered_network,
+    next_occurrence_after, set_collection_schedule_mutation, set_network_transfer_policy_mutation,
 };
 
 use dump::{DumpBootstrapForm, DumpBootstrapPreview, INDEPENDENT_ANCHOR_NOTICE};
@@ -3821,7 +3821,7 @@ fn configured_client(
         .map_err(|_| "Maximum byte-rate policy is too large.".to_owned())?;
     ClientConfig::new(
         api_endpoint,
-        concat!("WikiSyncer/", env!("CARGO_PKG_VERSION")),
+        application_user_agent().map_err(|error| error.to_string())?,
     )
     .and_then(|config| config.with_max_concurrent_requests(max_concurrent_requests))
     .and_then(|config| {
@@ -5009,6 +5009,86 @@ mod tests {
         include_str!("../../../fixtures/mediawiki/reconciliation-content-middle.json");
     const HEAD_CONTENT: &str =
         include_str!("../../../fixtures/mediawiki/reconciliation-content-head.json");
+    const NORWEGIAN_TITLE_RESOLUTION: &str = r#"{
+      "batchcomplete": true,
+      "query": {
+        "normalized": [
+          { "from": "Rust_programmeringssprak", "to": "Rust programmeringssprak" }
+        ],
+        "redirects": [
+          { "from": "Rust programmeringssprak", "to": "Rust (programmeringssprak)" }
+        ],
+        "pages": [
+          {
+            "pageid": 25357340,
+            "ns": 0,
+            "title": "Rust (programmeringssprak)",
+            "revisions": [
+              {
+                "revid": 1300000001,
+                "parentid": 1300000000,
+                "timestamp": "2026-08-19T12:34:56Z",
+                "size": 40,
+                "sha1": "c34wlley9m7sxty0ey9ammqeq3n0cnk"
+              }
+            ]
+          }
+        ]
+      }
+    }"#;
+    const NORWEGIAN_UNCHANGED_HEAD: &str = r#"{
+      "batchcomplete": true,
+      "query": {
+        "pages": [
+          {
+            "pageid": 25357340,
+            "ns": 0,
+            "title": "Rust (programmeringssprak)",
+            "revisions": [
+              {
+                "revid": 1300000001,
+                "parentid": 1300000000,
+                "timestamp": "2026-08-19T12:34:56Z",
+                "size": 40,
+                "sha1": "c34wlley9m7sxty0ey9ammqeq3n0cnk"
+              }
+            ]
+          }
+        ]
+      }
+    }"#;
+    const NORWEGIAN_REVISION_CONTENT: &str = r#"{
+      "batchcomplete": true,
+      "query": {
+        "pages": [
+          {
+            "pageid": 25357340,
+            "ns": 0,
+            "title": "Rust (programmeringssprak)",
+            "revisions": [
+              {
+                "revid": 1300000001,
+                "parentid": 1300000000,
+                "timestamp": "2026-08-19T12:34:56Z",
+                "user": "Norsk testredaktor",
+                "userid": 84,
+                "comment": "Forbedre historieseksjonen",
+                "minor": false,
+                "size": 40,
+                "sha1": "c34wlley9m7sxty0ey9ammqeq3n0cnk",
+                "slots": {
+                  "main": {
+                    "contentmodel": "wikitext",
+                    "contentformat": "text/x-wiki",
+                    "content": "== Rust ==\nEt systemprogrammeringssprak."
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }"#;
 
     fn purge_preview_fixture(collection_id: CollectionId, suffix: &str) -> PurgePreview {
         PurgePreview {
@@ -6172,6 +6252,195 @@ mod tests {
             .expect("daemon thread")
             .expect("daemon shutdown");
         assert_eq!(server.finish().len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn direct_then_daemon_multilanguage_lifecycle_is_durable_and_source_isolated() {
+        let english_server =
+            FixtureServer::start(vec![TITLE_RESOLUTION, UNCHANGED_HEAD, REVISION_CONTENT]);
+        let norwegian_server = FixtureServer::start(vec![
+            NORWEGIAN_TITLE_RESOLUTION,
+            NORWEGIAN_UNCHANGED_HEAD,
+            NORWEGIAN_REVISION_CONTENT,
+        ]);
+        let temporary = tempfile::tempdir().expect("temporary library");
+        load_library_snapshot(temporary.path(), true).expect("create library through GUI flow");
+
+        let english_preview = preview_collection(PreviewCollectionRequest {
+            api_endpoint: english_server.endpoint.clone(),
+            network_policy: NetworkTransferPolicy::default(),
+            rule: CollectionRule::ExplicitTitles(
+                wikisync_core::TitleSelection::new([
+                    PageTitle::new("Rust_programming_language").expect("English title")
+                ])
+                .expect("English selection"),
+            ),
+        })
+        .await
+        .expect("preview English fixture");
+        let direct_snapshot = create_collection_and_sync(&CreateCollectionRequest {
+            library_path: temporary.path().to_path_buf(),
+            name: "English systems language".to_owned(),
+            language_code: "en".to_owned(),
+            api_endpoint: english_server.endpoint.clone(),
+            preview: english_preview,
+            history_policy: HistoryPolicy::CurrentAndFuture,
+            budget: CollectionBudget::unlimited(),
+            removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            image_policy: ImagePolicy::None,
+            schedule: ScheduleSettings {
+                cadence: ScheduleCadence::Manual,
+                jitter_seconds: 0,
+                paused: false,
+            },
+        })
+        .await
+        .expect("direct English create and bootstrap");
+        assert_eq!(direct_snapshot.wikis.len(), 1);
+        assert_eq!(direct_snapshot.collections.len(), 1);
+
+        let norwegian_preview = preview_collection(PreviewCollectionRequest {
+            api_endpoint: norwegian_server.endpoint.clone(),
+            network_policy: NetworkTransferPolicy::default(),
+            rule: CollectionRule::ExplicitTitles(
+                wikisync_core::TitleSelection::new([
+                    PageTitle::new("Rust_programmeringssprak").expect("Norwegian title")
+                ])
+                .expect("Norwegian selection"),
+            ),
+        })
+        .await
+        .expect("preview Norwegian fixture");
+
+        let handler =
+            wikisyncd::ApplicationHandler::new(temporary.path()).expect("application handler");
+        let daemon = wikisyncd::Daemon::bind(temporary.path(), handler).expect("daemon");
+        let shutdown = daemon.shutdown_handle();
+        let daemon_thread = thread::spawn(move || daemon.run());
+        wikisyncd::Client::for_library(temporary.path())
+            .expect("daemon client")
+            .health()
+            .expect("daemon readiness");
+
+        let daemon_snapshot = create_collection_and_sync(&CreateCollectionRequest {
+            library_path: temporary.path().to_path_buf(),
+            name: "Norsk systemsprak".to_owned(),
+            language_code: "nb".to_owned(),
+            api_endpoint: norwegian_server.endpoint.clone(),
+            preview: norwegian_preview,
+            history_policy: HistoryPolicy::CurrentAndFuture,
+            budget: CollectionBudget::unlimited(),
+            removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+            image_policy: ImagePolicy::None,
+            schedule: ScheduleSettings {
+                cadence: ScheduleCadence::Manual,
+                jitter_seconds: 0,
+                paused: false,
+            },
+        })
+        .await
+        .expect("daemon-owned Norwegian create and bootstrap");
+        assert_eq!(daemon_snapshot.wikis.len(), 2);
+        assert_eq!(daemon_snapshot.collections.len(), 2);
+        assert_eq!(daemon_snapshot.unique_page_count, 2);
+
+        shutdown.shutdown();
+        daemon_thread
+            .join()
+            .expect("daemon thread")
+            .expect("daemon shutdown");
+        assert_eq!(english_server.finish().len(), 3);
+        assert_eq!(norwegian_server.finish().len(), 3);
+
+        let durable_snapshot =
+            load_library_snapshot(temporary.path(), false).expect("reopen durable GUI snapshot");
+        let english_wiki = durable_snapshot
+            .wikis
+            .iter()
+            .find(|wiki| wiki.language_code == "en")
+            .expect("durable English source");
+        let norwegian_wiki = durable_snapshot
+            .wikis
+            .iter()
+            .find(|wiki| wiki.language_code == "nb")
+            .expect("durable Norwegian source");
+        assert_ne!(english_wiki.wiki_id, norwegian_wiki.wiki_id);
+        assert_ne!(english_wiki.api_endpoint, norwegian_wiki.api_endpoint);
+        let english_collection = durable_snapshot
+            .collections
+            .iter()
+            .find(|collection| collection.name == "English systems language")
+            .expect("durable English collection");
+        let norwegian_collection = durable_snapshot
+            .collections
+            .iter()
+            .find(|collection| collection.name == "Norsk systemsprak")
+            .expect("durable Norwegian collection");
+        assert_eq!(english_collection.wiki_id, english_wiki.wiki_id);
+        assert_eq!(norwegian_collection.wiki_id, norwegian_wiki.wiki_id);
+        assert_eq!(durable_snapshot.unique_page_count, 2);
+        assert_eq!(durable_snapshot.recent_revisions.len(), 2);
+
+        let library = Library::open_read_only(temporary.path()).expect("inspect durable library");
+        let english_page = library
+            .collection_pages(english_wiki.wiki_id, english_collection.collection_id)
+            .expect("English collection pages")
+            .remove(0);
+        let norwegian_page = library
+            .collection_pages(norwegian_wiki.wiki_id, norwegian_collection.collection_id)
+            .expect("Norwegian collection pages")
+            .remove(0);
+        assert_eq!(
+            english_page.page_id, norwegian_page.page_id,
+            "the fixture intentionally collides upstream page IDs across sources"
+        );
+        assert_ne!(english_page.title, norwegian_page.title);
+        assert!(
+            library
+                .collection_pages(norwegian_wiki.wiki_id, english_collection.collection_id)
+                .is_err(),
+            "a collection cannot be inspected through another source identity"
+        );
+        assert!(
+            library
+                .collection_pages(english_wiki.wiki_id, norwegian_collection.collection_id)
+                .is_err(),
+            "source isolation is symmetric"
+        );
+
+        let english_revision = library
+            .revisions_for_page(english_wiki.wiki_id, english_page.page_id)
+            .expect("English revisions")
+            .remove(0);
+        let norwegian_revision = library
+            .revisions_for_page(norwegian_wiki.wiki_id, norwegian_page.page_id)
+            .expect("Norwegian revisions")
+            .remove(0);
+        assert_eq!(
+            english_revision.revision_id, norwegian_revision.revision_id,
+            "the fixture intentionally collides upstream revision IDs across sources"
+        );
+        assert_eq!(
+            library
+                .read_object(english_revision.content_object_id)
+                .expect("durable English content"),
+            b"== Rust ==\nA systems programming language."
+        );
+        assert_eq!(
+            library
+                .read_object(norwegian_revision.content_object_id)
+                .expect("durable Norwegian content"),
+            b"== Rust ==\nEt systemprogrammeringssprak."
+        );
+        assert_ne!(
+            english_revision.content_object_id,
+            norwegian_revision.content_object_id
+        );
+        assert!(
+            verify_library(&library, VerificationScope::Full)
+                .expect("verify multi-source library")
+                .is_verified_since_capture()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

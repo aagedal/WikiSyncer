@@ -12,6 +12,7 @@ mod network;
 mod purge;
 mod schedule;
 mod source;
+mod user_agent;
 
 pub use application::ApplicationHandler;
 pub use collection::{
@@ -37,6 +38,9 @@ pub use schedule::{
 pub use source::{
     MAX_SOURCE_API_ENDPOINT_BYTES, MAX_SOURCE_LANGUAGE_CODE_BYTES, SourceAdministration,
     SourceAdministrationOutcome, administer_source_direct,
+};
+pub use user_agent::{
+    MAX_OPERATOR_CONTACT_BYTES, OPERATOR_CONTACT_ENV, UserAgentConfigError, application_user_agent,
 };
 
 use std::error::Error;
@@ -960,6 +964,9 @@ impl<H: RequestHandler> Daemon<H> {
         while self.running.load(Ordering::Acquire) {
             match self.listener.accept() {
                 Ok((mut stream, _address)) => {
+                    if authorize_peer(&stream).is_err() {
+                        continue;
+                    }
                     if stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT)).is_err()
                         || stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT)).is_err()
                     {
@@ -1116,6 +1123,46 @@ impl<H: RequestHandler> Daemon<H> {
     }
 }
 
+fn authorize_peer(stream: &UnixStream) -> Result<(), DaemonError> {
+    authorize_peer_uid(peer_effective_uid(stream)?, nix::unistd::geteuid().as_raw())
+}
+
+fn authorize_peer_uid(peer_uid: u32, daemon_uid: u32) -> Result<(), DaemonError> {
+    if peer_uid == daemon_uid {
+        Ok(())
+    } else {
+        Err(DaemonError::UnauthorizedPeer)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn peer_effective_uid(stream: &UnixStream) -> Result<u32, DaemonError> {
+    nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
+        .map(|credentials| credentials.uid())
+        .map_err(nix_error)
+}
+
+#[cfg(target_os = "macos")]
+fn peer_effective_uid(stream: &UnixStream) -> Result<u32, DaemonError> {
+    nix::unistd::getpeereid(stream)
+        .map(|(uid, _gid)| uid.as_raw())
+        .map_err(nix_error)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn peer_effective_uid(_stream: &UnixStream) -> Result<u32, DaemonError> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "daemon IPC peer credentials are unsupported on this platform",
+    )
+    .into())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn nix_error(error: nix::errno::Errno) -> DaemonError {
+    io::Error::from_raw_os_error(error as i32).into()
+}
+
 fn completed_collection_outcome(
     outcome: CollectionAdminProtocolOutcome,
 ) -> Result<CollectionAdministrationOutcome, DaemonError> {
@@ -1184,6 +1231,8 @@ pub enum DaemonError {
     Protocol(&'static str),
     /// Application recovery failed while writer ownership was held.
     Startup(String),
+    /// The operating system reported that the IPC peer has a different effective UID.
+    UnauthorizedPeer,
     /// Compatible remote daemon rejected the request.
     Remote(ResponseError),
 }
@@ -1211,6 +1260,9 @@ impl fmt::Display for DaemonError {
             Self::Protocol(message) => write!(formatter, "invalid daemon protocol: {message}"),
             Self::Startup(message) => {
                 write!(formatter, "daemon startup recovery failed: {message}")
+            }
+            Self::UnauthorizedPeer => {
+                formatter.write_str("daemon IPC peer has a different effective user ID")
             }
             Self::Remote(error) => write!(
                 formatter,
@@ -2780,6 +2832,30 @@ mod tests {
         ));
         drop(daemon);
         WriterLease::acquire(library.path()).expect("lease after daemon drop");
+    }
+
+    #[test]
+    fn daemon_accepts_its_own_effective_uid_and_rejects_a_different_uid() {
+        let daemon_uid = nix::unistd::geteuid().as_raw();
+        assert!(authorize_peer_uid(daemon_uid, daemon_uid).is_ok());
+        let different_uid = daemon_uid.wrapping_add(1);
+        assert!(matches!(
+            authorize_peer_uid(different_uid, daemon_uid),
+            Err(DaemonError::UnauthorizedPeer)
+        ));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn connected_local_peer_credentials_match_the_daemon_effective_uid() {
+        let library = TempLibrary::new();
+        let listener_path = library.path().join("peer-credentials.sock");
+        let listener = UnixListener::bind(&listener_path).expect("bind credential fixture");
+        let client = UnixStream::connect(&listener_path).expect("connect credential fixture");
+        let (server, _) = listener.accept().expect("accept credential fixture");
+
+        authorize_peer(&server).expect("same-UID peer must be authorized");
+        drop(client);
     }
 
     #[test]

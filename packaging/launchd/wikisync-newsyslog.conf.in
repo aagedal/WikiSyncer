@@ -1,0 +1,4 @@
+# Rotate each stopped launchd stream at 10 MiB and retain four gzip archives.
+# The companion passes both paths explicitly and runs newsyslog without root.
+@LOG_DIRECTORY@/wikisyncd.log @UID@:@GID@ 600 4 10240 * BNZ
+@LOG_DIRECTORY@/wikisyncd-error.log @UID@:@GID@ 600 4 10240 * BNZ

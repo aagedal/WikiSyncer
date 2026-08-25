@@ -57,13 +57,28 @@ Inspect the service manager and recent logs:
 ```sh
 # macOS
 launchctl print "gui/$(id -u)/org.wikisync.WikiSyncer"
+launchctl print "gui/$(id -u)/org.wikisync.WikiSyncer-log-maintenance"
 tail -n 200 "$HOME/Library/Logs/WikiSyncer/wikisyncd-error.log"
 
 # Linux
 systemctl --user status wikisyncd.service
 journalctl --user -u wikisyncd.service --since today --no-pager
+journalctl --disk-usage
 systemctl --user list-timers wikisyncd-health.timer
 ```
+
+On macOS, the supported companion checks hourly and rotates at 10 MiB only after
+unloading the primary agent, retaining four gzip archives for each of stdout and
+stderr. Inspect numbered `.gz` files in the same private log directory when older
+evidence is needed. A current file may exceed the threshold by output produced within
+one check interval; repeated companion failures require disk-space monitoring and
+investigation rather than manual rotation of a live descriptor.
+
+On Linux, the unit's rate limit reduces a log storm but journald's effective global
+`SystemMaxUse`, `RuntimeMaxUse`, and `MaxRetentionSec` settings determine stored bytes
+and age. `systemd-analyze cat-config systemd/journald.conf` shows the merged policy.
+Do not claim per-service bounded retention from the WikiSyncer unit: changing journald
+configuration is an administrator action that affects other units too.
 
 Service logs and recorded error messages can include source endpoints, page/job
 identifiers, filesystem paths, and upstream response details. Redact usernames, home

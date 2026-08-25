@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Audit release-mode WikiSyncer offline behavior without live services.
 
-The audit injects a small native library into the release CLI and daemon.  The
+The audit injects a small native library into the release CLI, daemon, and, when a
+native graphical session is available, the packaged Iced GUI executable.  The
 library records and denies C-library IPv4/IPv6 connects, addressed datagrams, and
 hostname resolution.  Unix-domain daemon IPC and inbound requests to the loopback
 reader remain available.  Any recorded attempt fails the audit.
@@ -27,7 +28,8 @@ import urllib.parse
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 INTERPOSER_SOURCE = ROOT / "scripts" / "offline_audit_interpose.c"
-RELEASE_BINARIES = ("wikisync", "wikisyncd")
+RELEASE_BINARIES = ("wikisync", "wikisyncd", "wikisync-gui")
+GUI_OBSERVATION_SECONDS = 3.0
 
 
 class AuditError(RuntimeError):
@@ -200,6 +202,66 @@ def stop_process(process: subprocess.Popen[str], label: str) -> None:
         raise AuditError(f"{label} did not stop after SIGTERM") from error
 
 
+def gui_launch_limitation(
+    environment: dict[str, str], system: str | None = None
+) -> str | None:
+    """Return why a GUI launch cannot provide honest evidence on this runner."""
+    native_system = platform.system() if system is None else system
+    if native_system == "Linux":
+        if environment.get("DISPLAY") or environment.get("WAYLAND_DISPLAY"):
+            return None
+        return "no DISPLAY or WAYLAND_DISPLAY graphical session"
+    if native_system == "Darwin":
+        launchctl = pathlib.Path("/bin/launchctl")
+        if not launchctl.is_file():
+            return "launchctl is unavailable, so an Aqua session cannot be established"
+        try:
+            completed = subprocess.run(
+                [str(launchctl), "managername"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=2.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return f"Aqua session detection failed: {error}"
+        if completed.returncode != 0 or completed.stdout.strip() != "Aqua":
+            return "the process is not running in a macOS Aqua session"
+        return None
+    return f"native GUI auditing is unsupported on {native_system}"
+
+
+def observe_gui_launch(
+    binary: pathlib.Path,
+    library: pathlib.Path,
+    environment: dict[str, str],
+    observation_seconds: float = GUI_OBSERVATION_SECONDS,
+) -> None:
+    """Launch the GUI without actions and require it to stay alive for a bounded window."""
+    gui_environment = environment.copy()
+    gui_environment["WIKISYNC_LIBRARY"] = str(library)
+    process = subprocess.Popen(
+        [str(binary)],
+        env=gui_environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + observation_seconds
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                raise AuditError(
+                    f"GUI exited during its {observation_seconds:g}-second default launch "
+                    f"observation ({process.returncode}):\n{stdout}\n{stderr}"
+                )
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    finally:
+        stop_process(process, "GUI")
+
+
 def ensure_binaries(binary_directory: pathlib.Path) -> dict[str, pathlib.Path]:
     binaries = {name: binary_directory / name for name in RELEASE_BINARIES}
     missing = [str(path) for path in binaries.values() if not path.is_file() or not os.access(path, os.X_OK)]
@@ -208,7 +270,7 @@ def ensure_binaries(binary_directory: pathlib.Path) -> dict[str, pathlib.Path]:
     return binaries
 
 
-def audit(binary_directory: pathlib.Path, build: bool) -> tuple[int, list[str]]:
+def audit(binary_directory: pathlib.Path, build: bool) -> tuple[int, list[str], str]:
     if build:
         run_checked(
             ["cargo", "build", "--workspace", "--bins", "--release", "--locked"],
@@ -280,10 +342,19 @@ def audit(binary_directory: pathlib.Path, build: bool) -> tuple[int, list[str]]:
         finally:
             stop_process(daemon, "daemon")
 
+        gui_limitation = gui_launch_limitation(environment)
+        if gui_limitation is None:
+            observe_gui_launch(binaries["wikisync-gui"], library, environment)
+            gui_evidence = (
+                f"packaged Iced GUI default launch observed for {GUI_OBSERVATION_SECONDS:g} seconds"
+            )
+        else:
+            gui_evidence = f"GUI launch not audited: {gui_limitation}"
+
         attempts = log_path.read_text(encoding="utf-8").splitlines()
         if attempts:
             raise AuditError("release binaries attempted outbound networking:\n" + "\n".join(attempts))
-        return len(visited), attempts
+        return len(visited), attempts, gui_evidence
 
 
 def parse_arguments(arguments: list[str]) -> argparse.Namespace:
@@ -292,7 +363,10 @@ def parse_arguments(arguments: list[str]) -> argparse.Namespace:
         "--binary-dir",
         type=pathlib.Path,
         default=ROOT / "target" / "release",
-        help="directory containing the native release wikisync and wikisyncd binaries",
+        help=(
+            "directory containing the native release wikisync, wikisyncd, and "
+            "wikisync-gui binaries"
+        ),
     )
     parser.add_argument(
         "--skip-build",
@@ -305,14 +379,16 @@ def parse_arguments(arguments: list[str]) -> argparse.Namespace:
 def main(arguments: list[str] | None = None) -> int:
     options = parse_arguments(sys.argv[1:] if arguments is None else arguments)
     try:
-        routes, attempts = audit(options.binary_dir.resolve(), not options.skip_build)
+        routes, attempts, gui_evidence = audit(
+            options.binary_dir.resolve(), not options.skip_build
+        )
     except (AuditError, OSError, subprocess.TimeoutExpired) as error:
         print(f"release offline audit: FAILED: {error}", file=sys.stderr)
         return 1
     print(
         "release offline audit: PASS: "
         f"CLI offline commands, daemon idle/IPC, and {routes} reader routes; "
-        f"{len(attempts)} outbound attempts"
+        f"{gui_evidence}; {len(attempts)} outbound attempts"
     )
     return 0
 

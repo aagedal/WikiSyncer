@@ -448,18 +448,19 @@ Credential-free beta packaging readiness now includes:
   fail-closed Developer ID inspection, strict accepted-notarization receipt checks,
   and signed-input-to-final-archive binding. Routine CI uses only an unmistakable
   unprovisioned identity and all-zero fingerprint; and
-- fifteen packaging tests covering reproducibility, tampering, unsafe paths,
-  symlinked inputs, Ed25519/signature constraints, exact signed sets, path-substitution
-  races, Mach-O structure, signing policy, notarization receipts, archive binding,
+- twenty-four packaging and service-policy tests covering reproducibility, tampering,
+  unsafe paths, symlinked inputs, Ed25519/signature constraints, exact signed sets,
+  path-substitution races, Mach-O structure, signing policy, notarization receipts, archive binding,
   and native network-interposer enforcement; and
 - a native macOS/Linux CI dry run with an immutable checkout action that builds and
   verifies candidates but deliberately has no credentials, signing, publication, or
   release-write authority;
 - a native release-mode offline audit that denies and records IPv4/IPv6 connection,
   addressed datagram, and hostname-resolution attempts while exercising offline CLI
-  commands, idle daemon IPC, and a browser-like crawl of the default reader. It passed
-  on macOS across six reader routes with zero outbound attempts and now runs in the
-  macOS/Linux release-candidate workflow; and
+  commands, idle daemon IPC, a browser-like crawl of the default reader, and a bounded
+  no-action launch of the packaged Iced GUI. The integrated macOS Aqua run covered six
+  reader routes plus three seconds of GUI initialization with zero outbound attempts;
+  headless Linux explicitly reports that GUI evidence is unavailable; and
 - immutable commit-SHA pins for every third-party action in normal and release CI.
 
 Beta robustness and migration evidence now also includes:
@@ -472,15 +473,53 @@ Beta robustness and migration evidence now also includes:
   transfer policy, titles, revisions, and exact bytes before migrating a copy through
   schema 15 and proving the same state after migration and an idempotent reopen.
 
+Additional release-acceptance hardening now also includes:
+
+- a representative fixture-backed multi-language GUI lifecycle that creates and
+  synchronizes an English collection through the direct writer and a Norwegian
+  collection through the daemon writer. Deliberately colliding upstream page and
+  revision IDs remain source-scoped, both canonical payloads survive restart, and a
+  full integrity pass verifies the resulting library;
+- kernel-derived Unix-socket peer credential checks before daemon request reads or
+  dispatch. macOS `getpeereid` and Linux `SO_PEERCRED` effective UIDs must match the
+  daemon owner and lookup failures fail closed. This protects the cross-account
+  boundary; hostile processes already running as the same account remain explicitly
+  inside the trust boundary;
+- maintained named seed corpora for all five fuzz targets, including ordinary empty,
+  short, Unicode, nested, incomplete, and valid compressed samples. Every target
+  compiled and completed a bounded direct smoke run; instrumented and sustained
+  `cargo-fuzz` campaigns remain outstanding because `cargo-fuzz` is unavailable;
+- the missing written renderer evaluation and fixture-backed Milestone 0 API/disk
+  characterization artifacts, which record the conservative offline renderer choice,
+  its fidelity boundary, reproducible commands, and non-SLA measurements; and
+- a per-candidate macOS/Ubuntu release-acceptance matrix that separates actual native
+  results from workflow definitions and credential-free evidence from production
+  signing, notarization, clean-system, trust-distribution, and publication gates. The
+  current local macOS row records the integrated workspace, packaging, migration,
+  multi-language, fuzz-build/smoke, and release offline-audit results; Ubuntu remains
+  pending native CI evidence for this working tree;
+- one bounded application User-Agent policy for every production MediaWiki and dump
+  client. `WIKISYNC_OPERATOR_CONTACT` accepts a non-secret public contact, rejects
+  malformed or oversized values before contact without echoing them, and safely
+  defaults to the project repository URL; service-manager configuration is documented;
+  and
+- bounded service-log retention evidence: macOS candidate archives contain an hourly
+  user-owned launchd companion that cooperatively unloads the daemon before `newsyslog`
+  rotation and retains four compressed generations per stream. Linux units use
+  journald plus per-unit rate limits while documentation accurately leaves global byte
+  and age quotas to administrator policy. Neither platform claims a hard per-service
+  disk quota.
+
 Workspace formatting, warning-denied Clippy, and all workspace tests pass. The
-`cargo-deny` subcommand is unavailable in this environment. All fifteen packaging
-tests, workflow YAML parsing and immutable-action-pin checks, fuzz-target compilation
-and smoke runs, fixture checksums, the native release offline audit, and final
-packaging verification pass.
+`cargo-deny` subcommand is unavailable in this environment. All twenty-four packaging
+and service-policy tests, workflow YAML parsing and immutable-action-pin checks,
+fuzz-target compilation and smoke runs, fixture checksums, the native release offline
+audit, and final packaging verification pass.
 This checkpoint adds no new package version. Purge cleanup now directly uses `rustix`
 for safe descriptor-relative filesystem operations. Dump parsing/acquisition directly
 uses `bzip2`, `quick-xml`, `blake3`, `bytes`, `fs2`, and `libc`; sync test coverage
-adds fixture-only `blake3` and `bzip2`, and source comparison uses `url`. Bounded
+adds fixture-only `blake3` and `bzip2`, source comparison uses `url`, and daemon peer-
+credential lookup uses safe `nix` wrappers over the supported platform APIs. Bounded
 raster validation continues to use `image` with only JPEG/PNG features. Their locked
 sources and licenses match the repository policy, but the unavailable `cargo-deny`
 executable prevented rerunning the automated policy audit. Milestone 4 delivery is
@@ -517,19 +556,24 @@ protection when the anchor is kept with and can be replaced alongside the librar
 
 ## Next checkpoint
 
-The initial robustness checkpoint is complete: maintained fuzz targets, a native
-release-mode offline/outbound audit, and a real older-beta whole-library migration
-fixture are present and validated. The next locally actionable release-acceptance work
-is a representative multi-language GUI/daemon lifecycle, a broader adversarial parser/
-decompression corpus with sustained fuzz runs, and a recorded macOS/Ubuntu acceptance
-matrix. The historical Milestone 0 API/disk benchmark and renderer-evaluation artifacts
-are also absent if the written plan is to be closed literally.
+The initial robustness checkpoint and its next local evidence slice are complete:
+maintained fuzz targets and seed corpora, a native release-mode offline/outbound audit,
+a real older-beta whole-library migration fixture, a representative multi-language
+GUI/daemon lifecycle, a recorded macOS/Ubuntu acceptance matrix, and the historical
+Milestone 0 API/disk and renderer-evaluation artifacts are present. The next locally
+actionable release-acceptance work is sustained instrumented fuzzing with recorded
+resource outcomes, native Ubuntu execution for the current candidate matrix, and a
+clean-system macOS/Ubuntu install/service/upgrade assessment once candidate artifacts
+are available.
 
-Other credential-free security-exit work remains: configurable operator contact in
-the application User-Agent, daemon peer-credential and hostile-same-UID review,
-bounded log-retention evidence, and GUI-inclusive release-binary no-telemetry evidence.
-The current native audit covers the default CLI, idle daemon, daemon IPC, and local
-reader, not GUI launch or explicitly requested online operations.
+The credential-free security-exit slice named by the previous checkpoint is now
+implemented: bounded operator-contact configuration reaches every production source
+client, platform service-log policy and limitations are documented and tested, and the
+native macOS audit includes the packaged GUI default launch. Daemon peer credentials
+enforce the cross-account boundary and the documented hostile-same-UID limitation
+remains by design. The native audit still does not cover GUI actions after launch or
+explicitly requested online operations, and native Ubuntu graphical evidence remains
+pending.
 
 Credentialed Apple signing/notarization, protected production release identities and
 independent trust distribution, native release validation, clean-system assessment,

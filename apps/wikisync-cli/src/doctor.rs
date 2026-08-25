@@ -14,7 +14,7 @@ use wikisync_core::PageTitle;
 use wikisync_integrity::{VerificationCoverage, VerificationScope, verify_library};
 use wikisync_mediawiki::{ClientConfig, MediaWikiClient, RetryPolicy};
 use wikisync_store::{Library, ScheduleCadence, SyncRunState};
-use wikisyncd::{Client, LocalSocketState, inspect_control_plane};
+use wikisyncd::{Client, LocalSocketState, application_user_agent, inspect_control_plane};
 
 const BUNDLE_FORMAT: &str = "wikisync-doctor";
 const BUNDLE_VERSION: u32 = 1;
@@ -119,14 +119,11 @@ fn source_reachability_section(library: &Library, online: bool) -> Value {
     };
 
     for source in sources.iter().take(REACHABILITY_SOURCE_LIMIT) {
-        let config = ClientConfig::new(
-            &source.api_endpoint,
-            format!(
-                "WikiSyncer/{} doctor-reachability",
-                env!("CARGO_PKG_VERSION")
-            ),
-        )
-        .and_then(|config| {
+        let Ok(user_agent) = application_user_agent() else {
+            configuration_rejected += 1;
+            continue;
+        };
+        let config = ClientConfig::new(&source.api_endpoint, user_agent).and_then(|config| {
             config
                 .with_timeouts(REACHABILITY_REQUEST_TIMEOUT, REACHABILITY_CONNECT_TIMEOUT)?
                 .with_max_response_bytes(REACHABILITY_RESPONSE_LIMIT)?

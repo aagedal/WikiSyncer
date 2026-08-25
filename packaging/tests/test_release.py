@@ -137,6 +137,27 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn(f"{prefix}/docs/security/macos-signing-notarization.md", names)
         self.assertEqual({member.mtime for member in names.values()}, {1700000000})
 
+    def test_macos_archive_contains_complete_launchd_log_policy(self) -> None:
+        destination = self.root / "macos-service-assets"
+        self.run_release(
+            "package", "--input-dir", self.binaries, "--output-dir", destination,
+            "--version", "0.1.0-beta.1", "--target-os", "macos", "--target-arch", "aarch64",
+            "--source-date-epoch", "1700000000",
+        )
+        archive_path = destination / "wikisync-0.1.0-beta.1-macos-aarch64.tar.gz"
+        self.run_release("verify-archive", "--archive", archive_path)
+        with tarfile.open(archive_path, "r:gz") as archive:
+            names = {member.name: member for member in archive}
+        prefix = "wikisync-0.1.0-beta.1-macos-aarch64/service"
+        expected = {
+            "org.wikisync.WikiSyncer.plist.in",
+            "org.wikisync.WikiSyncer-log-maintenance.plist.in",
+            "wikisync-newsyslog.conf.in",
+            "wikisync-log-maintenance.sh",
+        }
+        self.assertTrue(all(f"{prefix}/{name}" in names for name in expected))
+        self.assertEqual({names[f"{prefix}/{name}"].mode for name in expected}, {0o644})
+
     def test_checksums_detect_tampering(self) -> None:
         archive = self.package(self.root / "release")
         checksum = archive.parent / "SHA256SUMS"

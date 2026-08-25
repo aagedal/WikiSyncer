@@ -18,6 +18,15 @@ The service integration in `packaging/` is opt-in and per-user. Do not install i
 root or convert it into a system service: the daemon and library should have the same
 unprivileged owner.
 
+Every production MediaWiki and dump request uses
+`WikiSyncer/<version> (<contact>)`. By default, `<contact>` is the public project
+repository URL. Set `WIKISYNC_OPERATOR_CONTACT` to a public email address, URL, or
+similar contact when an operator-specific value is appropriate. The value is sent to
+the configured source: do not put a token, private address, or other secret there. It
+must be 1–256 visible ASCII bytes without surrounding whitespace, parentheses, or
+backslashes; an invalid value fails before a request is made and is not copied into
+the error message.
+
 ## Before installing
 
 1. Build or obtain a trusted `wikisyncd` executable and record its absolute path.
@@ -47,20 +56,57 @@ a separate loopback-only process; these templates do not expose it.
 
 ## macOS launchd user agent
 
-Copy `packaging/launchd/org.wikisync.WikiSyncer.plist.in` to a private working file.
-Replace `@WIKISYNCD@`, `@LIBRARY@`, and `@LOG_DIRECTORY@` with absolute paths. Create
-the log directory with mode `0700`, validate the result, then place it in the user
-agent directory:
+The macOS distribution has a primary agent plus a log-maintenance companion. Copy the
+two plist templates, the `newsyslog` template, and `wikisync-log-maintenance.sh` to a
+private working directory. Replace `@WIKISYNCD@`, `@LIBRARY@`, `@LOG_DIRECTORY@`,
+`@LOG_MAINTENANCE_SCRIPT@`, `@NEWSYSLOG_CONFIG@`, and `@SERVICE_PLIST@` with absolute
+paths; replace `@UID@` and `@GID@` with `id -u` and `id -g`. The log-directory path
+must not contain whitespace because `newsyslog.conf` is whitespace-delimited. Create
+the directories with mode `0700`, validate both plists, then install all four files as
+the same unprivileged user:
 
 ```sh
-mkdir -p "$HOME/Library/Logs/WikiSyncer" "$HOME/Library/LaunchAgents"
-chmod 700 "$HOME/Library/Logs/WikiSyncer" "$HOME/Library/LaunchAgents"
+mkdir -p "$HOME/Library/Logs/WikiSyncer" \
+  "$HOME/Library/Application Support/WikiSyncer/service" \
+  "$HOME/Library/LaunchAgents"
+chmod 700 "$HOME/Library/Logs/WikiSyncer" \
+  "$HOME/Library/Application Support/WikiSyncer" \
+  "$HOME/Library/Application Support/WikiSyncer/service" \
+  "$HOME/Library/LaunchAgents"
 plutil -lint /path/to/rendered/org.wikisync.WikiSyncer.plist
+plutil -lint /path/to/rendered/org.wikisync.WikiSyncer-log-maintenance.plist
 install -m 600 /path/to/rendered/org.wikisync.WikiSyncer.plist \
   "$HOME/Library/LaunchAgents/org.wikisync.WikiSyncer.plist"
+install -m 600 /path/to/rendered/org.wikisync.WikiSyncer-log-maintenance.plist \
+  "$HOME/Library/LaunchAgents/org.wikisync.WikiSyncer-log-maintenance.plist"
+install -m 600 /path/to/rendered/wikisync-newsyslog.conf \
+  "$HOME/Library/Application Support/WikiSyncer/service/newsyslog.conf"
+install -m 700 packaging/launchd/wikisync-log-maintenance.sh \
+  "$HOME/Library/Application Support/WikiSyncer/service/wikisync-log-maintenance.sh"
 launchctl bootstrap "gui/$(id -u)" \
   "$HOME/Library/LaunchAgents/org.wikisync.WikiSyncer.plist"
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/org.wikisync.WikiSyncer-log-maintenance.plist"
 ```
+
+To configure an operator-specific contact for the unattended daemon, add an
+`EnvironmentVariables` dictionary containing `WIKISYNC_OPERATOR_CONTACT` to the
+rendered primary plist before `plutil -lint`. XML-escape the public value. Leave the
+dictionary out to use the repository-URL default; the maintenance companion does not
+need the value because it performs no network requests.
+
+The companion checks hourly. When either stream is at least 10 MiB, it confirms the
+daemon control plane is responsive, unloads the primary agent so launchd closes its
+output descriptors, waits up to ten minutes for cooperative termination, evaluates
+both streams with `/usr/sbin/newsyslog`, retains four gzip archives per stream, and reloads
+the primary agent. It never rotates a live or symlinked stream. If shutdown or rotation
+fails, inspect `launchctl print` for the companion; the helper always attempts to
+reload an agent it successfully unloaded.
+
+Four archives bound retained generations, not instantaneous bytes. Each current file
+can exceed 10 MiB by output written between hourly checks, and compression ratios vary.
+This is a retention policy, not a hard disk quota. Use a filesystem quota or disk-space
+monitor when an absolute storage ceiling is required.
 
 The agent starts at login and restarts after unexpected failure. Inspect it without
 making a network request:
@@ -69,6 +115,7 @@ making a network request:
 /absolute/path/to/wikisyncd --library /absolute/path/to/library status
 /absolute/path/to/wikisyncd --library /absolute/path/to/library health
 launchctl print "gui/$(id -u)/org.wikisync.WikiSyncer"
+launchctl print "gui/$(id -u)/org.wikisync.WikiSyncer-log-maintenance"
 ```
 
 `SIGTERM`, `SIGINT`, and the IPC `shutdown` command all request cooperative shutdown
@@ -78,15 +125,18 @@ and only then unload its definition:
 
 ```sh
 /absolute/path/to/wikisyncd --library /absolute/path/to/library shutdown
+launchctl bootout \
+  "gui/$(id -u)/org.wikisync.WikiSyncer-log-maintenance"
 launchctl bootout "gui/$(id -u)/org.wikisync.WikiSyncer"
-rm "$HOME/Library/LaunchAgents/org.wikisync.WikiSyncer.plist"
+rm "$HOME/Library/LaunchAgents/org.wikisync.WikiSyncer.plist" \
+  "$HOME/Library/LaunchAgents/org.wikisync.WikiSyncer-log-maintenance.plist"
 ```
 
 After shutdown, `status` and `health` fail with a connection-not-found or
 connection-refused error; use `launchctl print` to distinguish an unloaded agent from
 one that is repeatedly failing. Removing the service does not remove the library or
-logs. Review and remove the two log files separately only if they are no longer
-needed.
+logs. The installed maintenance script, configuration, current logs, and numbered
+archives remain until the operator reviews and removes them separately.
 
 ## Linux systemd user service
 
@@ -109,6 +159,16 @@ systemctl --user daemon-reload
 systemctl --user enable --now wikisyncd.service
 ```
 
+For an operator-specific contact, add a private user-unit drop-in before starting the
+service, then verify the merged unit. Omit the drop-in to use the repository-URL
+default:
+
+```ini
+# ~/.config/systemd/user/wikisyncd.service.d/operator-contact.conf
+[Service]
+Environment="WIKISYNC_OPERATOR_CONTACT=mailto:operator@example.invalid"
+```
+
 The persistent service restarts only after an unexpected failure. `systemctl stop`
 invokes the local `shutdown` command, then waits for the main PID to exit and release
 its sockets. The combined stop sequence allows up to 60 seconds for the active
@@ -127,6 +187,35 @@ systemctl --user enable --now wikisyncd-health.timer
 The timer only checks the local Unix socket. It is not a synchronization timer.
 Without login lingering, a user manager normally stops at logout; deciding to enable
 lingering is an administrator policy choice and is not required by WikiSyncer.
+
+The unit explicitly sends stdout/stderr to journald and limits acceptance from the
+daemon to 1,000 messages per 30 seconds (the health probe is limited to 100). This
+limits a noisy unit's message rate but does not bound journal storage. journald storage
+and age limits normally cover the whole system journal and require administrator
+policy. Inspect the effective policy and current use before enabling unattended sync:
+
+```sh
+systemd-analyze cat-config systemd/journald.conf
+journalctl --disk-usage
+```
+
+If the existing administrator policy is not bounded appropriately, an administrator
+can add a drop-in such as the following and restart journald after assessing the
+system-wide effect. These values are examples, not settings installed by WikiSyncer:
+
+```ini
+# /etc/systemd/journald.conf.d/60-journal-retention.conf
+[Journal]
+SystemMaxUse=512M
+RuntimeMaxUse=128M
+MaxRetentionSec=30day
+```
+
+`SystemMaxUse` and `RuntimeMaxUse` retain free-space headroom according to journald's
+own rules; archived journals are removed to approach those limits. The limits include
+other services, so do not describe them as a WikiSyncer-specific quota. Where an
+administrator declines to set a bounded journal policy, external disk monitoring is
+required and this service-log retention checkpoint is not operationally satisfied.
 
 To uninstall, stop and disable the timer and service, remove only their rendered unit
 files, then reload the user manager:

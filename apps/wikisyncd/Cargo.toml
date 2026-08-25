@@ -16,6 +16,7 @@ workspace = true
 
 [dependencies]
 fs2 = "0.4"
+nix = { version = "0.30", default-features = false, features = ["socket", "user"] }
 signal-hook = "0.3"
 tokio = { version = "1.0", features = ["net", "rt", "time"] }
 wikisync-core = { version = "=0.1.0", path = "../../crates/wikisync-core" }

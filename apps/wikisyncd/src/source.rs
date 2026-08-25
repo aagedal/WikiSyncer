@@ -10,7 +10,6 @@ use crate::OperationError;
 pub const MAX_SOURCE_API_ENDPOINT_BYTES: usize = 4 * 1024;
 /// Largest accepted source language code in bytes.
 pub const MAX_SOURCE_LANGUAGE_CODE_BYTES: usize = 64;
-const MAX_SOURCE_USER_AGENT_BYTES: usize = 512;
 
 /// One source operation shared by direct and daemon writer paths.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -107,12 +106,7 @@ fn validate_registration(api_endpoint: &str, language_code: &str) -> Result<(), 
             "source language code must not contain control characters",
         ));
     }
-    let user_agent = source_admin_user_agent();
-    if user_agent.len() > MAX_SOURCE_USER_AGENT_BYTES {
-        return Err(OperationError::failed(
-            "source validation User-Agent exceeds its configured bound",
-        ));
-    }
+    let user_agent = crate::application_user_agent().map_err(operation_failed)?;
     ClientConfig::new(api_endpoint, user_agent)
         .map(|_| ())
         .map_err(operation_failed)
@@ -127,14 +121,6 @@ fn validate_text_bound(field: &str, value: &str, maximum: usize) -> Result<(), O
     } else {
         Ok(())
     }
-}
-
-fn source_admin_user_agent() -> String {
-    format!(
-        "WikiSyncer-daemon/{} ({})",
-        env!("CARGO_PKG_VERSION"),
-        env!("CARGO_PKG_REPOSITORY")
-    )
 }
 
 fn operation_failed(error: impl std::fmt::Display) -> OperationError {

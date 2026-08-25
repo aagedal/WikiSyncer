@@ -311,14 +311,17 @@ impl ApplicationHandler {
             .map(usize::try_from)
             .transpose()
             .map_err(|_| OperationError::failed("network byte-rate policy is too large"))?;
-        let client_config = ClientConfig::new(&wiki.api_endpoint, user_agent())
-            .and_then(|config| config.with_max_concurrent_requests(max_concurrent_requests))
-            .and_then(|config| {
-                config.with_max_downloaded_response_bytes_per_second(
-                    max_downloaded_response_bytes_per_second,
-                )
-            })
-            .map_err(|error| OperationError::failed(error.to_string()))?;
+        let client_config = ClientConfig::new(
+            &wiki.api_endpoint,
+            crate::application_user_agent().map_err(operation_failed)?,
+        )
+        .and_then(|config| config.with_max_concurrent_requests(max_concurrent_requests))
+        .and_then(|config| {
+            config.with_max_downloaded_response_bytes_per_second(
+                max_downloaded_response_bytes_per_second,
+            )
+        })
+        .map_err(|error| OperationError::failed(error.to_string()))?;
         let client = MediaWikiClient::new(client_config)
             .map_err(|error| OperationError::failed(error.to_string()))?;
         let needs_bootstrap = library
@@ -1049,14 +1052,6 @@ fn unix_time() -> Result<u64, OperationError> {
         .map_err(|_| OperationError::failed("system clock is before the Unix epoch"))
 }
 
-fn user_agent() -> String {
-    format!(
-        "WikiSyncer-daemon/{} ({})",
-        env!("CARGO_PKG_VERSION"),
-        env!("CARGO_PKG_REPOSITORY")
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1214,6 +1209,15 @@ mod tests {
         stream
             .write_all(response.body.as_bytes())
             .expect("write fixture body");
+    }
+
+    fn assert_application_user_agent(request: &str) {
+        let expected = crate::application_user_agent().expect("configured fixture User-Agent");
+        assert!(request.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("user-agent") && value.trim() == expected
+            })
+        }));
     }
 
     #[test]
@@ -1561,6 +1565,9 @@ mod tests {
 
         let requests = server.finish();
         assert_eq!(requests.len(), 5);
+        requests
+            .iter()
+            .for_each(|request| assert_application_user_agent(request));
         assert!(requests[0].contains("pageids=25357340"));
         assert!(requests[2].contains("rvdir=older"));
         assert!(requests[4].contains("rvstartid=1300000000"));

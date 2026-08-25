@@ -20,7 +20,7 @@ use wikisync_sync::{
 use wikisyncd::{
     CollectionAdministration, CollectionAdministrationOutcome, CollectionDraft,
     CollectionDraftEstimate, MeteredNetworkState, WriterAccess, administer_collection_direct,
-    detect_metered_network,
+    application_user_agent, detect_metered_network,
 };
 
 const JSON_SCHEMA_VERSION: u32 = 1;
@@ -846,7 +846,7 @@ fn configured_client(endpoint: &str, policy: NetworkTransferPolicy) -> Result<Cl
         .map(usize::try_from)
         .transpose()
         .map_err(|_| Error::message("maximum byte-rate policy is too large"))?;
-    ClientConfig::new(endpoint, concat!("WikiSyncer/", env!("CARGO_PKG_VERSION")))
+    ClientConfig::new(endpoint, application_user_agent().map_err(display_error)?)
         .and_then(|config| config.with_max_concurrent_requests(concurrent))
         .and_then(|config| config.with_max_downloaded_response_bytes_per_second(rate))
         .map_err(display_error)

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.wikisync.WikiSyncer-log-maintenance</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>@LOG_MAINTENANCE_SCRIPT@</string>
+        <string>@WIKISYNCD@</string>
+        <string>@LIBRARY@</string>
+        <string>@NEWSYSLOG_CONFIG@</string>
+        <string>@SERVICE_PLIST@</string>
+        <string>@UID@</string>
+        <string>@LOG_DIRECTORY@/wikisyncd.log</string>
+        <string>@LOG_DIRECTORY@/wikisyncd-error.log</string>
+    </array>
+
+    <!-- newsyslog's 10 MiB threshold is checked at most one hour late. -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>Umask</key>
+    <integer>63</integer>
+</dict>
+</plist>

@@ -1,0 +1,5 @@
+== Nested ==
+
+* outer [[Page|''label'']]
+** inner {{template|[[Target|值]]}}
+*** <ref>nested <span>text</span></ref>

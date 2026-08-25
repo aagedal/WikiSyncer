@@ -147,6 +147,9 @@ Replace every template token before installation:
 - `@WIKISYNCD@`: absolute path to the `wikisyncd` executable;
 - `@LIBRARY@`: absolute path to an existing WikiSyncer library;
 - `@LOG_DIRECTORY@`: existing user-only log directory (launchd only); and
+- `@LOG_MAINTENANCE_SCRIPT@`, `@NEWSYSLOG_CONFIG@`, and `@SERVICE_PLIST@`:
+  absolute installed paths to the corresponding rendered launchd assets;
+- `@UID@` and `@GID@`: the installing user's numeric IDs (launchd only); and
 - `@DOCUMENTATION_DIRECTORY@`: absolute path to `docs/operations` (systemd only).
 
 Do not put shell syntax, environment variables, `~`, XML entities, or systemd `%`
@@ -154,6 +157,18 @@ specifiers in a replacement. Service managers do not perform ordinary shell
 expansion here. Paths containing `@`, a newline, or a double quote are not supported
 by this simple substitution format. The launchd template additionally requires XML
 escaping for `&`, `<`, and `>`; choosing ordinary absolute paths avoids that issue.
+The `newsyslog` configuration is whitespace-delimited, so its log directory must not
+contain whitespace. Install `wikisync-log-maintenance.sh` unchanged and user-owned;
+the companion invokes it explicitly with `/bin/sh`.
+
+The primary launchd agent writes two private files. The companion checks them hourly,
+and when either reaches 10 MiB it unloads the primary agent, waits up to ten minutes
+for cooperative shutdown, evaluates both streams with user-scoped `newsyslog`, retains
+four gzip archives per stream, and loads the primary agent again. Stopping first is
+required: launchd owns the inherited output descriptors, so renaming a live file would
+leave the daemon writing into an archived inode. The 10 MiB threshold is not a hard
+disk quota; one interval's output can overshoot it. Operators needing a hard ceiling
+must also monitor or quota the containing filesystem.
 
 `wikisyncd.service.in` is the persistent Linux service. The health service/timer is
 optional and only runs the local `health` command every 15 minutes. It is not a sync
@@ -161,6 +176,10 @@ schedule, does not contact MediaWiki, and does not restart an intentionally disa
 daemon. Explicit GUI/CLI requests can forward synchronization, verification, and
 compaction through the daemon. Synchronization schedules are durable library
 configuration edited in the GUI; they are not service-manager timers.
+The Linux units write to journald and apply per-unit message-rate limits. Journal
+storage and age limits are administrator-owned, generally global settings; the user
+unit does not claim to set or verify them. Review the documented journald policy before
+leaving an unattended service enabled.
 
 See [service-management.md](../docs/operations/service-management.md) for a cautious,
 manual installation procedure. Packaging automation should perform the same token

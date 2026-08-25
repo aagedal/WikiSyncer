@@ -579,12 +579,10 @@ def repository_files(repo_root: Path, target_os: str) -> list[tuple[str, bytes, 
     for path in sorted(operations.glob("*.md")):
         sources.append((f"docs/operations/{path.name}", path))
     if target_os == "macos":
-        sources.append(
-            (
-                "service/org.wikisync.WikiSyncer.plist.in",
-                repo_root / "packaging" / "launchd" / "org.wikisync.WikiSyncer.plist.in",
-            )
-        )
+        launchd = repo_root / "packaging" / "launchd"
+        for path in sorted(launchd.iterdir()):
+            if path.suffix in {".in", ".sh"}:
+                sources.append((f"service/{path.name}", path))
     else:
         systemd = repo_root / "packaging" / "systemd"
         for path in sorted(systemd.glob("*.in")):

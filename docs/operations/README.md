@@ -24,6 +24,9 @@ includes the current schedule editor.
 - [Packaging](../../packaging/README.md): build and verify reproducible candidate
   archives, authenticate their checksum manifest, and understand the remaining
   credentialed platform-release gates.
+- [Release acceptance matrix](release-acceptance-matrix.md): record per-candidate
+  macOS/Ubuntu validation without treating workflow definitions or credential-free
+  dry runs as signed-release evidence.
 
 A library may retain public editor names or IP addresses and material later deleted
 or suppressed upstream. Backups and diagnostic output must be protected and reviewed

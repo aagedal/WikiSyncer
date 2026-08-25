@@ -13,6 +13,13 @@ Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=60s
 UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wikisyncd
+# Bound a single noisy unit's acceptance rate. Storage and age quotas are journald
+# administrator policy and cannot honestly be scoped by this user unit.
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=1000
 
 # The foundation creates private Unix sockets in the selected library. Address-family
 # access also permits later configured HTTPS mutation handlers without exposing an

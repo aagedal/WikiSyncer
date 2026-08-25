@@ -289,10 +289,13 @@ pub async fn bootstrap_collection_from_current_dump_direct_async(
         .map(usize::try_from)
         .transpose()
         .map_err(|_| OperationError::failed("network byte-rate policy is too large"))?;
-    let client_config = ClientConfig::new(&preview.source_api_endpoint, user_agent())
-        .and_then(|config| config.with_max_concurrent_requests(request_slots))
-        .and_then(|config| config.with_max_downloaded_response_bytes_per_second(byte_rate))
-        .map_err(failed)?;
+    let client_config = ClientConfig::new(
+        &preview.source_api_endpoint,
+        crate::application_user_agent().map_err(failed)?,
+    )
+    .and_then(|config| config.with_max_concurrent_requests(request_slots))
+    .and_then(|config| config.with_max_downloaded_response_bytes_per_second(byte_rate))
+    .map_err(failed)?;
     let client = MediaWikiClient::new(client_config).map_err(failed)?;
     let cache = ensure_dump_cache(library.root())?;
     let verified = client
@@ -798,14 +801,6 @@ fn failed(error: impl std::fmt::Display) -> OperationError {
     OperationError::failed(error.to_string())
 }
 
-fn user_agent() -> String {
-    format!(
-        "WikiSyncer-daemon/{} ({})",
-        env!("CARGO_PKG_VERSION"),
-        env!("CARGO_PKG_REPOSITORY")
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,10 +916,13 @@ mod tests {
             let expected_requests = responses.len();
             let requests = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&requests);
+            let expected_user_agent =
+                crate::application_user_agent().expect("configured fixture User-Agent");
             let thread = thread::spawn(move || {
                 for (status, body, content_type) in responses {
                     let (mut stream, _) = listener.accept().expect("accept fixture request");
-                    read_request(&mut stream);
+                    let request = read_request(&mut stream);
+                    assert_user_agent(&request, &expected_user_agent);
                     observed.fetch_add(1, Ordering::Release);
                     write_response(&mut stream, status, &body, content_type);
                 }
@@ -962,7 +960,7 @@ mod tests {
         }
     }
 
-    fn read_request(stream: &mut TcpStream) {
+    fn read_request(stream: &mut TcpStream) -> String {
         let mut bytes = Vec::new();
         let mut buffer = [0_u8; 1_024];
         while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -971,6 +969,15 @@ mod tests {
             bytes.extend_from_slice(&buffer[..read]);
             assert!(bytes.len() < 64 * 1_024, "fixture request too large");
         }
+        String::from_utf8(bytes).expect("fixture request headers are UTF-8 compatible")
+    }
+
+    fn assert_user_agent(request: &str, expected: &str) {
+        assert!(request.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("user-agent") && value.trim() == expected
+            })
+        }));
     }
 
     fn write_response(stream: &mut TcpStream, status: u16, body: &[u8], content_type: &str) {

@@ -1,0 +1,3 @@
+== Unclosed
+Text with [[target|label and {{template|value
+<ref>unfinished
