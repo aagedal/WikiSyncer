@@ -33,8 +33,24 @@ The archive builder accepts only regular, executable input files named `wikisync
 and permissions; includes the license, operations guide, and target service template;
 and rejects symlink inputs. Run it on the intended target: it does not cross-compile,
 inspect the executable format, produce a macOS application bundle, or imply platform
-code signing. `release.yml` builds and validates unsigned candidates on native macOS
-and Linux runners but intentionally publishes nothing.
+code signing. Before packaging on Linux, bind the candidate record to the requested
+native ELF architecture and validate the rendered user units with the installed
+systemd parser:
+
+```sh
+python3 packaging/scripts/release.py verify-linux-binaries \
+  --input-dir target/release --target-arch x86_64
+python3 packaging/scripts/release.py verify-systemd-units
+```
+
+These checks reject non-ELF, non-executable, malformed, unsupported, and wrong-
+architecture binary sets; `systemd-analyze` must accept all three rendered user-unit
+templates. They do not prove a clean-system install or a working graphical session.
+`release.yml` runs the full format/lint/test, packaging, native-binary, systemd,
+offline-audit, checksum, and layout sequence on pinned native macOS and Ubuntu runners
+but intentionally publishes nothing. Its final job summary binds successful
+credential-free evidence to the exact candidate, platform, toolchain, lockfile, audit
+result, and archive checksum.
 
 Run the packaging tests without a Rust build:
 

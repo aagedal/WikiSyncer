@@ -5,7 +5,10 @@ from __future__ import annotations
 import os
 import plistlib
 from pathlib import Path
+import platform
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -14,6 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHD = REPO_ROOT / "packaging" / "launchd"
 SYSTEMD = REPO_ROOT / "packaging" / "systemd"
 OPERATIONS = REPO_ROOT / "docs" / "operations"
+RELEASE = REPO_ROOT / "packaging" / "scripts" / "release.py"
 
 
 class ServiceLogRetentionTests(unittest.TestCase):
@@ -147,6 +151,20 @@ class ServiceLogRetentionTests(unittest.TestCase):
             self.assertIn(setting, diagnostics)
         self.assertIn("whole system journal", management)
         self.assertIn("administrator", management)
+
+    @unittest.skipUnless(
+        platform.system() == "Linux" and shutil.which("systemd-analyze") is not None,
+        "native systemd-analyze verification is Linux-only",
+    )
+    def test_systemd_user_units_pass_native_verification(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, str(RELEASE), "verify-systemd-units", "--repo-root", str(REPO_ROOT)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("native systemd-analyze verification passed", completed.stdout)
 
 
 if __name__ == "__main__":

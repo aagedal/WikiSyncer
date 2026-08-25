@@ -50,6 +50,10 @@ MACOS_CPU_TYPES = {
     0x01000007: "x86_64",
     0x0100000C: "aarch64",
 }
+LINUX_ELF_MACHINES = {
+    62: "x86_64",  # EM_X86_64
+    183: "aarch64",  # EM_AARCH64
+}
 MAX_MACHO_ARCHITECTURES = 32
 MAX_MACHO_LOAD_COMMANDS = 4_096
 MAX_MACHO_ALIGNMENT_EXPONENT = 30
@@ -146,6 +150,95 @@ def read_exact_at(
     if len(payload) != size:
         raise ReleaseError(f"macOS release binary has a truncated {description}: {path}")
     return payload
+
+
+def linux_elf_architecture(path: Path) -> str:
+    source, metadata = opened_regular_file(path, "Linux release binary", MAX_MEMBER_BYTES)
+    with source:
+        if metadata.st_mode & 0o111 == 0:
+            raise ReleaseError(f"Linux release binary is not executable: {path}")
+        header = source.read(64)
+    if len(header) < 64:
+        raise ReleaseError(f"Linux release binary has a truncated ELF header: {path}")
+    if header[:4] != b"\x7fELF":
+        raise ReleaseError(f"Linux release binary is not ELF: {path}")
+    if header[4] != 2:
+        raise ReleaseError(f"Linux release binary is not 64-bit ELF: {path}")
+    byte_order = {1: "<", 2: ">"}.get(header[5])
+    if byte_order is None or header[6] != 1:
+        raise ReleaseError(f"Linux release binary has an unsupported ELF encoding: {path}")
+    file_type, machine, version = struct.unpack_from(f"{byte_order}HHI", header, 16)
+    if file_type not in {2, 3}:  # ET_EXEC or ET_DYN (PIE)
+        raise ReleaseError(f"Linux release binary is not an executable ELF file: {path}")
+    if version != 1:
+        raise ReleaseError(f"Linux release binary has an unsupported ELF version: {path}")
+    architecture = LINUX_ELF_MACHINES.get(machine)
+    if architecture is None:
+        raise ReleaseError(f"unsupported ELF machine {machine}: {path}")
+    header_size = struct.unpack_from(f"{byte_order}H", header, 52)[0]
+    if header_size < 64 or header_size > metadata.st_size:
+        raise ReleaseError(f"Linux release binary has an invalid ELF header size: {path}")
+    return architecture
+
+
+def verify_linux_binaries(args: argparse.Namespace) -> None:
+    input_dir = absolute_path(args.input_dir)
+    target_arch = checked_token(args.target_arch, "target architecture")
+    if target_arch not in set(LINUX_ELF_MACHINES.values()):
+        raise ReleaseError(f"unsupported Linux target architecture: {target_arch}")
+    for binary in BINARIES:
+        path = input_dir / binary
+        architecture = linux_elf_architecture(path)
+        if architecture != target_arch:
+            raise ReleaseError(
+                f"Linux release binary {binary} is {architecture}, expected {target_arch}"
+            )
+    print(f"Linux release binaries: ELF {target_arch} verified")
+
+
+def verify_systemd_units(args: argparse.Namespace) -> None:
+    systemd_analyze = shutil.which("systemd-analyze")
+    if systemd_analyze is None:
+        raise ReleaseError("systemd-analyze is required for native Linux unit verification")
+    true_executable = shutil.which("true")
+    if true_executable is None:
+        raise ReleaseError("a native true executable is required for systemd unit verification")
+    repo_root = args.repo_root.resolve()
+    source_directory = repo_root / "packaging" / "systemd"
+    documentation_directory = repo_root / "docs" / "operations"
+    with tempfile.TemporaryDirectory(prefix="wikisync-systemd-verify-") as temporary:
+        root = Path(temporary)
+        library = root / "library"
+        library.mkdir()
+        rendered = []
+        for name in (
+            "wikisyncd.service",
+            "wikisyncd-health.service",
+            "wikisyncd-health.timer",
+        ):
+            template = source_directory / f"{name}.in"
+            payload = bounded_file_bytes(template, "systemd unit template").decode("utf-8")
+            payload = (
+                payload.replace("@WIKISYNCD@", true_executable)
+                .replace("@LIBRARY@", str(library))
+                .replace("@DOCUMENTATION_DIRECTORY@", str(documentation_directory))
+            )
+            if re.search(r"@[A-Z][A-Z_]*@", payload):
+                raise ReleaseError(f"unresolved token in rendered systemd unit: {template}")
+            destination = root / name
+            destination.write_text(payload, encoding="utf-8")
+            rendered.append(destination)
+        command = [systemd_analyze, "--user", "verify", *(str(path) for path in rendered)]
+        completed = subprocess.run(command, text=True, capture_output=True, check=False)
+        if completed.stdout:
+            print(completed.stdout, end="")
+        if completed.stderr:
+            print(completed.stderr, file=sys.stderr, end="")
+        if completed.returncode != 0:
+            raise ReleaseError(
+                f"systemd-analyze rejected the rendered user units (exit {completed.returncode})"
+            )
+    print("Linux systemd user units: native systemd-analyze verification passed")
 
 
 def thin_macho_architecture(
@@ -1048,6 +1141,23 @@ def parser() -> argparse.ArgumentParser:
     package.add_argument("--target-arch", required=True)
     package.add_argument("--source-date-epoch", type=int)
     package.set_defaults(function=build_archive)
+
+    linux_binaries = subcommands.add_parser(
+        "verify-linux-binaries",
+        help="verify that the release inputs are executable 64-bit Linux ELF binaries",
+    )
+    linux_binaries.add_argument("--input-dir", type=Path, required=True)
+    linux_binaries.add_argument("--target-arch", required=True)
+    linux_binaries.set_defaults(function=verify_linux_binaries)
+
+    systemd_units = subcommands.add_parser(
+        "verify-systemd-units",
+        help="render and natively validate the Linux systemd user units",
+    )
+    systemd_units.add_argument(
+        "--repo-root", type=Path, default=Path(__file__).resolve().parents[2]
+    )
+    systemd_units.set_defaults(function=verify_systemd_units)
 
     macos_plan = subcommands.add_parser(
         "macos-signing-plan",

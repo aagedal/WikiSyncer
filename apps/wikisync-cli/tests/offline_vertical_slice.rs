@@ -1,5 +1,6 @@
 mod support;
 
+use std::fs;
 use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -137,6 +138,35 @@ async fn captured_library_remains_readable_searchable_and_diffable_offline() {
     assert_eq!(difference["mode"], "reading");
     assert_eq!(difference["has_changes"], true);
 
+    let export = run(
+        &library_root,
+        &[
+            "export",
+            "--format",
+            "markdown",
+            "--collection",
+            &collection_id.get().to_string(),
+        ],
+    );
+    assert!(
+        String::from_utf8_lossy(&export.stdout).contains("Exported 1 article"),
+        "offline export did not report the captured article"
+    );
+    let export_root = library_root.join("exports/current");
+    let index = fs::read_to_string(export_root.join("index.jsonl")).expect("offline export index");
+    let index: Value = serde_json::from_str(index.trim()).expect("offline export index row");
+    assert_eq!(index["wiki"], "en");
+    assert_eq!(index["revision_id"], 1_300_000_001_u64);
+    assert_eq!(index["transformer_version"], "wikitext-markdown-v1");
+    let article_path = index["relative_path"]
+        .as_str()
+        .expect("offline export article path");
+    let exported_article =
+        fs::read_to_string(export_root.join(article_path)).expect("offline Markdown article");
+    assert!(exported_article.contains("systems programming"));
+    assert!(exported_article.contains("## Source and attribution"));
+    assert!(exported_article.contains("content_hash: \"b3:"));
+
     let response = wikisync_web::router(&library_root)
         .oneshot(
             Request::builder()
@@ -156,6 +186,11 @@ async fn captured_library_remains_readable_searchable_and_diffable_offline() {
 }
 
 fn run_json(library_root: &Path, arguments: &[&str]) -> Value {
+    let output = run(library_root, arguments);
+    serde_json::from_slice(&output.stdout).expect("command JSON output")
+}
+
+fn run(library_root: &Path, arguments: &[&str]) -> Output {
     let output = Command::new(env!("CARGO_BIN_EXE_wikisync"))
         .arg("--library")
         .arg(library_root)
@@ -163,7 +198,7 @@ fn run_json(library_root: &Path, arguments: &[&str]) -> Value {
         .output()
         .expect("run wikisync command");
     assert_success(&output, arguments);
-    serde_json::from_slice(&output.stdout).expect("command JSON output")
+    output
 }
 
 fn assert_success(output: &Output, arguments: &[&str]) {

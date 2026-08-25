@@ -448,13 +448,17 @@ Credential-free beta packaging readiness now includes:
   fail-closed Developer ID inspection, strict accepted-notarization receipt checks,
   and signed-input-to-final-archive binding. Routine CI uses only an unmistakable
   unprovisioned identity and all-zero fingerprint; and
-- twenty-four packaging and service-policy tests covering reproducibility, tampering,
+- twenty-seven packaging and service-policy tests covering reproducibility, tampering,
   unsafe paths, symlinked inputs, Ed25519/signature constraints, exact signed sets,
-  path-substitution races, Mach-O structure, signing policy, notarization receipts, archive binding,
-  and native network-interposer enforcement; and
+  path-substitution races, Mach-O and ELF structure, signing policy, notarization
+  receipts, archive binding, native systemd parsing, and network-interposer
+  enforcement; and
 - a native macOS/Linux CI dry run with an immutable checkout action that builds and
   verifies candidates but deliberately has no credentials, signing, publication, or
-  release-write authority;
+  release-write authority. Its native Ubuntu path now validates exact 64-bit ELF
+  architecture and rendered user units with `systemd-analyze`, while the successful
+  job summary binds the credential-free result to the commit, clean tree, host,
+  toolchain, lockfile, timestamps, offline audit, and archive checksum;
 - a native release-mode offline audit that denies and records IPv4/IPv6 connection,
   addressed datagram, and hostname-resolution attempts while exercising offline CLI
   commands, idle daemon IPC, a browser-like crawl of the default reader, and a bounded
@@ -487,8 +491,12 @@ Additional release-acceptance hardening now also includes:
   inside the trust boundary;
 - maintained named seed corpora for all five fuzz targets, including ordinary empty,
   short, Unicode, nested, incomplete, and valid compressed samples. Every target
-  compiled and completed a bounded direct smoke run; instrumented and sustained
-  `cargo-fuzz` campaigns remain outstanding because `cargo-fuzz` is unavailable;
+  compiled and completed a bounded direct smoke run. All five also completed a clean
+  60-second nightly AddressSanitizer/libFuzzer resource-sizing campaign with isolated
+  corpora and no crash, timeout, OOM, or artifact; the exact corpus identity,
+  executions, coverage, peak RSS, toolchain, and symbolizer limitation are recorded
+  in `docs/benchmarks/fuzz-campaign-2026-08-25.md`. Longer sustained campaigns and a
+  direct untrusted Action API JSON fuzz boundary remain outstanding;
 - the missing written renderer evaluation and fixture-backed Milestone 0 API/disk
   characterization artifacts, which record the conservative offline renderer choice,
   its fidelity boundary, reproducible commands, and non-SLA measurements; and
@@ -508,22 +516,27 @@ Additional release-acceptance hardening now also includes:
   rotation and retains four compressed generations per stream. Linux units use
   journald plus per-unit rate limits while documentation accurately leaves global byte
   and age quotas to administrator policy. Neither platform claims a hard per-service
-  disk quota.
+  disk quota; and
+- the offline vertical-slice gate now rebuilds a fresh Markdown export after the
+  fixture source is shut down and unreachable, then verifies revision and transformer
+  identities, rebuilt article content, source/attribution, and content-hash metadata.
 
-Workspace formatting, warning-denied Clippy, and all workspace tests pass. The
-`cargo-deny` subcommand is unavailable in this environment. All twenty-four packaging
-and service-policy tests, workflow YAML parsing and immutable-action-pin checks,
-fuzz-target compilation and smoke runs, fixture checksums, the native release offline
-audit, and final packaging verification pass.
+Workspace formatting, warning-denied Clippy, and all workspace tests pass.
+`cargo-deny 0.20.2` reports advisories, bans, licenses, and sources clean; expected
+duplicate-version and unused-license-allowance diagnostics remain warnings. The
+packaging suite has twenty-seven tests: twenty-six pass on this macOS host and the
+native-Linux systemd test is skipped as designed. Workflow YAML parsing,
+immutable-action-pin checks, fuzz-target compilation, smoke and bounded instrumented
+runs, fixture checksums, the native release offline audit, and final packaging
+verification pass.
 This checkpoint adds no new package version. Purge cleanup now directly uses `rustix`
 for safe descriptor-relative filesystem operations. Dump parsing/acquisition directly
 uses `bzip2`, `quick-xml`, `blake3`, `bytes`, `fs2`, and `libc`; sync test coverage
 adds fixture-only `blake3` and `bzip2`, source comparison uses `url`, and daemon peer-
 credential lookup uses safe `nix` wrappers over the supported platform APIs. Bounded
 raster validation continues to use `image` with only JPEG/PNG features. Their locked
-sources and licenses match the repository policy, but the unavailable `cargo-deny`
-executable prevented rerunning the automated policy audit. Milestone 4 delivery is
-still partial: actual Apple
+sources and licenses match the repository policy, and the automated `cargo-deny`
+audit passes. Milestone 4 delivery is still partial: actual Apple
 signing/notarization, production Linux/macOS identities and independent trust
 distribution, credentialed native validation, clean-system Gatekeeper assessment,
 and signed artifact publication remain.
@@ -560,11 +573,12 @@ The initial robustness checkpoint and its next local evidence slice are complete
 maintained fuzz targets and seed corpora, a native release-mode offline/outbound audit,
 a real older-beta whole-library migration fixture, a representative multi-language
 GUI/daemon lifecycle, a recorded macOS/Ubuntu acceptance matrix, and the historical
-Milestone 0 API/disk and renderer-evaluation artifacts are present. The next locally
-actionable release-acceptance work is sustained instrumented fuzzing with recorded
-resource outcomes, native Ubuntu execution for the current candidate matrix, and a
-clean-system macOS/Ubuntu install/service/upgrade assessment once candidate artifacts
-are available.
+Milestone 0 API/disk and renderer-evaluation artifacts are present. Initial
+instrumented fuzz resource outcomes are now recorded; the next locally actionable
+release-acceptance work is longer sustained campaigns (including a deliberate
+untrusted Action API input boundary), native Ubuntu execution for the current
+candidate matrix, and a clean-system macOS/Ubuntu install/service/upgrade assessment
+once candidate artifacts are available.
 
 The credential-free security-exit slice named by the previous checkpoint is now
 implemented: bounded operator-contact configuration reaches every production source

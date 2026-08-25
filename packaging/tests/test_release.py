@@ -54,6 +54,26 @@ def minimal_macho(cpu_type: int) -> bytes:
     return header + segment
 
 
+def minimal_elf(machine: int, *, file_type: int = 3, header_size: int = 64) -> bytes:
+    identification = b"\x7fELF" + bytes((2, 1, 1, 0, 0)) + b"\0" * 7
+    return identification + struct.pack(
+        "<HHIQQQIHHHHHH",
+        file_type,
+        machine,
+        1,
+        0,
+        64,
+        0,
+        0,
+        header_size,
+        56,
+        0,
+        64,
+        0,
+        0,
+    )
+
+
 def fat_macho(slices: list[tuple[int, bytes]]) -> bytes:
     table_end = 8 + 20 * len(slices)
     offsets = []
@@ -202,6 +222,50 @@ class ReleasePackagingTests(unittest.TestCase):
             *arguments[:-1], "--output-file", self.root / "unsafe-plan.json", succeed=False,
         )
         self.assertIn("all-zero certificate fingerprint", production_with_placeholder.stderr)
+
+    def test_linux_binary_verification_accepts_matching_executable_elf_files(self) -> None:
+        binaries = self.root / "linux-bin"
+        binaries.mkdir()
+        for name in ("wikisync", "wikisyncd", "wikisync-gui"):
+            path = binaries / name
+            path.write_bytes(minimal_elf(62))
+            path.chmod(0o755)
+        result = self.run_release(
+            "verify-linux-binaries",
+            "--input-dir",
+            binaries,
+            "--target-arch",
+            "x86_64",
+        )
+        self.assertIn("ELF x86_64 verified", result.stdout)
+
+    def test_linux_binary_verification_rejects_wrong_or_malformed_elf_files(self) -> None:
+        binaries = self.root / "linux-invalid"
+        binaries.mkdir()
+        for name in ("wikisync", "wikisyncd", "wikisync-gui"):
+            path = binaries / name
+            path.write_bytes(minimal_elf(183))
+            path.chmod(0o755)
+        wrong_architecture = self.run_release(
+            "verify-linux-binaries",
+            "--input-dir",
+            binaries,
+            "--target-arch",
+            "x86_64",
+            succeed=False,
+        )
+        self.assertIn("is aarch64, expected x86_64", wrong_architecture.stderr)
+
+        (binaries / "wikisync").write_bytes(b"not ELF")
+        malformed = self.run_release(
+            "verify-linux-binaries",
+            "--input-dir",
+            binaries,
+            "--target-arch",
+            "aarch64",
+            succeed=False,
+        )
+        self.assertIn("truncated ELF header", malformed.stderr)
 
     def test_macos_signing_plan_rejects_wrong_architecture_and_identity(self) -> None:
         binaries = self.macos_binaries()

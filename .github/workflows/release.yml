@@ -39,12 +39,28 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+      # dtolnay/rust-toolchain stable channel snapshot, resolved 2026-08-25.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: clippy,rustfmt
+      - name: Begin native evidence record
+        run: echo "RELEASE_EVIDENCE_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Lint all targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --locked
       - name: Test packaging and detached-signature tooling
         run: python3 -m unittest discover -s packaging/tests -v
       - name: Build release binaries
         run: cargo build --workspace --bins --release --locked
       - name: Audit default offline behavior for outbound networking
-        run: python3 scripts/release_offline_audit.py --skip-build
+        run: |
+          set -o pipefail
+          mkdir -p target/release-candidate
+          python3 scripts/release_offline_audit.py --skip-build \
+            | tee target/release-candidate/offline-audit.log
       - name: Build and verify deterministic release candidate
         env:
           TARGET_OS: ${{ matrix.target_os }}
@@ -57,6 +73,12 @@ jobs:
             x86_64|amd64) target_arch=x86_64 ;;
             *) echo "unsupported runner architecture: $(uname -m)" >&2; exit 1 ;;
           esac
+          if [ "$TARGET_OS" = linux ]; then
+            python3 packaging/scripts/release.py verify-linux-binaries \
+              --input-dir target/release \
+              --target-arch "$target_arch"
+            python3 packaging/scripts/release.py verify-systemd-units
+          fi
           if [ "$TARGET_OS" = macos ]; then
             python3 packaging/scripts/release.py macos-signing-plan \
               --input-dir target/release \
@@ -83,9 +105,55 @@ jobs:
           archive="target/release-candidate/wikisync-${version}-${TARGET_OS}-${target_arch}.tar.gz"
           python3 packaging/scripts/release.py verify-archive --archive "$archive"
           test ! -e target/release-candidate/SHA256SUMS.sig
+      - name: Record successful native evidence
+        env:
+          TARGET_OS: ${{ matrix.target_os }}
+        run: |
+          set -eu
+          test -z "$(git status --porcelain --untracked-files=all)"
+          evidence=target/release-candidate/native-evidence.md
+          lock_sha256="$(python3 -c 'import hashlib; print(hashlib.sha256(open("Cargo.lock", "rb").read()).hexdigest())')"
+          finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          {
+            echo "## WikiSyncer native release evidence"
+            echo
+            echo "- Result: PASS (all preceding steps in this job completed)"
+            echo "- Candidate commit: \`$GITHUB_SHA\` (clean checkout after validation)"
+            echo "- Target: \`$TARGET_OS/$(uname -m)\` on \`${{ matrix.runner }}\`"
+            echo "- Started: \`$RELEASE_EVIDENCE_STARTED_AT\`"
+            echo "- Finished: \`$finished_at\`"
+            echo "- Cargo.lock SHA-256: \`$lock_sha256\`"
+            echo "- Immutable run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT"
+            echo
+            echo '```text'
+            uname -a
+            if [ "$TARGET_OS" = linux ]; then
+              grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release
+              systemd-analyze --version | head -1
+            else
+              sw_vers
+            fi
+            rustc -Vv
+            cargo -V
+            echo '```'
+            echo
+            echo "Validated commands: formatting, warning-denied Clippy, locked workspace tests, packaging tests, locked release build, default-path offline audit, deterministic packaging, checksum verification, and archive-layout verification."
+            if [ "$TARGET_OS" = linux ]; then
+              echo "Linux-specific gates: native 64-bit ELF architecture validation and rendered systemd user-unit validation."
+            fi
+            echo
+            echo '```text'
+            cat target/release-candidate/offline-audit.log
+            cat target/release-candidate/SHA256SUMS
+            echo '```'
+          } > "$evidence"
+          cat "$evidence"
+          cat "$evidence" >> "$GITHUB_STEP_SUMMARY"
 
 # This workflow deliberately performs no publication, platform signing, notarization,
 # Gatekeeper assessment, or secret-backed checksum signing. The macOS plan contains an
 # all-zero certificate fingerprint and an explicitly unprovisioned identity. Real
 # release gates require explicit identities and protected credentials, and the
-# resulting artifacts need separate native review.
+# resulting artifacts need separate native review. The final job summary is a native,
+# candidate-bound credential-free record; it is not production signing, graphical
+# Linux GUI evidence on a headless runner, or a clean-system install/upgrade result.

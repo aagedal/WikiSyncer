@@ -15,24 +15,27 @@ short, Unicode, nested-structure, and deliberately incomplete inputs where those
 cases apply. Compressed targets include valid format samples as well as truncated or
 invalid representations, so both decoding and rejection paths receive seed coverage.
 
-Install `cargo-fuzz`, then run one target from the repository root, for example:
+Install the nightly Rust toolchain and `cargo-fuzz`, then run one target from the
+repository root. Keep the workspace's default toolchain on stable and select nightly
+only for the instrumented fuzz command:
 
 ```sh
-cargo fuzz run wikitext_markdown -- -max_len=262144
-cargo fuzz run trusted_head_json -- -max_len=4097
-cargo fuzz run dump_parser -- -max_len=262144
-cargo fuzz run loose_object -- -max_len=65536
-cargo fuzz run pack_roundtrip -- -max_len=32768
+rustup toolchain install nightly --profile minimal
+cargo +nightly fuzz run wikitext_markdown -- -max_len=262144
+cargo +nightly fuzz run trusted_head_json -- -max_len=4097
+cargo +nightly fuzz run dump_parser -- -max_len=262144
+cargo +nightly fuzz run loose_object -- -max_len=65536
+cargo +nightly fuzz run pack_roundtrip -- -max_len=32768
 ```
 
 For a short local smoke run against each maintained corpus:
 
 ```sh
-cargo fuzz run wikitext_markdown fuzz/corpus/wikitext_markdown -- -runs=100 -max_len=262144
-cargo fuzz run trusted_head_json fuzz/corpus/trusted_head_json -- -runs=100 -max_len=4097
-cargo fuzz run dump_parser fuzz/corpus/dump_parser -- -runs=100 -max_len=262144
-cargo fuzz run loose_object fuzz/corpus/loose_object -- -runs=100 -max_len=65536
-cargo fuzz run pack_roundtrip fuzz/corpus/pack_roundtrip -- -runs=25 -max_len=32768
+cargo +nightly fuzz run wikitext_markdown fuzz/corpus/wikitext_markdown -- -runs=100 -max_len=262144
+cargo +nightly fuzz run trusted_head_json fuzz/corpus/trusted_head_json -- -runs=100 -max_len=4097
+cargo +nightly fuzz run dump_parser fuzz/corpus/dump_parser -- -runs=100 -max_len=262144
+cargo +nightly fuzz run loose_object fuzz/corpus/loose_object -- -runs=100 -max_len=65536
+cargo +nightly fuzz run pack_roundtrip fuzz/corpus/pack_roundtrip -- -runs=25 -max_len=32768
 ```
 
 The explicit `-max_len` values complement the limits in each harness. The storage
