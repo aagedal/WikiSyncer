@@ -7,9 +7,13 @@ delete SQLite rows, loose objects, packs, indexes, or manifests by hand to simul
 purge. Manual deletion can strand pack-delta dependants and can make manifested
 content disappear without an authenticated explanation.
 
-This document defines the required contract for a future purge implementation. The
-implementation must satisfy this contract and its failure-path tests before a product
-surface may describe purge as available.
+This document defines the required contract for the complete purge product. A partial
+library foundation now implements bounded preview/authorization, the authenticated
+manifest event, exact authorized-absence verification, and restartable cleanup for
+loose objects and whole-target packs. Mixed-pack retained-subset replacement,
+single-writer startup/resume integration, and the CLI/daemon/GUI workflow remain
+unfinished. The complete implementation must satisfy this contract and its
+failure-path tests before a product surface may describe purge as available.
 
 ## Meaning and scope
 
@@ -111,10 +115,10 @@ list. The durable library derives the authoritative closure.
 ## Manifest and cleanup ordering
 
 An authorized absence must never be indistinguishable from tampering or accidental
-loss. A future manifest schema therefore needs a backward-readable, explicitly typed
-purge event. New readers must continue to read every older synchronization manifest.
-An older reader that does not understand the purge event must fail visibly as
-incompatible; it must not skip the event and report the shortened library as clean.
+loss. Manifest schema 3 therefore adds a backward-readable, explicitly typed purge
+event while new readers continue to read older synchronization manifests. An older
+reader that does not understand the purge event must fail visibly as incompatible; it
+must not skip the event and report the shortened library as clean.
 
 The purge event must commit to the selected tombstone, the pre-purge manifest head,
 the collection generation, the complete catalog and preview fingerprints, the

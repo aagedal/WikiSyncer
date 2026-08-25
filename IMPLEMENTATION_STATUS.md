@@ -385,12 +385,37 @@ The destructive-purge safety foundation now also includes:
   revision claims and positive historical page-head claims against retained page,
   revision, ownership, and exact content-object metadata. Missing or changed claims
   now have distinct structured findings, while a legitimately superseded historical
-  head remains valid.
+  head remains valid;
+- manifest schema 3 with backward reads of schema-1/2 synchronization entries and a
+  typed purge event bound to the exact durable journal, pre-purge manifest head,
+  independently computed bounded logical-catalog fingerprint, and ordered object/pack
+  inventory. Cross-process append serialization, no-clobber installation, directory
+  durability, duplicate-event rejection, and tamper/stale-head tests protect the
+  shared manifest chain;
+- schema migration 15 with exact positive authorized-absence evidence, restartable
+  file and accounting journals, strict phase invariants, and fail-closed migration of
+  legacy schema-14 authorizations that lacked an independent catalog commitment;
+- a library-level cleanup executor for verified loose objects and whole-target packs.
+  It commits logical absence before physical retirement, resumes `unlinking` work,
+  checks expected versus observed bytes and pack replacement metrics, pins managed
+  parent and leaf descriptors with no-follow traversal, and uses descriptor-relative
+  unlink plus parent-directory durability so ancestor replacement cannot redirect a
+  deletion; and
+- full verification that distinguishes exact active authenticated absence from
+  unexplained loss, pending or inconsistent cleanup, shared-reference violations, and
+  a later verified reintroduction of identical canonical bytes. Reintroduction
+  atomically restores the deterministic loose location and supersedes, rather than
+  deletes, the historical absence evidence.
 
-This foundation performs no destructive action. No object location, pack, manifest,
-canonical byte, or audit row is removed. The authenticated purge event, authorized-
-absence verification, retained-subset replacement packs, cleanup/resume executor, and
-CLI/daemon/GUI workflow remain unfinished.
+Destructive purge remains partial and is not exposed through the CLI, daemon, or GUI.
+Mixed packs still stop at an explicit retained-subset replacement requirement because
+the replacement builder/activator is not implemented. Product exposure also still
+requires one writer lease across authorization and cleanup, startup recovery before
+conflicting mutations, and the preview/acknowledgement workflow. The library executor
+retains audit rows, object identities, and manifest evidence; it removes only exact
+authorized payload files for the supported loose/whole-pack cases. Portable POSIX
+still leaves a very small final leaf-name race between identity confirmation and
+`unlinkat`, although pinned parent traversal prevents ancestor redirection.
 
 Credential-free beta packaging readiness now includes:
 
@@ -420,7 +445,8 @@ Credential-free beta packaging readiness now includes:
 Workspace formatting, warning-denied Clippy, and all workspace tests pass. The
 `cargo-deny` subcommand is unavailable in this environment. All thirteen packaging
 tests, release-workflow YAML parsing, and the final packaging verification pass.
-This checkpoint adds no new package version. Dump parsing/acquisition now directly
+This checkpoint adds no new package version. Purge cleanup now directly uses `rustix`
+for safe descriptor-relative filesystem operations. Dump parsing/acquisition directly
 uses `bzip2`, `quick-xml`, `blake3`, `bytes`, `fs2`, and `libc`; sync test coverage
 adds fixture-only `blake3` and `bzip2`, and source comparison uses `url`. Bounded
 raster validation continues to use `image` with only JPEG/PNG features. Their locked
@@ -434,8 +460,9 @@ and signed artifact publication remain.
 ## Plan audit notes
 
 The ordered first implementation backlog (items 1–13) is complete. The broader
-milestone delivery lists are not all closed: destructive purge is not implemented,
-credentialed platform packages remain outstanding, while pack tuning, the initial
+milestone delivery lists are not all closed: destructive purge has a validated partial
+library implementation but no mixed-pack or product completion path, and credentialed
+platform packages remain outstanding, while pack tuning, the initial
 stable-contract definition, optional thumbnail media, and the authenticated durable
 dump-bootstrap library and daemon/CLI/GUI product paths are implemented.
 Daemon-owned source administration, the planned
@@ -457,22 +484,18 @@ protection when the anchor is kept with and can be replaced alongside the librar
 
 ## Next checkpoint
 
-The next locally actionable stable-v1 checkpoint is the authenticated purge event.
-Schema 14 now provides the non-destructive, generation/head/catalog-bound preview and
-authorization journal, and full verification now reconciles manifested revision/page
-claims against retained metadata. The next manifest schema must remain able to read
-schema-1/2 synchronization entries while adding a typed purge event that commits the
-exact journal identity and inventory before any payload can become absent.
+The next locally actionable stable-v1 checkpoint is retained-subset replacement for
+mixed packs. It must build a bounded immutable replacement containing exactly the
+retained object closure, fully reconstruct and hash-verify every entry, durably install
+and activate it, record independently checked replacement metrics, and only then make
+the old mixed pack eligible for the existing restartable retirement phases.
 
-After that event is durable, full verification must distinguish exact authenticated
-authorized absence from unexplained loss, stale/mismatched journals, shared-reference
-violations, and pending cleanup without weakening strict byte-verification language.
-Only then can the executor build and fully verify retained-subset replacement packs,
-activate them before retiring mixed old packs, remove authorized loose/whole-pack
-payload through restartable journal phases, and expose the separate preview-first
-CLI/daemon/GUI workflow. The product surfaces must keep exact name/fingerprint and
-payload-retention/external-copy acknowledgements and must not repurpose non-destructive
-`collection remove`.
+After mixed-pack completion, integrate the separate preview-first purge operation with
+the daemon/CLI/GUI writer boundary. One lease must cover authorization through each
+cleanup checkpoint, daemon startup must resume or fail closed on unfinished cleanup
+before conflicting mutations, and the product surfaces must retain the exact
+name/fingerprint plus payload-retention/external-copy acknowledgements. They must not
+repurpose non-destructive `collection remove`.
 
 Credentialed Apple signing/notarization, protected production release identities and
 independent trust distribution, native release validation, clean-system assessment,

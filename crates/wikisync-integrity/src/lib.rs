@@ -4,7 +4,7 @@
 //! identities recorded when they were captured. It does not establish that an
 //! upstream statement is true, unbiased, complete, or still publicly available.
 //! Full verification also checks reference consistency exposed by the current
-//! schema. Schema version 14 has no persistent derived-cache table, so no report from
+//! schema. Schema version 15 has no persistent derived-cache table, so no report from
 //! this version claims derived-cache inventory or cache-body verification.
 
 use std::collections::{HashMap, HashSet};
@@ -19,7 +19,7 @@ use wikisync_content::{PLAIN_TEXT_TRANSFORMER_VERSION, ThumbnailLimits, validate
 use wikisync_core::{MAX_THUMBNAIL_BYTES, MAX_THUMBNAIL_EDGE_PIXELS};
 use wikisync_store::{
     IntegrityMetadataIssue, IntegrityMetadataSubject, Library, ManifestId, ObjectId,
-    ObjectVerificationState, StoreError, StoredManifest, SyncRunState,
+    ObjectVerificationState, PurgeJournalState, StoreError, StoredManifest, SyncRunState,
 };
 
 const TRUSTED_HEAD_SCHEMA_VERSION: u32 = 1;
@@ -167,6 +167,20 @@ pub enum VerificationFindingKind {
     ManifestMediaInventoryChanged,
     /// SQLite media inventory changed while manifest media was being compared.
     ManifestMediaInventoryChangedDuringVerification,
+    /// An authenticated purge event had no corresponding durable cleanup journal.
+    PurgeJournalMissing,
+    /// A durable cleanup journal did not exactly match its authenticated purge event.
+    PurgeJournalMismatch,
+    /// The durable purge-object inventory did not reproduce its authenticated identity.
+    PurgeInventoryMismatch,
+    /// Authorized-absence, physical-work, or completion-accounting state disagreed
+    /// with the authenticated purge event and cleanup phase.
+    PurgeCleanupMismatch,
+    /// A purge inventory object is still required by a retained reference outside
+    /// the authorized collection closure.
+    PurgeSharedReferenceViolation,
+    /// Canonical payload was absent without an exact authenticated purge authorization.
+    UnexplainedObjectLoss,
     /// The external trusted-head signature did not verify with its embedded key.
     TrustedHeadSignatureInvalid,
     /// The authenticated external head did not match the current local manifest head.
@@ -278,6 +292,14 @@ pub struct VerificationReport {
     pub manifest_media_coverage: ManifestMediaCoverage,
     /// Latest media-aware scope snapshots compared with current durable metadata.
     pub manifest_media_snapshots_examined: u64,
+    /// Authenticated purge events compared with their exact durable journals.
+    pub purge_events_examined: u64,
+    /// Valid authenticated purge journals whose cleanup is not yet complete.
+    pub purges_pending_cleanup: u64,
+    /// Absent canonical objects exactly explained by authenticated purges in cleaning
+    /// or succeeded state, positive per-object absence records, and verified cleanup
+    /// accounting. An unreadable retained object is never inferred to be purged.
+    pub authorized_absences_verified: u64,
     /// Revision, page, checkpoint, search-document, FTS, media, and media-placement
     /// records present when a full metadata-reference scan began. Quick verification
     /// leaves this zero.
@@ -301,17 +323,22 @@ pub struct VerificationReport {
 }
 
 impl VerificationReport {
-    /// Returns whether the report verifies every object in the stable observed
-    /// library catalog since capture.
+    /// Returns whether the report verifies every retained object in the stable
+    /// observed library catalog since capture and exactly authenticates every
+    /// authorized absence.
     ///
-    /// This is strictly an integrity statement about captured bytes. It is not a
-    /// statement about the truth or continued upstream availability of their content.
+    /// This is strictly an integrity statement about retained captured bytes and
+    /// authenticated local purge evidence. It is not a statement about source truth,
+    /// upstream availability, external copies, or physical secure erasure.
     #[must_use]
     pub const fn is_verified_since_capture(&self) -> bool {
         matches!(self.coverage, VerificationCoverage::Complete)
             && self.finding_count == 0
             && self.objects_examined == self.objects_at_start
-            && self.objects_verified == self.objects_at_start
+            && self
+                .objects_verified
+                .saturating_add(self.authorized_absences_verified)
+                == self.objects_at_start
             && self.objects_at_start == self.objects_at_end
             && (matches!(self.scope, VerificationScope::Quick)
                 || (self.metadata_records_examined == self.metadata_records_at_start
@@ -513,6 +540,7 @@ fn validated_manifest_head(
     let mut expected_sequence = 1_u64;
     let mut predecessor = None;
     let mut run_ids = HashSet::new();
+    let mut purge_ids = HashSet::new();
     let mut head = None;
     loop {
         let page = library.manifests_after(cursor, 1_000)?;
@@ -530,10 +558,27 @@ fn validated_manifest_head(
                     "manifest predecessor chain is broken",
                 ));
             }
-            if !run_ids.insert(stored.manifest.run_id) {
+            if let Some(sync) = stored.manifest.sync()
+                && !run_ids.insert(sync.run_id)
+            {
                 return Err(TrustedHeadError::InvalidManifestHistory(
                     "sync run occurs more than once in manifest chain",
                 ));
+            }
+            if let Some(purge) = stored.manifest.purge() {
+                let expected_pre_purge_head = predecessor.map(|id| (expected_sequence - 1, id));
+                if purge.pre_purge_head_sequence.zip(purge.pre_purge_head_id)
+                    != expected_pre_purge_head
+                {
+                    return Err(TrustedHeadError::InvalidManifestHistory(
+                        "purge event pre-head does not authenticate its predecessor",
+                    ));
+                }
+                if !purge_ids.insert(purge.purge_id) {
+                    return Err(TrustedHeadError::InvalidManifestHistory(
+                        "purge journal occurs more than once in manifest chain",
+                    ));
+                }
             }
             predecessor = Some(stored.id);
             cursor = Some(stored.manifest.sequence);
@@ -586,6 +631,9 @@ pub fn verify_library_with_options(
         manifest_page_head_claims_examined: 0,
         manifest_media_coverage: ManifestMediaCoverage::NotCovered,
         manifest_media_snapshots_examined: 0,
+        purge_events_examined: 0,
+        purges_pending_cleanup: 0,
+        authorized_absences_verified: 0,
         metadata_records_at_start: 0,
         metadata_records_at_end: 0,
         metadata_records_examined: 0,
@@ -595,6 +643,7 @@ pub fn verify_library_with_options(
         omitted_findings: 0,
     };
     let mut cursor = None;
+    let mut missing_objects = Vec::new();
 
     while report.objects_examined < target {
         let remaining = target - report.objects_examined;
@@ -662,17 +711,28 @@ pub fn verify_library_with_options(
                             ))?;
                     }
                 }
-                Err(error) => push_finding(
-                    &mut report,
-                    options.max_retained_findings,
-                    VerificationFinding {
-                        kind: VerificationFindingKind::ObjectUnreadable,
-                        object_id: Some(object_id),
-                        manifest_sequence: None,
-                        metadata_subject: None,
-                        message: error.to_string(),
-                    },
-                ),
+                Err(StoreError::ObjectNotFound(_)) => missing_objects.push(object_id),
+                Err(error) => {
+                    let is_absent = match &error {
+                        StoreError::Io(error) => error.kind() == std::io::ErrorKind::NotFound,
+                        _ => false,
+                    };
+                    push_finding(
+                        &mut report,
+                        options.max_retained_findings,
+                        VerificationFinding {
+                            kind: if is_absent {
+                                VerificationFindingKind::UnexplainedObjectLoss
+                            } else {
+                                VerificationFindingKind::ObjectUnreadable
+                            },
+                            object_id: Some(object_id),
+                            manifest_sequence: None,
+                            metadata_subject: None,
+                            message: error.to_string(),
+                        },
+                    );
+                }
             }
         }
     }
@@ -700,11 +760,53 @@ pub fn verify_library_with_options(
         report.coverage = VerificationCoverage::Partial;
     }
     if options.scope == VerificationScope::Full {
-        verify_manifest_history(library, options.max_retained_findings, &mut report)?;
+        let authorized_absences =
+            verify_manifest_history(library, options.max_retained_findings, &mut report)?;
+        record_missing_objects(
+            &mut report,
+            options.max_retained_findings,
+            &missing_objects,
+            &authorized_absences,
+        );
         verify_metadata_references(library, options, &mut report)?;
+    } else {
+        record_missing_objects(
+            &mut report,
+            options.max_retained_findings,
+            &missing_objects,
+            &HashSet::new(),
+        );
     }
 
     Ok(report)
+}
+
+fn record_missing_objects(
+    report: &mut VerificationReport,
+    maximum_findings: usize,
+    missing_objects: &[ObjectId],
+    authorized_absences: &HashSet<ObjectId>,
+) {
+    for object_id in missing_objects {
+        if authorized_absences.contains(object_id) {
+            report.authorized_absences_verified =
+                report.authorized_absences_verified.saturating_add(1);
+        } else {
+            push_finding(
+                report,
+                maximum_findings,
+                VerificationFinding {
+                    kind: VerificationFindingKind::UnexplainedObjectLoss,
+                    object_id: Some(*object_id),
+                    manifest_sequence: None,
+                    metadata_subject: None,
+                    message: format!(
+                        "object {object_id} has no verified readable representation and no exact authenticated authorized absence"
+                    ),
+                },
+            );
+        }
+    }
 }
 
 /// Performs full local verification and authenticates the resulting manifest-chain
@@ -1161,7 +1263,8 @@ fn verify_manifest_history(
     library: &Library,
     maximum_findings: usize,
     report: &mut VerificationReport,
-) -> Result<(), VerificationError> {
+) -> Result<HashSet<ObjectId>, VerificationError> {
+    let mut authorized_absences = HashSet::new();
     let claim_change_counter_at_start = library.integrity_metadata_change_counter()?;
     let start_names = match manifest_inventory_names(library) {
         Ok(names) => names,
@@ -1178,7 +1281,7 @@ fn verify_manifest_history(
                     message: error.to_string(),
                 },
             );
-            return Ok(());
+            return Ok(authorized_absences);
         }
     };
     let mut sequences = Vec::new();
@@ -1292,48 +1395,55 @@ fn verify_manifest_history(
                 },
             );
         }
+        verify_purge_event(
+            library,
+            &stored,
+            expected_predecessor.map(|id| (sequence - 1, id)),
+            maximum_findings,
+            report,
+            &mut authorized_absences,
+        );
         previous = Some((sequence, stored.id));
 
-        if !represented_runs.insert(stored.manifest.run_id) {
-            push_finding(
-                report,
-                maximum_findings,
-                VerificationFinding {
-                    kind: VerificationFindingKind::DuplicateManifestRun,
-                    object_id: None,
-                    manifest_sequence: Some(sequence),
-                    metadata_subject: None,
-                    message: format!(
-                        "sync run {} is represented by more than one manifest",
-                        stored.manifest.run_id
-                    ),
-                },
+        if let Some(sync) = stored.manifest.sync() {
+            if !represented_runs.insert(sync.run_id) {
+                push_finding(
+                    report,
+                    maximum_findings,
+                    VerificationFinding {
+                        kind: VerificationFindingKind::DuplicateManifestRun,
+                        object_id: None,
+                        manifest_sequence: Some(sequence),
+                        metadata_subject: None,
+                        message: format!(
+                            "sync run {} is represented by more than one manifest",
+                            sync.run_id
+                        ),
+                    },
+                );
+            }
+            let status = library.sync_run_status(sync.run_id)?;
+            if status.is_none_or(|status| status.state != SyncRunState::Succeeded) {
+                push_finding(
+                    report,
+                    maximum_findings,
+                    VerificationFinding {
+                        kind: VerificationFindingKind::ManifestRunNotSucceeded,
+                        object_id: None,
+                        manifest_sequence: Some(sequence),
+                        metadata_subject: None,
+                        message: format!(
+                            "manifest refers to absent or unsuccessful sync run {}",
+                            sync.run_id
+                        ),
+                    },
+                );
+            }
+            latest_by_scope.insert(
+                (sync.wiki_id.get(), sync.collection_id.map(|id| id.get())),
+                stored,
             );
         }
-        let status = library.sync_run_status(stored.manifest.run_id)?;
-        if status.is_none_or(|status| status.state != SyncRunState::Succeeded) {
-            push_finding(
-                report,
-                maximum_findings,
-                VerificationFinding {
-                    kind: VerificationFindingKind::ManifestRunNotSucceeded,
-                    object_id: None,
-                    manifest_sequence: Some(sequence),
-                    metadata_subject: None,
-                    message: format!(
-                        "manifest refers to absent or unsuccessful sync run {}",
-                        stored.manifest.run_id
-                    ),
-                },
-            );
-        }
-        latest_by_scope.insert(
-            (
-                stored.manifest.wiki_id.get(),
-                stored.manifest.collection_id.map(|id| id.get()),
-            ),
-            stored,
-        );
     }
 
     record_manifest_claim_scan_stability(
@@ -1408,7 +1518,386 @@ fn verify_manifest_history(
             );
         }
     }
-    Ok(())
+    Ok(authorized_absences)
+}
+
+fn verify_purge_event(
+    library: &Library,
+    stored: &StoredManifest,
+    expected_pre_purge_head: Option<(u64, ManifestId)>,
+    maximum_findings: usize,
+    report: &mut VerificationReport,
+    authorized_absences: &mut HashSet<ObjectId>,
+) {
+    let Some(event) = stored.manifest.purge() else {
+        return;
+    };
+    report.purge_events_examined = report.purge_events_examined.saturating_add(1);
+    let event_pre_purge_head = event.pre_purge_head_sequence.zip(event.pre_purge_head_id);
+    if event_pre_purge_head != expected_pre_purge_head {
+        push_finding(
+            report,
+            maximum_findings,
+            VerificationFinding {
+                kind: VerificationFindingKind::PurgeJournalMismatch,
+                object_id: None,
+                manifest_sequence: Some(stored.manifest.sequence),
+                metadata_subject: None,
+                message: format!(
+                    "purge event {} commits pre-purge head {:?}, but its authenticated chain position requires {:?}",
+                    event.purge_id, event_pre_purge_head, expected_pre_purge_head
+                ),
+            },
+        );
+    }
+
+    match library.purge_verification_snapshot(event.purge_id) {
+        Ok(snapshot) => {
+            if snapshot.expected_manifest != *event {
+                push_finding(
+                    report,
+                    maximum_findings,
+                    VerificationFinding {
+                        kind: VerificationFindingKind::PurgeJournalMismatch,
+                        object_id: None,
+                        manifest_sequence: Some(stored.manifest.sequence),
+                        metadata_subject: None,
+                        message: format!(
+                            "purge event {} does not exactly match its durable journal binding",
+                            event.purge_id
+                        ),
+                    },
+                );
+            } else if snapshot.shared_object_count != 0 {
+                push_finding(
+                    report,
+                    maximum_findings,
+                    VerificationFinding {
+                        kind: VerificationFindingKind::PurgeSharedReferenceViolation,
+                        object_id: None,
+                        manifest_sequence: Some(stored.manifest.sequence),
+                        metadata_subject: None,
+                        message: format!(
+                            "purge journal {} contains {} object(s) still required by retained references",
+                            event.purge_id, snapshot.shared_object_count
+                        ),
+                    },
+                );
+            } else {
+                let cleanup_valid = match library.verify_purge_cleanup_state(event.purge_id) {
+                    Ok(progress) if progress.state == snapshot.state => true,
+                    Ok(_) => {
+                        push_cleanup_mismatch(
+                            report,
+                            maximum_findings,
+                            stored.manifest.sequence,
+                            event.purge_id,
+                            "cleanup progress disagrees with its durable journal state",
+                        );
+                        false
+                    }
+                    Err(error) => {
+                        push_cleanup_mismatch(
+                            report,
+                            maximum_findings,
+                            stored.manifest.sequence,
+                            event.purge_id,
+                            &format!("cleanup state failed verification: {error}"),
+                        );
+                        false
+                    }
+                };
+                if cleanup_valid {
+                    match snapshot.state {
+                        PurgeJournalState::Authorized | PurgeJournalState::Repacking => {
+                            report.purges_pending_cleanup =
+                                report.purges_pending_cleanup.saturating_add(1);
+                        }
+                        PurgeJournalState::Cleaning => {
+                            report.purges_pending_cleanup =
+                                report.purges_pending_cleanup.saturating_add(1);
+                            collect_authorized_absences(
+                                library,
+                                stored.manifest.sequence,
+                                event,
+                                snapshot.state,
+                                maximum_findings,
+                                report,
+                                authorized_absences,
+                            );
+                        }
+                        PurgeJournalState::Succeeded => collect_authorized_absences(
+                            library,
+                            stored.manifest.sequence,
+                            event,
+                            snapshot.state,
+                            maximum_findings,
+                            report,
+                            authorized_absences,
+                        ),
+                        PurgeJournalState::Failed => push_finding(
+                            report,
+                            maximum_findings,
+                            VerificationFinding {
+                                kind: VerificationFindingKind::PurgeJournalMismatch,
+                                object_id: None,
+                                manifest_sequence: Some(stored.manifest.sequence),
+                                metadata_subject: None,
+                                message: format!(
+                                    "purge journal {} is durably marked failed",
+                                    event.purge_id
+                                ),
+                            },
+                        ),
+                    }
+                }
+            }
+        }
+        Err(StoreError::PurgeNotFound(_)) => push_finding(
+            report,
+            maximum_findings,
+            VerificationFinding {
+                kind: VerificationFindingKind::PurgeJournalMissing,
+                object_id: None,
+                manifest_sequence: Some(stored.manifest.sequence),
+                metadata_subject: None,
+                message: format!(
+                    "authenticated purge event {} has no durable cleanup journal",
+                    event.purge_id
+                ),
+            },
+        ),
+        Err(StoreError::StalePurgePreview(_)) => push_finding(
+            report,
+            maximum_findings,
+            VerificationFinding {
+                kind: VerificationFindingKind::PurgeJournalMismatch,
+                object_id: None,
+                manifest_sequence: Some(stored.manifest.sequence),
+                metadata_subject: None,
+                message: format!(
+                    "purge journal {} no longer matches its retained collection tombstone",
+                    event.purge_id
+                ),
+            },
+        ),
+        Err(error) => push_finding(
+            report,
+            maximum_findings,
+            VerificationFinding {
+                kind: VerificationFindingKind::PurgeInventoryMismatch,
+                object_id: None,
+                manifest_sequence: Some(stored.manifest.sequence),
+                metadata_subject: None,
+                message: format!(
+                    "purge journal {} could not reproduce its authenticated inventory binding: {error}",
+                    event.purge_id
+                ),
+            },
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_authorized_absences(
+    library: &Library,
+    manifest_sequence: u64,
+    event: &wikisync_store::PurgeManifest,
+    state: PurgeJournalState,
+    maximum_findings: usize,
+    report: &mut VerificationReport,
+    authorized_absences: &mut HashSet<ObjectId>,
+) {
+    match library.verify_purge_cleanup_state(event.purge_id) {
+        Ok(progress)
+            if progress.state == state
+                && progress.manifest_installed
+                && (state != PurgeJournalState::Succeeded
+                    || (progress.pending_pack_count == 0
+                        && progress.replacement_ready_pack_count == 0
+                        && progress.pending_file_count == 0
+                        && progress.unlinking_file_count == 0)) => {}
+        Ok(_) => {
+            push_cleanup_mismatch(
+                report,
+                maximum_findings,
+                manifest_sequence,
+                event.purge_id,
+                "cleanup progress is incompatible with its authenticated journal phase",
+            );
+            return;
+        }
+        Err(error) => {
+            push_cleanup_mismatch(
+                report,
+                maximum_findings,
+                manifest_sequence,
+                event.purge_id,
+                &format!("cleanup progress is unreadable: {error}"),
+            );
+            return;
+        }
+    }
+
+    let mut cursor = None;
+    let mut examined = 0_u64;
+    let mut exact_absences = Vec::new();
+    let mut valid = true;
+    loop {
+        let objects = match library.purge_objects_after(event.purge_id, cursor, 1_000) {
+            Ok(objects) => objects,
+            Err(error) => {
+                push_cleanup_mismatch(
+                    report,
+                    maximum_findings,
+                    manifest_sequence,
+                    event.purge_id,
+                    &format!("authorized-absence inventory is unreadable: {error}"),
+                );
+                return;
+            }
+        };
+        if objects.is_empty() {
+            break;
+        }
+        for selected in &objects {
+            examined = examined.saturating_add(1);
+            cursor = Some(selected.object.id);
+            let absence = match library
+                .purge_authorized_absence_for_purge(event.purge_id, selected.object.id)
+            {
+                Ok(Some(absence)) if absence.object == selected.object => absence,
+                Ok(_) => {
+                    valid = false;
+                    push_cleanup_mismatch(
+                        report,
+                        maximum_findings,
+                        manifest_sequence,
+                        event.purge_id,
+                        &format!(
+                            "journal object {} lacks its exact positive authorized-absence record",
+                            selected.object.id
+                        ),
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    valid = false;
+                    push_cleanup_mismatch(
+                        report,
+                        maximum_findings,
+                        manifest_sequence,
+                        event.purge_id,
+                        &format!(
+                            "authorized-absence record for {} is unreadable: {error}",
+                            selected.object.id
+                        ),
+                    );
+                    continue;
+                }
+            };
+            match (
+                absence.superseded_at,
+                library.read_object(selected.object.id),
+            ) {
+                (None, Err(StoreError::ObjectNotFound(_))) => {
+                    exact_absences.push(selected.object.id);
+                }
+                (None, Ok(_)) => {
+                    valid = false;
+                    push_cleanup_mismatch(
+                        report,
+                        maximum_findings,
+                        manifest_sequence,
+                        event.purge_id,
+                        &format!(
+                            "authorized-absence object {} still has a verified readable location",
+                            selected.object.id
+                        ),
+                    );
+                }
+                (None, Err(error)) => {
+                    valid = false;
+                    push_cleanup_mismatch(
+                        report,
+                        maximum_findings,
+                        manifest_sequence,
+                        event.purge_id,
+                        &format!(
+                            "authorized-absence object {} failed with an unexplained storage error: {error}",
+                            selected.object.id
+                        ),
+                    );
+                }
+                (Some(_), Ok(_)) if state == PurgeJournalState::Succeeded => {}
+                (Some(_), Ok(_)) => {
+                    valid = false;
+                    push_cleanup_mismatch(
+                        report,
+                        maximum_findings,
+                        manifest_sequence,
+                        event.purge_id,
+                        &format!(
+                            "absence for object {} was superseded before purge completion",
+                            selected.object.id
+                        ),
+                    );
+                }
+                (Some(_), Err(error)) => {
+                    valid = false;
+                    push_cleanup_mismatch(
+                        report,
+                        maximum_findings,
+                        manifest_sequence,
+                        event.purge_id,
+                        &format!(
+                            "superseded absence object {} is not normally readable: {error}",
+                            selected.object.id
+                        ),
+                    );
+                }
+            }
+        }
+        if objects.len() < 1_000 {
+            break;
+        }
+    }
+    if examined != event.object_count {
+        valid = false;
+        push_cleanup_mismatch(
+            report,
+            maximum_findings,
+            manifest_sequence,
+            event.purge_id,
+            &format!(
+                "authorized-absence inventory contains {examined} objects, but the event commits {}",
+                event.object_count
+            ),
+        );
+    }
+    if valid {
+        authorized_absences.extend(exact_absences);
+    }
+}
+
+fn push_cleanup_mismatch(
+    report: &mut VerificationReport,
+    maximum_findings: usize,
+    manifest_sequence: u64,
+    purge_id: u64,
+    detail: &str,
+) {
+    push_finding(
+        report,
+        maximum_findings,
+        VerificationFinding {
+            kind: VerificationFindingKind::PurgeCleanupMismatch,
+            object_id: None,
+            manifest_sequence: Some(manifest_sequence),
+            metadata_subject: None,
+            message: format!("purge cleanup {purge_id} is inconsistent: {detail}"),
+        },
+    );
 }
 
 fn record_manifest_claim_scan_stability(
@@ -1443,7 +1932,10 @@ fn verify_manifest_metadata_claims(
     maximum_findings: usize,
     report: &mut VerificationReport,
 ) -> Result<(), VerificationError> {
-    let manifest = &stored.manifest;
+    let entry = &stored.manifest;
+    let Some(manifest) = entry.sync() else {
+        return Ok(());
+    };
     for claim in &manifest.introduced_revisions {
         report.manifest_revision_claims_examined = report
             .manifest_revision_claims_examined
@@ -1459,7 +1951,7 @@ fn verify_manifest_metadata_claims(
                 VerificationFinding {
                     kind: VerificationFindingKind::ManifestRevisionClaimMissing,
                     object_id: Some(claim.content_object_id),
-                    manifest_sequence: Some(manifest.sequence),
+                    manifest_sequence: Some(entry.sequence),
                     metadata_subject: None,
                     message: format!(
                         "manifested revision {} for page {} is absent from retained metadata",
@@ -1476,7 +1968,7 @@ fn verify_manifest_metadata_claims(
                         VerificationFinding {
                             kind: VerificationFindingKind::ManifestRevisionClaimPageMismatch,
                             object_id: Some(claim.content_object_id),
-                            manifest_sequence: Some(manifest.sequence),
+                            manifest_sequence: Some(entry.sequence),
                             metadata_subject: None,
                             message: format!(
                                 "manifested revision {} belonged to page {}, but retained metadata assigns it to page {}",
@@ -1494,7 +1986,7 @@ fn verify_manifest_metadata_claims(
                         VerificationFinding {
                             kind: VerificationFindingKind::ManifestRevisionClaimObjectMismatch,
                             object_id: Some(revision.content_object_id),
-                            manifest_sequence: Some(manifest.sequence),
+                            manifest_sequence: Some(entry.sequence),
                             metadata_subject: None,
                             message: format!(
                                 "manifested revision {} selected object {}, but retained metadata selects {}",
@@ -1514,7 +2006,7 @@ fn verify_manifest_metadata_claims(
                 VerificationFinding {
                     kind: VerificationFindingKind::ManifestRevisionClaimPageMissing,
                     object_id: Some(claim.content_object_id),
-                    manifest_sequence: Some(manifest.sequence),
+                    manifest_sequence: Some(entry.sequence),
                     metadata_subject: None,
                     message: format!(
                         "manifested revision {} refers to retained page {} that is absent",
@@ -1543,7 +2035,7 @@ fn verify_manifest_metadata_claims(
                 VerificationFinding {
                     kind: VerificationFindingKind::ManifestPageHeadClaimPageMissing,
                     object_id: None,
-                    manifest_sequence: Some(manifest.sequence),
+                    manifest_sequence: Some(entry.sequence),
                     metadata_subject: None,
                     message: format!(
                         "manifested positive head for page {} has no retained page metadata",
@@ -1559,7 +2051,7 @@ fn verify_manifest_metadata_claims(
                 VerificationFinding {
                     kind: VerificationFindingKind::ManifestPageHeadClaimRevisionMissing,
                     object_id: None,
-                    manifest_sequence: Some(manifest.sequence),
+                    manifest_sequence: Some(entry.sequence),
                     metadata_subject: None,
                     message: format!(
                         "manifested head revision {} for page {} is absent from retained metadata",
@@ -1574,7 +2066,7 @@ fn verify_manifest_metadata_claims(
                 VerificationFinding {
                     kind: VerificationFindingKind::ManifestPageHeadClaimRevisionPageMismatch,
                     object_id: Some(revision.content_object_id),
-                    manifest_sequence: Some(manifest.sequence),
+                    manifest_sequence: Some(entry.sequence),
                     metadata_subject: None,
                     message: format!(
                         "manifested head revision {} belonged to page {}, but retained metadata assigns it to page {}",
@@ -1599,7 +2091,12 @@ fn verify_manifest_media_snapshots(
     let scope_count = latest_by_scope.len();
     let covered_count = latest_by_scope
         .values()
-        .filter(|stored| stored.manifest.media_snapshot.is_some())
+        .filter(|stored| {
+            stored
+                .manifest
+                .sync()
+                .is_some_and(|sync| sync.media_snapshot.is_some())
+        })
         .count();
     report.manifest_media_coverage = match (covered_count, scope_count) {
         (0, _) => ManifestMediaCoverage::NotCovered,
@@ -1614,13 +2111,16 @@ fn verify_manifest_media_snapshots(
     let mut manifests = latest_by_scope.into_values().collect::<Vec<_>>();
     manifests.sort_by_key(|stored| stored.manifest.sequence);
     for stored in manifests {
-        let Some(expected) = stored.manifest.media_snapshot.as_ref() else {
+        let sync = stored
+            .manifest
+            .sync()
+            .expect("latest scope map contains only synchronization events");
+        let Some(expected) = sync.media_snapshot.as_ref() else {
             continue;
         };
         report.manifest_media_snapshots_examined =
             report.manifest_media_snapshots_examined.saturating_add(1);
-        let current = library
-            .manifest_media_snapshot(stored.manifest.wiki_id, stored.manifest.collection_id)?;
+        let current = library.manifest_media_snapshot(sync.wiki_id, sync.collection_id)?;
         let current_inventory = current
             .inventory
             .iter()
@@ -1953,8 +2453,8 @@ mod tests {
     use tempfile::TempDir;
     use wikisync_core::{CollectionId, MediaId, PageId, PageTitle, RevisionId, ThumbnailPolicy};
     use wikisync_store::{
-        CurrentRevisionCapture, Library, MediaPlacementKind, ObjectKind, RevisionMediaPlacement,
-        SyncRunKind, ThumbnailCapture, ThumbnailMimeType,
+        CurrentRevisionCapture, Library, MediaPlacementKind, ObjectKind, PurgeAuthorization,
+        RevisionMediaPlacement, SyncRunKind, ThumbnailCapture, ThumbnailMimeType,
     };
 
     use super::*;
@@ -2072,6 +2572,97 @@ mod tests {
             library.append_sync_manifest(run_id).expect("manifest run");
         }
         (directory, library)
+    }
+
+    fn authenticated_purge_fixture() -> (TempDir, Library, u64, ObjectId) {
+        authenticated_purge_fixture_with_storage(false)
+    }
+
+    fn authenticated_purge_fixture_with_storage(
+        pack_object: bool,
+    ) -> (TempDir, Library, u64, ObjectId) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut library = Library::open(directory.path()).expect("library");
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Purge verification fixture")
+            .expect("collection");
+        let title = PageTitle::new("Purge verification page").expect("title");
+        let captured = library
+            .capture_current_revision(
+                wiki_id,
+                collection_id,
+                &CurrentRevisionCapture {
+                    page_id: PageId::new(70).expect("page"),
+                    namespace: 0,
+                    title: &title,
+                    revision_id: RevisionId::new(700).expect("revision"),
+                    parent_id: None,
+                    timestamp: "2026-08-24T00:00:00Z",
+                    author: Some("Fixture author"),
+                    author_id: Some(1),
+                    comment: Some("purge verification fixture"),
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: b"exclusive purge verification payload",
+                },
+            )
+            .expect("capture");
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 100)
+            .expect("start run")
+            .status
+            .run_id;
+        library
+            .complete_sync_run(run_id, None)
+            .expect("complete run");
+        library.append_sync_manifest(run_id).expect("sync manifest");
+        library
+            .tombstone_collection(collection_id)
+            .expect("tombstone");
+        if pack_object {
+            library
+                .pack_loose_objects()
+                .expect("pack target")
+                .expect("whole target pack");
+        }
+        let preview = library
+            .preview_collection_purge(collection_id)
+            .expect("preview");
+        let receipt = library
+            .authorize_collection_purge(
+                collection_id,
+                PurgeAuthorization {
+                    collection_name: &preview.collection_name,
+                    preview_fingerprint: &preview.fingerprint,
+                    payload_only_acknowledged: true,
+                    backups_not_erased_acknowledged: true,
+                },
+            )
+            .expect("authorization");
+        library
+            .append_purge_manifest(receipt.purge_id)
+            .expect("purge manifest");
+        (directory, library, receipt.purge_id, captured.id)
+    }
+
+    fn advance_purge_to_state(library: &mut Library, purge_id: u64, expected: PurgeJournalState) {
+        for _ in 0..16 {
+            let state = library
+                .purge_cleanup_progress(purge_id)
+                .expect("cleanup progress")
+                .state;
+            if state == expected {
+                return;
+            }
+            library
+                .resume_purge_cleanup(purge_id)
+                .expect("advance purge cleanup");
+        }
+        panic!("purge {purge_id} did not reach {expected:?}");
     }
 
     fn metadata_fixture() -> (TempDir, Library) {
@@ -2355,6 +2946,379 @@ mod tests {
         assert_eq!(report.manifests_identity_verified, 3);
         assert_eq!(report.finding_count, 0);
         assert!(report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn authenticated_purge_event_and_exact_pending_journal_verify_cleanly() {
+        let (_directory, library, purge_id, _object_id) = authenticated_purge_fixture();
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert_eq!(report.manifests_at_start, 2);
+        assert_eq!(report.purge_events_examined, 1);
+        assert_eq!(report.purges_pending_cleanup, 1);
+        assert_eq!(report.authorized_absences_verified, 0);
+        assert_eq!(report.finding_count, 0, "{:?}", report.findings);
+        assert!(report.is_verified_since_capture());
+        assert_eq!(
+            library
+                .purge_verification_snapshot(purge_id)
+                .expect("snapshot")
+                .state,
+            PurgeJournalState::Authorized
+        );
+    }
+
+    #[test]
+    fn authenticated_purge_event_requires_its_exact_durable_journal() {
+        let (_directory, library, purge_id, _object_id) = authenticated_purge_fixture();
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .execute(
+                "DELETE FROM purge_operations WHERE purge_id = ?1",
+                [purge_id],
+            )
+            .expect("remove journal fixture");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::PurgeJournalMissing
+                && finding.manifest_sequence == Some(2)
+        }));
+        assert!(!report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn authenticated_purge_event_rejects_mismatched_journal_binding() {
+        let (_directory, library, purge_id, _object_id) = authenticated_purge_fixture();
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .execute(
+                "UPDATE purge_operations
+                 SET collection_name = 'Changed purge name',
+                     acknowledged_collection_name = 'Changed purge name'
+                 WHERE purge_id = ?1",
+                [purge_id],
+            )
+            .expect("change journal binding");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::PurgeJournalMismatch
+                && finding.manifest_sequence == Some(2)
+        }));
+        assert!(!report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn authenticated_purge_event_rejects_changed_collection_tombstone() {
+        let (_directory, library, purge_id, _object_id) = authenticated_purge_fixture();
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        let collection_id: i64 = connection
+            .query_row(
+                "SELECT collection_id FROM purge_operations WHERE purge_id = ?1",
+                [purge_id],
+                |row| row.get(0),
+            )
+            .expect("purge collection");
+        connection
+            .execute(
+                "UPDATE collections SET generation = generation + 1
+                 WHERE collection_id = ?1",
+                [collection_id],
+            )
+            .expect("change retained tombstone");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::PurgeJournalMismatch
+                && finding.manifest_sequence == Some(2)
+        }));
+        assert!(!report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn authenticated_purge_event_rejects_changed_inventory_rows() {
+        let (_directory, library, purge_id, _object_id) = authenticated_purge_fixture();
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .execute(
+                "UPDATE purge_objects
+                 SET uncompressed_length = uncompressed_length + 1
+                 WHERE purge_id = ?1",
+                [purge_id],
+            )
+            .expect("change journal inventory");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::PurgeInventoryMismatch
+                && finding.manifest_sequence == Some(2)
+        }));
+        assert!(!report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn absent_payload_without_positive_authorized_absence_is_unexplained_loss() {
+        let (directory, library, _purge_id, object_id) = authenticated_purge_fixture();
+        let encoded = object_id.to_string();
+        let digest = encoded.strip_prefix("b3:").expect("object prefix");
+        let loose_path = directory
+            .path()
+            .join("objects/loose/b3")
+            .join(&digest[..2])
+            .join(&digest[2..4])
+            .join(digest);
+        fs::remove_file(loose_path).expect("remove unauthorized payload fixture");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::UnexplainedObjectLoss
+                && finding.object_id == Some(object_id)
+        }));
+        assert_eq!(report.authorized_absences_verified, 0);
+        assert!(!report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn loose_cleanup_authorizes_exact_absence_while_pending_and_after_completion() {
+        let (_directory, mut library, purge_id, object_id) = authenticated_purge_fixture();
+        advance_purge_to_state(&mut library, purge_id, PurgeJournalState::Cleaning);
+
+        let cleaning = verify_library(&library, VerificationScope::Full).expect("cleaning verify");
+        assert_eq!(cleaning.authorized_absences_verified, 1);
+        assert_eq!(cleaning.purges_pending_cleanup, 1);
+        assert_eq!(cleaning.finding_count, 0, "{:?}", cleaning.findings);
+        assert!(cleaning.is_verified_since_capture());
+        assert!(matches!(
+            library.read_object(object_id),
+            Err(StoreError::ObjectNotFound(id)) if id == object_id
+        ));
+
+        advance_purge_to_state(&mut library, purge_id, PurgeJournalState::Succeeded);
+        let completed =
+            verify_library(&library, VerificationScope::Full).expect("completed verify");
+        assert_eq!(completed.authorized_absences_verified, 1);
+        assert_eq!(completed.purges_pending_cleanup, 0);
+        assert_eq!(completed.finding_count, 0, "{:?}", completed.findings);
+        assert!(completed.is_verified_since_capture());
+    }
+
+    #[test]
+    fn whole_pack_cleanup_authorizes_exact_absence_after_retirement() {
+        let (_directory, mut library, purge_id, object_id) =
+            authenticated_purge_fixture_with_storage(true);
+        advance_purge_to_state(&mut library, purge_id, PurgeJournalState::Cleaning);
+
+        let cleaning = verify_library(&library, VerificationScope::Full).expect("cleaning verify");
+        assert_eq!(cleaning.authorized_absences_verified, 1);
+        assert_eq!(cleaning.purges_pending_cleanup, 1);
+        assert_eq!(cleaning.finding_count, 0, "{:?}", cleaning.findings);
+
+        advance_purge_to_state(&mut library, purge_id, PurgeJournalState::Succeeded);
+        let completed =
+            verify_library(&library, VerificationScope::Full).expect("completed verify");
+        assert_eq!(completed.authorized_absences_verified, 1);
+        assert_eq!(completed.purges_pending_cleanup, 0);
+        assert_eq!(completed.finding_count, 0, "{:?}", completed.findings);
+        assert!(completed.is_verified_since_capture());
+        assert!(matches!(
+            library.read_object(object_id),
+            Err(StoreError::ObjectNotFound(id)) if id == object_id
+        ));
+    }
+
+    #[test]
+    fn superseded_absence_requires_readable_bytes_and_preserves_purge_history() {
+        let (_directory, mut library, purge_id, object_id) = authenticated_purge_fixture();
+        advance_purge_to_state(&mut library, purge_id, PurgeJournalState::Succeeded);
+        let wiki_id = wikisync_core::WikiId::new(1).expect("wiki");
+        let retained = library
+            .create_explicit_collection(wiki_id, "Post-purge retained collection")
+            .expect("retained collection");
+        let title = PageTitle::new("Post-purge retained page").expect("title");
+        let restored = library
+            .capture_current_revision(
+                wiki_id,
+                retained,
+                &CurrentRevisionCapture {
+                    page_id: PageId::new(71).expect("page"),
+                    namespace: 0,
+                    title: &title,
+                    revision_id: RevisionId::new(701).expect("revision"),
+                    parent_id: None,
+                    timestamp: "2026-08-24T02:00:00Z",
+                    author: Some("Fixture author"),
+                    author_id: Some(1),
+                    comment: Some("restored after purge"),
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: b"exclusive purge verification payload",
+                },
+            )
+            .expect("restore captured payload");
+        assert_eq!(restored.id, object_id);
+        assert!(
+            library
+                .purge_authorized_absence(object_id)
+                .expect("active absence lookup")
+                .is_none()
+        );
+        assert!(
+            library
+                .purge_authorized_absence_for_purge(purge_id, object_id)
+                .expect("historical absence lookup")
+                .expect("historical absence")
+                .superseded_at
+                .is_some()
+        );
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert_eq!(report.objects_verified, report.objects_at_start);
+        assert_eq!(report.authorized_absences_verified, 0);
+        assert_eq!(report.purges_pending_cleanup, 0);
+        assert_eq!(report.finding_count, 0, "{:?}", report.findings);
+        assert!(report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn superseded_absence_cannot_explain_later_payload_loss() {
+        let (directory, mut library, purge_id, object_id) = authenticated_purge_fixture();
+        advance_purge_to_state(&mut library, purge_id, PurgeJournalState::Succeeded);
+        library
+            .put_bytes(
+                ObjectKind::Wikitext,
+                b"exclusive purge verification payload",
+            )
+            .expect("restore payload");
+        let encoded = object_id.to_string();
+        let digest = encoded.strip_prefix("b3:").expect("object prefix");
+        fs::remove_file(
+            directory
+                .path()
+                .join("objects/loose/b3")
+                .join(&digest[..2])
+                .join(&digest[2..4])
+                .join(digest),
+        )
+        .expect("remove restored payload");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert_eq!(report.authorized_absences_verified, 0);
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::UnexplainedObjectLoss
+                && finding.object_id == Some(object_id)
+        }));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == VerificationFindingKind::PurgeCleanupMismatch)
+        );
+        assert!(!report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn missing_authorized_absence_row_fails_cleanup_and_remains_unexplained() {
+        let (_directory, mut library, purge_id, object_id) = authenticated_purge_fixture();
+        advance_purge_to_state(&mut library, purge_id, PurgeJournalState::Cleaning);
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .execute(
+                "DELETE FROM purge_authorized_absences WHERE object_id = ?1",
+                [object_id.to_string()],
+            )
+            .expect("remove absence evidence");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert_eq!(report.authorized_absences_verified, 0);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == VerificationFindingKind::PurgeCleanupMismatch)
+        );
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::UnexplainedObjectLoss
+                && finding.object_id == Some(object_id)
+        }));
+        assert!(!report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn succeeded_cleanup_rejects_tampered_completion_accounting() {
+        let (_directory, mut library, purge_id, object_id) = authenticated_purge_fixture();
+        advance_purge_to_state(&mut library, purge_id, PurgeJournalState::Succeeded);
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .execute(
+                "UPDATE purge_cleanup_accounting
+                 SET retired_file_bytes = retired_file_bytes + 1
+                 WHERE purge_id = ?1",
+                [purge_id],
+            )
+            .expect("tamper cleanup accounting");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert_eq!(report.authorized_absences_verified, 0);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == VerificationFindingKind::PurgeCleanupMismatch)
+        );
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::UnexplainedObjectLoss
+                && finding.object_id == Some(object_id)
+        }));
+        assert!(!report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn purge_event_rejects_late_shared_reference_and_still_hashes_payload() {
+        let (_directory, library, _purge_id, object_id) = authenticated_purge_fixture();
+        let connection = rusqlite::Connection::open(library.database_path()).expect("database");
+        connection
+            .execute(
+                "INSERT INTO pages (
+                    wiki_id, page_id, namespace, current_title, current_revision_id,
+                    current_revision_time, state, first_captured_at, updated_at
+                 ) VALUES (1, 71, 0, 'Late retained page', 701,
+                           '2026-08-24T01:00:00Z', 'active', 1, 1)",
+                [],
+            )
+            .expect("insert retained page");
+        connection
+            .execute(
+                "INSERT INTO revisions (
+                    wiki_id, revision_id, page_id, parent_revision_id, revision_time,
+                    author_name, author_id, comment, is_minor, source_size,
+                    upstream_sha1, content_model, content_object_id, captured_at
+                 ) VALUES (1, 701, 71, NULL, '2026-08-24T01:00:00Z',
+                           'Fixture author', 1, 'late shared reference', 0, 36,
+                           NULL, 'wikitext', ?1, 1)",
+                [object_id.to_string()],
+            )
+            .expect("insert retained revision");
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == VerificationFindingKind::PurgeSharedReferenceViolation
+        }));
+        assert_eq!(report.objects_verified, report.objects_at_start);
+        assert_eq!(report.authorized_absences_verified, 0);
+        assert!(!report.is_verified_since_capture());
     }
 
     #[test]

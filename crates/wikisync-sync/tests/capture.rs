@@ -1214,19 +1214,21 @@ async fn long_gap_reconciliation_captures_every_intermediate_before_advancing_ch
     assert_eq!(checkpoint.last_run_id, Some(report.status.run_id));
     assert_eq!(library.manifest_count().expect("manifest count"), 2);
     let repaired = library.read_manifest(1).expect("repaired predecessor");
-    assert_eq!(repaired.manifest.run_id, prior_run.status.run_id);
-    assert_eq!(repaired.manifest.introduced_revisions.len(), 1);
+    let repaired_sync = repaired.manifest.sync().expect("sync manifest event");
+    assert_eq!(repaired_sync.run_id, prior_run.status.run_id);
+    assert_eq!(repaired_sync.introduced_revisions.len(), 1);
     let manifest = library.read_manifest(2).expect("sync manifest");
-    assert_eq!(manifest.manifest.run_id, report.status.run_id);
-    assert_eq!(manifest.manifest.wiki_id, wiki_id);
-    assert_eq!(manifest.manifest.collection_id, Some(collection_id));
-    assert_eq!(manifest.manifest.page_heads.len(), 1);
-    assert_eq!(manifest.manifest.page_heads[0].page_id, page_id);
+    let manifest_sync = manifest.manifest.sync().expect("sync manifest event");
+    assert_eq!(manifest_sync.run_id, report.status.run_id);
+    assert_eq!(manifest_sync.wiki_id, wiki_id);
+    assert_eq!(manifest_sync.collection_id, Some(collection_id));
+    assert_eq!(manifest_sync.page_heads.len(), 1);
+    assert_eq!(manifest_sync.page_heads[0].page_id, page_id);
     assert_eq!(
-        manifest.manifest.page_heads[0].revision_id,
+        manifest_sync.page_heads[0].revision_id,
         Some(RevisionId::new(1_300_000_003).expect("manifest head"))
     );
-    assert_eq!(manifest.manifest.introduced_revisions.len(), 2);
+    assert_eq!(manifest_sync.introduced_revisions.len(), 2);
     let search = SqliteSearchIndex::open(&library).expect("search index");
     let hits = search
         .search(SearchQuery::new("safe concurrency"))
