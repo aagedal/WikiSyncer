@@ -2,6 +2,7 @@ mod collection;
 mod doctor;
 mod dump_bootstrap;
 mod export;
+mod purge;
 mod trust;
 
 use std::env;
@@ -53,6 +54,8 @@ Usage:
   wikisync --library <path> collection list [--all] [--json]
   wikisync --library <path> collection remove --collection <id> [--commit] [--json]
   wikisync --library <path> collection estimate --collection <id> [--json]
+  wikisync --library <path> purge preview --collection <id> [--json]
+  wikisync --library <path> purge execute --collection <id> --name <exact-name> --fingerprint <exact-fingerprint> --ack-payload-only-and-retain-audit --ack-external-copies-not-erased [--json]
   wikisync --library <path> trust key-generate --output <external-path>
   wikisync --library <path> trust key-validate --key <external-path>
   wikisync --library <path> trust key-import --source <external-path> --output <external-path>
@@ -149,6 +152,10 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                 }
                 Command::DumpBootstrap(command) => {
                     return dump_bootstrap::run(&library_root, command, CLI_JSON_SCHEMA_VERSION)
+                        .map_err(Into::into);
+                }
+                Command::Purge(command) => {
+                    return purge::run(&library_root, command, CLI_JSON_SCHEMA_VERSION)
                         .map_err(Into::into);
                 }
                 command => command,
@@ -417,6 +424,9 @@ fn run(arguments: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> Re
                 }
                 Command::DumpBootstrap(_) => {
                     unreachable!("dump bootstrap returned before opening a reader")
+                }
+                Command::Purge(_) => {
+                    unreachable!("purge returned before opening a reader")
                 }
                 Command::TrustKeyGenerate { .. }
                 | Command::TrustKeyValidate { .. }
@@ -1198,6 +1208,7 @@ enum Command {
     },
     Collection(collection::Command),
     DumpBootstrap(dump_bootstrap::Command),
+    Purge(purge::Command),
     TrustKeyGenerate {
         output: PathBuf,
     },
@@ -1298,7 +1309,7 @@ fn parse(
             Some(
                 "init" | "source" | "collection" | "trust" | "category-preview" | "search" | "show"
                 | "history" | "diff" | "sync" | "verify" | "compact" | "dump-bootstrap" | "status"
-                | "export" | "doctor" | "serve",
+                | "export" | "doctor" | "serve" | "purge",
             ) => break argument,
             Some(value) => return Err(CliError::usage(format!("unknown command {value:?}"))),
             None => return Err(CliError::usage("arguments must be valid UTF-8")),
@@ -1339,6 +1350,7 @@ fn parse(
         Some("dump-bootstrap") => {
             Command::DumpBootstrap(dump_bootstrap::parse(values).map_err(CliError::usage)?)
         }
+        Some("purge") => Command::Purge(purge::parse(values).map_err(CliError::usage)?),
         Some("status") => parse_status(values)?,
         Some("export") => parse_export(values)?,
         Some("doctor") => parse_doctor(values)?,
@@ -2059,6 +2071,12 @@ impl From<collection::Error> for CliError {
 
 impl From<dump_bootstrap::Error> for CliError {
     fn from(error: dump_bootstrap::Error) -> Self {
+        Self::message(error.to_string())
+    }
+}
+
+impl From<purge::Error> for CliError {
+    fn from(error: purge::Error) -> Self {
         Self::message(error.to_string())
     }
 }

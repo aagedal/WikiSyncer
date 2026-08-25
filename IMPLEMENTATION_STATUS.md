@@ -1,6 +1,6 @@
 # WikiSyncer implementation status
 
-Updated: 2026-08-24
+Updated: 2026-08-25
 
 ## Completed backlog items
 
@@ -362,9 +362,9 @@ Optional-thumbnail capture now forms an end-to-end, default-off stable-v1 path:
   historical, and collection exports use explicit v2 schemas with deterministic
   attributed media sections and deduplicated hash-addressed private media files.
 
-The destructive-purge safety foundation now also includes:
+The destructive-purge product path now also includes:
 
-- a documented, still-pending product and threat-model contract that defines purge as
+- a documented product and threat-model contract that defines purge as
   collection-exclusive canonical-payload reclamation for a tombstoned collection
   while retaining audit metadata and hashes. It requires exact preview confirmation,
   explains shared-reference and pack-delta constraints, and makes no personal-data,
@@ -401,21 +401,35 @@ The destructive-purge safety foundation now also includes:
   parent and leaf descriptors with no-follow traversal, and uses descriptor-relative
   unlink plus parent-directory durability so ancestor replacement cannot redirect a
   deletion; and
+- bounded retained-subset replacement for mixed packs. One cleanup checkpoint fully
+  reconstructs and hash-verifies the old pack, builds an immutable replacement with
+  exactly the retained object closure, verifies its payload and index, and atomically
+  activates checked replacement metrics before the old generation becomes eligible
+  for the existing restartable retirement phases;
 - full verification that distinguishes exact active authenticated absence from
   unexplained loss, pending or inconsistent cleanup, shared-reference violations, and
   a later verified reintroduction of identical canonical bytes. Reintroduction
   atomically restores the deterministic loose location and supersedes, rather than
   deletes, the historical absence evidence.
 
-Destructive purge remains partial and is not exposed through the CLI, daemon, or GUI.
-Mixed packs still stop at an explicit retained-subset replacement requirement because
-the replacement builder/activator is not implemented. Product exposure also still
-requires one writer lease across authorization and cleanup, startup recovery before
-conflicting mutations, and the preview/acknowledgement workflow. The library executor
-retains audit rows, object identities, and manifest evidence; it removes only exact
-authorized payload files for the supported loose/whole-pack cases. Portable POSIX
-still leaves a very small final leaf-name race between identity confirmation and
-`unlinkat`, although pinned parent traversal prevents ancestor redirection.
+The separate preview-first purge operation is now exposed through the CLI, daemon,
+and Iced GUI without changing non-destructive `collection remove`. All surfaces use
+the same bounded mutation contract, require the exact previewed name and fingerprint
+plus separate payload/audit-retention and external-copy acknowledgements, retain one
+writer boundary through terminal cleanup, and report checked retirement/replacement
+metrics. Daemon startup and every conflicting mutation resume unfinished purge work
+or fail closed before proceeding. GUI confirmations begin unchecked and reset when a
+preview changes; preview and execution remain local and contact no MediaWiki source.
+The library retains audit rows, object identities, hashes, and manifest evidence and
+makes no backup, snapshot, personal-metadata, SSD-remnant, or secure-erasure promise.
+Portable POSIX still leaves a very small final leaf-name race between identity
+confirmation and `unlinkat`, although pinned parent traversal prevents ancestor
+redirection.
+
+Milestone 2 acceptance evidence now also includes a fixture-backed offline lifecycle
+that preserves a stable page ID and earlier canonical revision/object identities
+through a title move, missing/deleted observation, and restoration, while capturing
+both the restored intermediate revision and final head before checkpoint advancement.
 
 Credential-free beta packaging readiness now includes:
 
@@ -434,17 +448,35 @@ Credential-free beta packaging readiness now includes:
   fail-closed Developer ID inspection, strict accepted-notarization receipt checks,
   and signed-input-to-final-archive binding. Routine CI uses only an unmistakable
   unprovisioned identity and all-zero fingerprint; and
-- thirteen packaging tests covering reproducibility, tampering, unsafe paths,
+- fifteen packaging tests covering reproducibility, tampering, unsafe paths,
   symlinked inputs, Ed25519/signature constraints, exact signed sets, path-substitution
-  races, Mach-O structure, signing policy, notarization receipts, and archive binding;
-  and
+  races, Mach-O structure, signing policy, notarization receipts, archive binding,
+  and native network-interposer enforcement; and
 - a native macOS/Linux CI dry run with an immutable checkout action that builds and
   verifies candidates but deliberately has no credentials, signing, publication, or
-  release-write authority.
+  release-write authority;
+- a native release-mode offline audit that denies and records IPv4/IPv6 connection,
+  addressed datagram, and hostname-resolution attempts while exercising offline CLI
+  commands, idle daemon IPC, and a browser-like crawl of the default reader. It passed
+  on macOS across six reader routes with zero outbound attempts and now runs in the
+  macOS/Linux release-candidate workflow; and
+- immutable commit-SHA pins for every third-party action in normal and release CI.
+
+Beta robustness and migration evidence now also includes:
+
+- maintained bounded fuzz targets and seed corpora for deterministic wikitext/plain-
+  text/Markdown rewriting, canonical trusted-head JSON, current-dump parsing, loose-
+  object decompression, pack/index reads, repacking, and delta reconstruction; and
+- a retained materialized schema-11 whole-library fixture with two canonical loose
+  objects. Public read APIs snapshot its source, collection, membership, schedule,
+  transfer policy, titles, revisions, and exact bytes before migrating a copy through
+  schema 15 and proving the same state after migration and an idempotent reopen.
 
 Workspace formatting, warning-denied Clippy, and all workspace tests pass. The
-`cargo-deny` subcommand is unavailable in this environment. All thirteen packaging
-tests, release-workflow YAML parsing, and the final packaging verification pass.
+`cargo-deny` subcommand is unavailable in this environment. All fifteen packaging
+tests, workflow YAML parsing and immutable-action-pin checks, fuzz-target compilation
+and smoke runs, fixture checksums, the native release offline audit, and final
+packaging verification pass.
 This checkpoint adds no new package version. Purge cleanup now directly uses `rustix`
 for safe descriptor-relative filesystem operations. Dump parsing/acquisition directly
 uses `bzip2`, `quick-xml`, `blake3`, `bytes`, `fs2`, and `libc`; sync test coverage
@@ -460,9 +492,10 @@ and signed artifact publication remain.
 ## Plan audit notes
 
 The ordered first implementation backlog (items 1–13) is complete. The broader
-milestone delivery lists are not all closed: destructive purge has a validated partial
-library implementation but no mixed-pack or product completion path, and credentialed
-platform packages remain outstanding, while pack tuning, the initial
+milestone delivery lists are not all closed: destructive purge now has its validated
+mixed-pack and CLI/daemon/GUI completion path, while credentialed platform packages,
+additional beta robustness evidence, and final platform acceptance remain outstanding. Pack
+tuning, the initial
 stable-contract definition, optional thumbnail media, and the authenticated durable
 dump-bootstrap library and daemon/CLI/GUI product paths are implemented.
 Daemon-owned source administration, the planned
@@ -484,18 +517,19 @@ protection when the anchor is kept with and can be replaced alongside the librar
 
 ## Next checkpoint
 
-The next locally actionable stable-v1 checkpoint is retained-subset replacement for
-mixed packs. It must build a bounded immutable replacement containing exactly the
-retained object closure, fully reconstruct and hash-verify every entry, durably install
-and activate it, record independently checked replacement metrics, and only then make
-the old mixed pack eligible for the existing restartable retirement phases.
+The initial robustness checkpoint is complete: maintained fuzz targets, a native
+release-mode offline/outbound audit, and a real older-beta whole-library migration
+fixture are present and validated. The next locally actionable release-acceptance work
+is a representative multi-language GUI/daemon lifecycle, a broader adversarial parser/
+decompression corpus with sustained fuzz runs, and a recorded macOS/Ubuntu acceptance
+matrix. The historical Milestone 0 API/disk benchmark and renderer-evaluation artifacts
+are also absent if the written plan is to be closed literally.
 
-After mixed-pack completion, integrate the separate preview-first purge operation with
-the daemon/CLI/GUI writer boundary. One lease must cover authorization through each
-cleanup checkpoint, daemon startup must resume or fail closed on unfinished cleanup
-before conflicting mutations, and the product surfaces must retain the exact
-name/fingerprint plus payload-retention/external-copy acknowledgements. They must not
-repurpose non-destructive `collection remove`.
+Other credential-free security-exit work remains: configurable operator contact in
+the application User-Agent, daemon peer-credential and hostile-same-UID review,
+bounded log-retention evidence, and GUI-inclusive release-binary no-telemetry evidence.
+The current native audit covers the default CLI, idle daemon, daemon IPC, and local
+reader, not GUI launch or explicitly requested online operations.
 
 Credentialed Apple signing/notarization, protected production release identities and
 independent trust distribution, native release validation, clean-system assessment,

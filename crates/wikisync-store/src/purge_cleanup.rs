@@ -1,9 +1,9 @@
 //! Restartable physical cleanup for authenticated destructive-purge journals.
 //!
 //! Every public entry point revalidates the typed manifest event before it can
-//! advance into logical absence or file retirement. Mixed packs deliberately stop
-//! at a visible replacement-required boundary until their retained subset has been
-//! activated and journaled atomically by the parent store module.
+//! advance into logical absence or file retirement. Mixed packs are rewritten one
+//! at a time with exactly their retained object subset before the old representation
+//! can become eligible for retirement.
 
 use super::*;
 
@@ -17,8 +17,11 @@ pub enum PurgeCleanupStep {
     Prepared,
     /// One whole-pack work item was verified and needs no replacement.
     WholePackReady,
-    /// A mixed pack still needs atomic retained-subset replacement activation.
+    /// Compatibility marker for an external replacement boundary. The built-in
+    /// cleanup driver now performs bounded replacement and does not emit this step.
     ReplacementRequired,
+    /// One mixed pack's exact retained subset was durably installed and activated.
+    ReplacementReady,
     /// Logical absence and derived-index removal committed atomically.
     AuthorizedAbsenceCommitted,
     /// One loose file or old pack/index group was retired and its directory synced.
@@ -424,10 +427,9 @@ impl Library {
 
     /// Advances at most one durable cleanup checkpoint.
     ///
-    /// Cancellation is safe between calls. A mixed-pack journal returns
-    /// [`PurgeCleanupStep::ReplacementRequired`] without deleting or obsoleting any
-    /// payload until the parent pack activator has atomically installed and journaled
-    /// the exact retained subset.
+    /// Cancellation is safe between calls. At most one whole-pack check or mixed-pack
+    /// replacement is completed per call, and no old payload becomes obsolete until
+    /// every replacement has been installed, fully verified, and journaled.
     pub fn resume_purge_cleanup(
         &mut self,
         purge_id: u64,
@@ -445,8 +447,8 @@ impl Library {
                 self.validate_authenticated_purge(purge_id)?;
                 if self.mark_next_whole_pack_ready(purge_id)? {
                     PurgeCleanupStep::WholePackReady
-                } else if self.pending_mixed_pack_exists(purge_id)? {
-                    PurgeCleanupStep::ReplacementRequired
+                } else if self.replace_next_mixed_pack(purge_id)? {
+                    PurgeCleanupStep::ReplacementReady
                 } else {
                     self.commit_authorized_absence(purge_id)?;
                     PurgeCleanupStep::AuthorizedAbsenceCommitted
@@ -1216,18 +1218,162 @@ impl Library {
         Ok(true)
     }
 
-    fn pending_mixed_pack_exists(&self, purge_id: u64) -> Result<bool, StoreError> {
-        self.connection
+    fn replace_next_mixed_pack(&mut self, purge_id: u64) -> Result<bool, StoreError> {
+        type Work = (String, i64, i64);
+        let work: Option<Work> = self
+            .connection
             .query_row(
-                "SELECT EXISTS (
-                    SELECT 1 FROM purge_pack_work
-                    WHERE purge_id = ?1 AND state = 'pending'
-                      AND retained_object_count > 0
-                 )",
+                "SELECT old_pack_id, purged_object_count, retained_object_count
+                 FROM purge_pack_work
+                 WHERE purge_id = ?1 AND state = 'pending'
+                   AND retained_object_count > 0
+                 ORDER BY old_pack_id LIMIT 1",
                 [to_sql_integer(purge_id)?],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .map_err(StoreError::from)
+            .optional()?;
+        let Some((old_pack_id, raw_purged_count, raw_retained_count)) = work else {
+            return Ok(false);
+        };
+        let purged_count = sql_u64(raw_purged_count, "invalid purged pack object count")?;
+        let retained_count = sql_u64(raw_retained_count, "invalid retained pack object count")?;
+        if retained_count == 0 || retained_count > u64::from(self.config.max_pack_objects) {
+            return Err(StoreError::PackLimitExceeded);
+        }
+
+        // This reconstructs and hash-verifies every old entry, including delta bases
+        // that are themselves selected for purge, before any replacement is built.
+        let recorded = self.verify_managed_recorded_pack(&old_pack_id)?;
+        if recorded.object_count
+            != purged_count
+                .checked_add(retained_count)
+                .ok_or(StoreError::CorruptMetadata(
+                    "mixed purge pack object count overflow",
+                ))?
+        {
+            return Err(StoreError::CorruptMetadata(
+                "mixed purge pack counts disagree with recorded pack",
+            ));
+        }
+
+        type Candidate = (
+            String,
+            i64,
+            String,
+            i64,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let candidates: Vec<Candidate> = {
+            let mut statement = self.connection.prepare(
+                "SELECT location.object_id, location.pack_offset,
+                        object.object_kind, object.uncompressed_length,
+                        selected.object_id,
+                        affinity.wiki_id, affinity.page_id, affinity.revision_id
+                 FROM object_locations AS location
+                 JOIN content_objects AS object USING (object_id)
+                 LEFT JOIN purge_objects AS selected
+                   ON selected.purge_id = ?1
+                  AND selected.object_id = location.object_id
+                 LEFT JOIN revisions AS affinity ON affinity.rowid = (
+                     SELECT revision.rowid
+                     FROM revisions AS revision
+                     WHERE revision.content_object_id = location.object_id
+                     ORDER BY revision.wiki_id, revision.page_id, revision.revision_id
+                     LIMIT 1
+                 )
+                 WHERE location.pack_id = ?2
+                   AND location.verification_state = 'verified'
+                 ORDER BY location.pack_offset LIMIT ?3",
+            )?;
+            statement
+                .query_map(
+                    params![
+                        to_sql_integer(purge_id)?,
+                        old_pack_id,
+                        i64::from(MAX_SUPPORTED_PACK_OBJECTS) + 1
+                    ],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ))
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if candidates.len() > MAX_SUPPORTED_PACK_OBJECTS as usize {
+            return Err(StoreError::PackLimitExceeded);
+        }
+        if candidates.len() as u64 != recorded.object_count {
+            return Err(StoreError::CorruptMetadata(
+                "mixed purge pack locations disagree with recorded pack",
+            ));
+        }
+
+        let mut observed_purged = 0_u64;
+        let mut total_input = 0_u64;
+        let mut sources = Vec::with_capacity(retained_count as usize);
+        for (
+            raw_id,
+            raw_offset,
+            raw_kind,
+            raw_length,
+            selected,
+            raw_wiki_id,
+            raw_page_id,
+            raw_revision_id,
+        ) in candidates
+        {
+            if selected.is_some() {
+                observed_purged = observed_purged
+                    .checked_add(1)
+                    .ok_or(StoreError::PackLimitExceeded)?;
+                continue;
+            }
+            let id: ObjectId = raw_id.parse().map_err(|_| {
+                StoreError::CorruptMetadata("invalid mixed purge pack object identity")
+            })?;
+            let kind = ObjectKind::from_database(&raw_kind)?;
+            let expected_length = sql_u64(raw_length, "invalid mixed pack object length")?;
+            total_input = total_input
+                .checked_add(expected_length)
+                .ok_or(StoreError::PackLimitExceeded)?;
+            if total_input > self.config.max_pack_input_bytes {
+                return Err(StoreError::PackLimitExceeded);
+            }
+            let bytes = self.read_object(id)?;
+            verify_object_bytes(id, kind, expected_length, &bytes)?;
+            let (affinity, revision_order) =
+                pack_affinity(raw_wiki_id, raw_page_id, raw_revision_id)?;
+            sources.push(PackSource {
+                id,
+                kind,
+                bytes,
+                affinity,
+                revision_order,
+                stable_order: sql_u64(raw_offset, "invalid mixed pack offset")?,
+            });
+        }
+        if observed_purged != purged_count || sources.len() as u64 != retained_count {
+            return Err(StoreError::CorruptMetadata(
+                "mixed purge retained subset disagrees with journal",
+            ));
+        }
+        sources.sort_by_key(PackSource::sort_key);
+        self.activate_pack_sources_for_purge(
+            &sources,
+            Some((purge_id, &old_pack_id, retained_count)),
+        )?;
+        Ok(true)
     }
 
     fn commit_authorized_absence(&mut self, purge_id: u64) -> Result<(), StoreError> {
@@ -2212,7 +2358,7 @@ fn managed_leaf_error(error: rustix::io::Errno) -> StoreError {
     }
 }
 
-fn checked_regular_file_length(path: &Path) -> Result<u64, StoreError> {
+pub(super) fn checked_regular_file_length(path: &Path) -> Result<u64, StoreError> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(StoreError::CorruptMetadata(
@@ -2716,7 +2862,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_pack_waits_for_atomic_replacement_without_removing_payload() {
+    fn mixed_pack_replacement_is_exact_restartable_and_precedes_retirement() {
         let directory = tempfile::tempdir().expect("temporary library");
         let mut library = Library::open(directory.path()).expect("open library");
         let wiki_id = library
@@ -2751,6 +2897,17 @@ mod tests {
             .expect("pack candidates")
             .expect("mixed pack");
         library
+            .prune_packed_loose_objects(&pack.pack_id)
+            .expect("remove loose fallbacks");
+        let old_pack_path: String = library
+            .connection
+            .query_row(
+                "SELECT pack_path FROM packs WHERE pack_id = ?1",
+                [&pack.pack_id],
+                |row| row.get(0),
+            )
+            .expect("old pack path");
+        library
             .tombstone_collection(target)
             .expect("tombstone target");
         let preview = library.preview_collection_purge(target).expect("preview");
@@ -2773,9 +2930,9 @@ mod tests {
         assert_eq!(
             library
                 .resume_purge_cleanup(receipt.purge_id)
-                .expect("wait for replacement")
+                .expect("build replacement")
                 .step,
-            PurgeCleanupStep::ReplacementRequired
+            PurgeCleanupStep::ReplacementReady
         );
         assert_eq!(
             library.read_object(target_id).expect("target retained"),
@@ -2806,6 +2963,304 @@ mod tests {
                 )
                 .expect("absence count"),
             0
+        );
+
+        let replacement_pack_id: String = library
+            .connection
+            .query_row(
+                "SELECT replacement_pack_id FROM purge_pack_work
+                 WHERE purge_id = ?1 AND old_pack_id = ?2",
+                params![
+                    to_sql_integer(receipt.purge_id).expect("purge ID"),
+                    pack.pack_id
+                ],
+                |row| row.get(0),
+            )
+            .expect("replacement pack ID");
+        assert_ne!(replacement_pack_id, pack.pack_id);
+        let replacement_ids = library
+            .pack_object_ids_excluding_purge(receipt.purge_id, &replacement_pack_id)
+            .expect("replacement inventory");
+        assert_eq!(replacement_ids, vec![retained_id.to_string()]);
+        let (metric_pack_bytes, metric_index_bytes): (i64, i64) = library
+            .connection
+            .query_row(
+                "SELECT pack_bytes, index_bytes FROM purge_replacement_metrics
+                 WHERE purge_id = ?1 AND old_pack_id = ?2",
+                params![
+                    to_sql_integer(receipt.purge_id).expect("purge ID"),
+                    pack.pack_id
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("replacement metrics");
+        let replacement = library
+            .verify_managed_recorded_pack(&replacement_pack_id)
+            .expect("verify replacement pack");
+        assert_eq!(replacement.object_count, 1);
+        let replacement_pack_path = library.root.join(&replacement.pack_path);
+        let replacement_index_path = library.root.join(&replacement.index_path);
+        assert_eq!(
+            sql_u64(metric_pack_bytes, "metric pack bytes").expect("pack metric"),
+            checked_regular_file_length(&replacement_pack_path).expect("replacement pack length")
+        );
+        assert_eq!(
+            sql_u64(metric_index_bytes, "metric index bytes").expect("index metric"),
+            checked_regular_file_length(&replacement_index_path).expect("replacement index length")
+        );
+        let ready_progress = library
+            .verify_purge_cleanup_state(receipt.purge_id)
+            .expect("independently verify replacement-ready state");
+        assert_eq!(ready_progress.replacement_ready_pack_count, 1);
+        assert!(ready_progress.replacement_file_bytes > 0);
+
+        let original_pack = fs::read(&replacement_pack_path).expect("replacement bytes");
+        let mut tampered_pack = original_pack.clone();
+        let last = tampered_pack
+            .last_mut()
+            .expect("replacement pack is nonempty");
+        *last ^= 0x01;
+        fs::write(&replacement_pack_path, tampered_pack).expect("tamper replacement pack");
+        assert!(matches!(
+            library.resume_purge_cleanup(receipt.purge_id),
+            Err(StoreError::CorruptPack("pack checksum mismatch"))
+        ));
+        assert_eq!(
+            library
+                .connection
+                .query_row(
+                    "SELECT state FROM packs WHERE pack_id = ?1",
+                    [&pack.pack_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("old pack remains active after payload tamper"),
+            "verified"
+        );
+        fs::write(&replacement_pack_path, original_pack).expect("restore replacement pack");
+
+        library
+            .connection
+            .execute(
+                "UPDATE purge_replacement_metrics SET pack_bytes = pack_bytes + 1
+                 WHERE purge_id = ?1 AND old_pack_id = ?2",
+                params![
+                    to_sql_integer(receipt.purge_id).expect("purge ID"),
+                    pack.pack_id
+                ],
+            )
+            .expect("tamper replacement metric");
+        assert!(matches!(
+            library.resume_purge_cleanup(receipt.purge_id),
+            Err(StoreError::CorruptMetadata(
+                "purge replacement metrics disagree with verified files"
+            ))
+        ));
+        assert_eq!(
+            library
+                .read_object(target_id)
+                .expect("target remains active"),
+            b"target mixed-pack payload"
+        );
+        assert_eq!(
+            library
+                .purge_cleanup_progress(receipt.purge_id)
+                .expect("failed-advance progress")
+                .state,
+            PurgeJournalState::Repacking
+        );
+        assert_eq!(
+            library
+                .connection
+                .query_row(
+                    "SELECT state FROM packs WHERE pack_id = ?1",
+                    [&pack.pack_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("old pack remains active after metric tamper"),
+            "verified"
+        );
+        library
+            .connection
+            .execute(
+                "UPDATE purge_replacement_metrics SET pack_bytes = pack_bytes - 1
+                 WHERE purge_id = ?1 AND old_pack_id = ?2",
+                params![
+                    to_sql_integer(receipt.purge_id).expect("purge ID"),
+                    pack.pack_id
+                ],
+            )
+            .expect("restore replacement metric");
+
+        drop(library);
+        let mut library = Library::open(directory.path()).expect("reopen after replacement");
+        assert_eq!(
+            library
+                .resume_purge_cleanup(receipt.purge_id)
+                .expect("commit absence after restart")
+                .step,
+            PurgeCleanupStep::AuthorizedAbsenceCommitted
+        );
+        assert!(matches!(
+            library.read_object(target_id),
+            Err(StoreError::ObjectNotFound(id)) if id == target_id
+        ));
+        assert_eq!(
+            library.read_object(retained_id).expect("read replacement"),
+            b"retained mixed-pack payload"
+        );
+        assert_eq!(
+            library
+                .connection
+                .query_row(
+                    "SELECT state FROM packs WHERE pack_id = ?1",
+                    [&pack.pack_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("obsolete old pack"),
+            "obsolete"
+        );
+        assert!(library.root.join(&old_pack_path).exists());
+
+        while library
+            .purge_cleanup_progress(receipt.purge_id)
+            .expect("cleanup progress")
+            .pending_file_count
+            + library
+                .purge_cleanup_progress(receipt.purge_id)
+                .expect("cleanup progress")
+                .unlinking_file_count
+            > 0
+        {
+            assert_eq!(
+                library
+                    .resume_purge_cleanup(receipt.purge_id)
+                    .expect("retire old files")
+                    .step,
+                PurgeCleanupStep::FilesRetired
+            );
+        }
+        assert!(!library.root.join(old_pack_path).exists());
+        assert_eq!(
+            library
+                .resume_purge_cleanup(receipt.purge_id)
+                .expect("finish mixed purge")
+                .step,
+            PurgeCleanupStep::Completed
+        );
+        assert_eq!(
+            library
+                .verify_purge_cleanup_state(receipt.purge_id)
+                .expect("verify completed mixed purge")
+                .state,
+            PurgeJournalState::Succeeded
+        );
+        assert_eq!(
+            library
+                .read_object(retained_id)
+                .expect("retained after cleanup"),
+            b"retained mixed-pack payload"
+        );
+    }
+
+    #[test]
+    fn mixed_pack_replacement_respects_input_bound_without_advancing_state() {
+        let directory = tempfile::tempdir().expect("temporary library");
+        let mut library = Library::open(directory.path()).expect("open library");
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let target = library
+            .create_explicit_collection(wiki_id, "Bounded mixed target")
+            .expect("target collection");
+        let retained = library
+            .create_explicit_collection(wiki_id, "Bounded mixed retained")
+            .expect("retained collection");
+        let target_id = capture_cleanup_page(
+            &mut library,
+            wiki_id,
+            target,
+            10,
+            100,
+            "Bounded target",
+            b"target payload",
+        );
+        let retained_id = capture_cleanup_page(
+            &mut library,
+            wiki_id,
+            retained,
+            20,
+            200,
+            "Bounded retained",
+            b"retained payload exceeds one byte",
+        );
+        let pack = library
+            .pack_loose_objects()
+            .expect("pack candidates")
+            .expect("mixed pack");
+        library
+            .prune_packed_loose_objects(&pack.pack_id)
+            .expect("remove loose fallbacks");
+        library
+            .tombstone_collection(target)
+            .expect("tombstone target");
+        let preview = library.preview_collection_purge(target).expect("preview");
+        let receipt = library
+            .authorize_collection_purge(
+                target,
+                PurgeAuthorization {
+                    collection_name: &preview.collection_name,
+                    preview_fingerprint: &preview.fingerprint,
+                    payload_only_acknowledged: true,
+                    backups_not_erased_acknowledged: true,
+                },
+            )
+            .expect("authorize purge");
+        assert_eq!(
+            library
+                .resume_purge_cleanup(receipt.purge_id)
+                .expect("prepare cleanup")
+                .step,
+            PurgeCleanupStep::Prepared
+        );
+        drop(library);
+
+        let config = StoreConfig::default()
+            .with_max_pack_input_bytes(1)
+            .expect("one-byte pack bound");
+        let mut library = Library::open_with_config(directory.path(), config)
+            .expect("reopen with smaller pack bound");
+        assert!(matches!(
+            library.resume_purge_cleanup(receipt.purge_id),
+            Err(StoreError::PackLimitExceeded)
+        ));
+        let progress = library
+            .purge_cleanup_progress(receipt.purge_id)
+            .expect("bounded replacement progress");
+        assert_eq!(progress.state, PurgeJournalState::Repacking);
+        assert_eq!(progress.pending_pack_count, 1);
+        assert_eq!(progress.replacement_ready_pack_count, 0);
+        assert_eq!(
+            library
+                .read_object(target_id)
+                .expect("target remains active"),
+            b"target payload"
+        );
+        assert_eq!(
+            library
+                .read_object(retained_id)
+                .expect("retained remains active"),
+            b"retained payload exceeds one byte"
+        );
+        assert_eq!(
+            library
+                .connection
+                .query_row(
+                    "SELECT state FROM packs WHERE pack_id = ?1",
+                    [&pack.pack_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("old pack remains active"),
+            "verified"
         );
     }
 

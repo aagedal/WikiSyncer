@@ -1,0 +1,53 @@
+[package]
+name = "wikisync-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3.20"
+wikisync-content = { path = "../crates/wikisync-content" }
+wikisync-integrity = { path = "../crates/wikisync-integrity" }
+wikisync-mediawiki = { path = "../crates/wikisync-mediawiki" }
+wikisync-store = { path = "../crates/wikisync-store" }
+
+[workspace]
+
+[[bin]]
+name = "wikitext_markdown"
+path = "fuzz_targets/wikitext_markdown.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "trusted_head_json"
+path = "fuzz_targets/trusted_head_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dump_parser"
+path = "fuzz_targets/dump_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "loose_object"
+path = "fuzz_targets/loose_object.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pack_roundtrip"
+path = "fuzz_targets/pack_roundtrip.rs"
+test = false
+doc = false
+bench = false

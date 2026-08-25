@@ -26,9 +26,9 @@ use wikisync_integrity::{
 };
 use wikisync_mediawiki::ClientConfig;
 use wikisync_store::{
-    CollectionSchedule, DumpImportStatus, Library, NetworkTransferPolicy, ScheduleCadence,
-    StoredCollection, StoredCollectionConfiguration, StoredWiki, SyncCheckpoint, SyncRunState,
-    SyncRunStatus,
+    CollectionSchedule, DumpImportStatus, Library, NetworkTransferPolicy, PurgeJournalState,
+    PurgePreview, ScheduleCadence, StoredCollection, StoredCollectionConfiguration, StoredWiki,
+    SyncCheckpoint, SyncRunState, SyncRunStatus,
 };
 use wikisync_sync::{
     CategoryPreviewLimits, CollectionSelectionPreview, bootstrap_collection, parse_title_list,
@@ -36,11 +36,13 @@ use wikisync_sync::{
 };
 use wikisync_web::ReaderHandle;
 use wikisyncd::{
-    CollectionAdministration, CollectionAdministrationOutcome, CollectionDraft,
-    MeteredNetworkState, Mutation, SourceAdministration, SourceAdministrationOutcome, WriterAccess,
-    WriterLease, administer_collection_direct, administer_source_direct,
-    bootstrap_collection_from_current_dump_direct_async, detect_metered_network,
-    next_occurrence_after, set_collection_schedule_mutation, set_network_transfer_policy_mutation,
+    ApplicationHandler, CollectionAdministration, CollectionAdministrationOutcome, CollectionDraft,
+    CollectionPurgeOutcome, CollectionPurgeRequest, MeteredNetworkState, Mutation,
+    OperationControl, RequestHandler, SourceAdministration, SourceAdministrationOutcome,
+    WriterAccess, WriterLease, administer_collection_direct, administer_source_direct,
+    bootstrap_collection_from_current_dump_direct_async, collection_purge_mutation,
+    decode_collection_purge_outcome, detect_metered_network, next_occurrence_after,
+    set_collection_schedule_mutation, set_network_transfer_policy_mutation,
 };
 
 use dump::{DumpBootstrapForm, DumpBootstrapPreview, INDEPENDENT_ANCHOR_NOTICE};
@@ -71,6 +73,7 @@ struct App {
     collection_form: CollectionForm,
     collection_editor: Option<CollectionEditor>,
     remove_confirmation: Option<CollectionId>,
+    purge_dialog: Option<CollectionPurgeDialog>,
     schedule_editor: Option<ScheduleEditor>,
     network_policy_editor: NetworkPolicyEditor,
     dump_bootstrap_form: DumpBootstrapForm,
@@ -103,6 +106,7 @@ impl App {
             collection_form: CollectionForm::default(),
             collection_editor: None,
             remove_confirmation: None,
+            purge_dialog: None,
             schedule_editor: None,
             network_policy_editor: NetworkPolicyEditor::default(),
             dump_bootstrap_form: DumpBootstrapForm::default(),
@@ -196,6 +200,7 @@ impl App {
                 self.snapshot = None;
                 self.notice = None;
                 self.dump_bootstrap_preview = None;
+                self.purge_dialog = None;
                 self.verification = VerificationState::NotRun;
                 self.reader = None;
             }
@@ -746,6 +751,7 @@ impl App {
                     self.collection_editor = None;
                     self.schedule_editor = None;
                     self.remove_confirmation = Some(collection_id);
+                    self.purge_dialog = None;
                 }
             }
             Message::CancelRemoveCollection => {
@@ -776,6 +782,116 @@ impl App {
                         self.notice = Some(Notice::success(
                             "Tracking stopped. Captured revisions, historical runs, manifests, and integrity evidence were retained; no article data was purged.",
                         ));
+                    }
+                    Err(error) => self.notice = Some(Notice::error(error)),
+                }
+            }
+            Message::OpenCollectionPurge(collection_id) => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                self.remove_confirmation = None;
+                self.collection_editor = None;
+                self.schedule_editor = None;
+                self.notice = None;
+                self.purge_dialog = Some(CollectionPurgeDialog::new(collection_id));
+                let path = PathBuf::from(&self.library_path);
+                let key = self.begin_request(path.clone());
+                return purge_preview_task(key, path, collection_id);
+            }
+            Message::RefreshCollectionPurgePreview => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let Some(dialog) = self.purge_dialog.as_mut() else {
+                    return Task::none();
+                };
+                dialog.clear_confirmations();
+                dialog.preview = None;
+                self.notice = None;
+                let collection_id = dialog.collection_id;
+                let path = PathBuf::from(&self.library_path);
+                let key = self.begin_request(path.clone());
+                return purge_preview_task(key, path, collection_id);
+            }
+            Message::CollectionPurgePreviewed(completion) => {
+                if !self.finish_request(&completion.key) {
+                    return Task::none();
+                }
+                match completion.result {
+                    Ok(preview) => {
+                        let Some(dialog) = self.purge_dialog.as_mut() else {
+                            return Task::none();
+                        };
+                        if dialog.collection_id != preview.collection_id {
+                            return Task::none();
+                        }
+                        dialog.install_preview(preview);
+                    }
+                    Err(error) => self.notice = Some(Notice::error(error)),
+                }
+            }
+            Message::CollectionPurgeNameChanged(value) => {
+                if !self.is_busy()
+                    && let Some(dialog) = self.purge_dialog.as_mut()
+                {
+                    dialog.typed_name = value;
+                }
+            }
+            Message::CollectionPurgeFingerprintChanged(value) => {
+                if !self.is_busy()
+                    && let Some(dialog) = self.purge_dialog.as_mut()
+                {
+                    dialog.typed_fingerprint = value;
+                }
+            }
+            Message::CollectionPurgePayloadAcknowledged(value) => {
+                if !self.is_busy()
+                    && let Some(dialog) = self.purge_dialog.as_mut()
+                {
+                    dialog.payload_only_acknowledged = value;
+                }
+            }
+            Message::CollectionPurgeExternalCopiesAcknowledged(value) => {
+                if !self.is_busy()
+                    && let Some(dialog) = self.purge_dialog.as_mut()
+                {
+                    dialog.external_copies_acknowledged = value;
+                }
+            }
+            Message::CancelCollectionPurge => {
+                if !self.is_busy() {
+                    self.purge_dialog = None;
+                }
+            }
+            Message::ConfirmCollectionPurge => {
+                if self.is_busy() {
+                    return Task::none();
+                }
+                let Some(request) = self
+                    .purge_dialog
+                    .as_ref()
+                    .and_then(CollectionPurgeDialog::confirmed_request)
+                else {
+                    self.notice = Some(Notice::error(
+                        "The exact name, exact fingerprint, and both acknowledgements are required.",
+                    ));
+                    return Task::none();
+                };
+                self.notice = None;
+                let path = PathBuf::from(&self.library_path);
+                let key = self.begin_request(path.clone());
+                return purge_collection_task(key, path, request);
+            }
+            Message::CollectionPurged(completion) => {
+                if !self.finish_request(&completion.key) {
+                    return Task::none();
+                }
+                match completion.result {
+                    Ok(result) => {
+                        self.snapshot = Some(result.snapshot);
+                        self.purge_dialog = None;
+                        self.notice = Some(Notice::success(purge_outcome_summary(&result.outcome)));
                     }
                     Err(error) => self.notice = Some(Notice::error(error)),
                 }
@@ -1444,7 +1560,7 @@ impl App {
     fn collections_view<'a>(&'a self, snapshot: &'a DashboardSnapshot) -> Element<'a, Message> {
         let mut list = column![text("Collections").size(30)].spacing(10);
         if snapshot.collections.is_empty() {
-            list = list.push(text("No collections yet. Create one below."));
+            list = list.push(text("No actively tracked collections. Create one below."));
         } else {
             for collection in &snapshot.collections {
                 let schedule = snapshot
@@ -1461,6 +1577,17 @@ impl App {
                     schedule,
                     !self.is_busy(),
                 ));
+            }
+        }
+
+        if !snapshot.tombstoned_collections.is_empty() {
+            list = list.push(horizontal_rule(1));
+            list = list.push(text("Stopped collections").size(23));
+            list = list.push(text(
+                "These tombstones retain history and audit evidence. Payload purge is a separate destructive operation and always starts with a read-only preview.",
+            ));
+            for collection in &snapshot.tombstoned_collections {
+                list = list.push(tombstoned_collection_row(collection, !self.is_busy()));
             }
         }
 
@@ -1491,6 +1618,10 @@ impl App {
                 )
                 .padding(12),
             );
+        }
+
+        if let Some(dialog) = &self.purge_dialog {
+            list = list.push(collection_purge_view(dialog, !self.is_busy()));
         }
 
         if let Some(editor) = &self.schedule_editor {
@@ -2210,6 +2341,16 @@ enum Message {
     CancelRemoveCollection,
     ConfirmRemoveCollection,
     CollectionRemoved(ScopedResult<DashboardSnapshot>),
+    OpenCollectionPurge(CollectionId),
+    RefreshCollectionPurgePreview,
+    CollectionPurgePreviewed(ScopedResult<PurgePreview>),
+    CollectionPurgeNameChanged(String),
+    CollectionPurgeFingerprintChanged(String),
+    CollectionPurgePayloadAcknowledged(bool),
+    CollectionPurgeExternalCopiesAcknowledged(bool),
+    CancelCollectionPurge,
+    ConfirmCollectionPurge,
+    CollectionPurged(ScopedResult<CollectionPurgeExecution>),
     EditSchedule(CollectionId),
     EditScheduleModeChanged(ScheduleMode),
     EditScheduleValueChanged(String),
@@ -2281,6 +2422,7 @@ struct DashboardSnapshot {
     network_policy: NetworkTransferPolicy,
     wikis: Vec<StoredWiki>,
     collections: Vec<StoredCollection>,
+    tombstoned_collections: Vec<StoredCollection>,
     collection_configurations: Vec<StoredCollectionConfiguration>,
     schedules: Vec<CollectionSchedule>,
     runs: Vec<SyncRunStatus>,
@@ -2742,6 +2884,67 @@ struct EditCollectionRequest {
 }
 
 #[derive(Clone, Debug)]
+struct CollectionPurgeDialog {
+    collection_id: CollectionId,
+    preview: Option<PurgePreview>,
+    typed_name: String,
+    typed_fingerprint: String,
+    payload_only_acknowledged: bool,
+    external_copies_acknowledged: bool,
+}
+
+impl CollectionPurgeDialog {
+    fn new(collection_id: CollectionId) -> Self {
+        Self {
+            collection_id,
+            preview: None,
+            typed_name: String::new(),
+            typed_fingerprint: String::new(),
+            payload_only_acknowledged: false,
+            external_copies_acknowledged: false,
+        }
+    }
+
+    fn install_preview(&mut self, preview: PurgePreview) {
+        self.clear_confirmations();
+        self.preview = Some(preview);
+    }
+
+    fn clear_confirmations(&mut self) {
+        self.typed_name.clear();
+        self.typed_fingerprint.clear();
+        self.payload_only_acknowledged = false;
+        self.external_copies_acknowledged = false;
+    }
+
+    fn is_confirmed(&self) -> bool {
+        self.preview.as_ref().is_some_and(|preview| {
+            self.typed_name == preview.collection_name
+                && self.typed_fingerprint == preview.fingerprint
+                && self.payload_only_acknowledged
+                && self.external_copies_acknowledged
+        })
+    }
+
+    fn confirmed_request(&self) -> Option<CollectionPurgeRequest> {
+        let preview = self.preview.as_ref()?;
+        self.is_confirmed().then(|| CollectionPurgeRequest {
+            collection_id: preview.collection_id,
+            collection_name: self.typed_name.clone(),
+            preview_fingerprint: self.typed_fingerprint.clone(),
+            payload_only_acknowledged: self.payload_only_acknowledged,
+            external_copies_not_erased_acknowledged: self.external_copies_acknowledged,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CollectionPurgeExecution {
+    snapshot: DashboardSnapshot,
+    outcome: CollectionPurgeOutcome,
+}
+
+#[derive(Clone, Debug)]
 enum VerificationState {
     NotRun,
     Running(VerificationKind),
@@ -2861,6 +3064,34 @@ fn remove_collection_task(
             ScopedResult { key, result }
         },
         Message::CollectionRemoved,
+    )
+}
+
+fn purge_preview_task(
+    key: RequestKey,
+    path: PathBuf,
+    collection_id: CollectionId,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = preview_collection_purge(&path, collection_id);
+            ScopedResult { key, result }
+        },
+        Message::CollectionPurgePreviewed,
+    )
+}
+
+fn purge_collection_task(
+    key: RequestKey,
+    path: PathBuf,
+    request: CollectionPurgeRequest,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = execute_collection_purge(path, request).await;
+            ScopedResult { key, result }
+        },
+        Message::CollectionPurged,
     )
 }
 
@@ -3347,6 +3578,83 @@ async fn remove_collection(
             let library = Library::open_read_only(&path).map_err(|error| error.to_string())?;
             snapshot(&library)
         }
+    }
+}
+
+fn preview_collection_purge(
+    path: &Path,
+    collection_id: CollectionId,
+) -> Result<PurgePreview, String> {
+    let library = Library::open_read_only(path).map_err(|error| error.to_string())?;
+    library
+        .preview_collection_purge(collection_id)
+        .map_err(|error| error.to_string())
+}
+
+async fn execute_collection_purge(
+    path: PathBuf,
+    request: CollectionPurgeRequest,
+) -> Result<CollectionPurgeExecution, String> {
+    let mutation = collection_purge_mutation(&request).map_err(|error| error.to_string())?;
+    match WriterAccess::discover(&path).map_err(|error| error.to_string())? {
+        WriterAccess::Direct(writer_lease) => {
+            // Keep the cooperative lease alive until the terminal receipt has been
+            // decoded and the post-purge read-only snapshot has been collected.
+            let mut handler = ApplicationHandler::new(&path).map_err(|error| error.to_string())?;
+            let wire_outcome = handler
+                .mutate(mutation, OperationControl::running())
+                .map_err(|error| error.to_string())?;
+            let outcome = decode_collection_purge_outcome(&wire_outcome)
+                .map_err(|error| error.to_string())?;
+            ensure_completed_purge_outcome(&outcome)?;
+            let library = Library::open_read_only(&path).map_err(|error| error.to_string())?;
+            let snapshot = snapshot(&library)?;
+            drop(writer_lease);
+            Ok(CollectionPurgeExecution { snapshot, outcome })
+        }
+        WriterAccess::Daemon(client) => {
+            let wire_outcome = client
+                .forward_mutation(mutation)
+                .map_err(|error| error.to_string())?;
+            let outcome = decode_collection_purge_outcome(&wire_outcome)
+                .map_err(|error| error.to_string())?;
+            ensure_completed_purge_outcome(&outcome)?;
+            let library = Library::open_read_only(&path).map_err(|error| error.to_string())?;
+            let snapshot = snapshot(&library)?;
+            Ok(CollectionPurgeExecution { snapshot, outcome })
+        }
+    }
+}
+
+fn ensure_completed_purge_outcome(outcome: &CollectionPurgeOutcome) -> Result<(), String> {
+    if outcome.progress.state == PurgeJournalState::Succeeded {
+        Ok(())
+    } else {
+        Err(format!(
+            "Purge {} returned without a durable succeeded state ({:?}).",
+            outcome.purge_id, outcome.progress.state
+        ))
+    }
+}
+
+fn purge_outcome_summary(outcome: &CollectionPurgeOutcome) -> String {
+    let progress = &outcome.progress;
+    format!(
+        "Purge {} completed durably: {} files / {} retired, {} replacement bytes written, {} net bytes reclaimed, and {} packs retired. Audit metadata and hashes remain.",
+        outcome.purge_id,
+        progress.retired_file_count,
+        format_bytes(progress.retired_file_bytes),
+        format_bytes(progress.replacement_file_bytes),
+        format_signed_bytes(progress.net_reclaimed_file_bytes),
+        progress.retired_pack_count,
+    )
+}
+
+fn format_signed_bytes(bytes: i64) -> String {
+    if bytes < 0 {
+        format!("-{}", format_bytes(bytes.unsigned_abs()))
+    } else {
+        format_bytes(bytes as u64)
     }
 }
 
@@ -3841,6 +4149,12 @@ fn snapshot(library: &Library) -> Result<DashboardSnapshot, String> {
         .network_transfer_policy()
         .map_err(|error| error.to_string())?;
     let collections = library.collections().map_err(|error| error.to_string())?;
+    let tombstoned_collections = library
+        .collections_including_tombstones()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|collection| collection.tombstoned_at.is_some())
+        .collect();
     let wikis = library.wikis().map_err(|error| error.to_string())?;
     let collection_configurations = collections
         .iter()
@@ -3915,6 +4229,7 @@ fn snapshot(library: &Library) -> Result<DashboardSnapshot, String> {
         network_policy,
         wikis,
         collections,
+        tombstoned_collections,
         collection_configurations,
         schedules,
         runs,
@@ -4489,6 +4804,118 @@ fn collection_row<'a>(
     .into()
 }
 
+fn tombstoned_collection_row(collection: &StoredCollection, enabled: bool) -> Element<'_, Message> {
+    container(
+        row![
+            column![
+                text(&collection.name).size(19),
+                text(format!(
+                    "Collection {} · stopped at {} · audit/history retained",
+                    collection.collection_id,
+                    collection
+                        .tombstoned_at
+                        .map_or_else(|| "unknown".to_owned(), |timestamp| timestamp.to_string())
+                ))
+                .size(13),
+            ],
+            Space::new(Length::Fill, Length::Shrink),
+            button("Preview payload purge").on_press_maybe(
+                enabled.then_some(Message::OpenCollectionPurge(collection.collection_id))
+            ),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .padding(12)
+    .into()
+}
+
+fn collection_purge_view(dialog: &CollectionPurgeDialog, enabled: bool) -> Element<'_, Message> {
+    let Some(preview) = dialog.preview.as_ref() else {
+        return container(
+            column![
+                text(format!(
+                    "Read-only payload purge preview · collection {}",
+                    dialog.collection_id
+                ))
+                .size(20),
+                text("Computing the exclusive canonical-payload closure locally. This preview never contacts MediaWiki and does not write to the library."),
+                row![
+                    button("Cancel").on_press_maybe(enabled.then_some(Message::CancelCollectionPurge)),
+                    button("Retry read-only preview")
+                        .on_press_maybe(enabled.then_some(Message::RefreshCollectionPurgePreview)),
+                ]
+                .spacing(8),
+            ]
+            .spacing(9),
+        )
+        .padding(12)
+        .into();
+    };
+
+    let confirmations_match = dialog.is_confirmed();
+    container(
+        column![
+            text("Permanent local payload purge").size(23),
+            text(format!("Exact collection name: {}", preview.collection_name)),
+            text(format!("Exact preview fingerprint: {}", preview.fingerprint)),
+            text(format!("Catalog fingerprint: {}", preview.catalog_fingerprint)),
+            text(format!(
+                "Objects: {} total · {} wikitext · {} media",
+                preview.object_count,
+                preview.wikitext_object_count,
+                preview.media_object_count
+            )),
+            text(format!(
+                "Logical payload: {} · estimated reclaimable: {}",
+                format_bytes(preview.logical_bytes),
+                format_bytes(preview.reclaimable_bytes)
+            )),
+            text(format!(
+                "Storage layout: {} loose objects · {} affected packs · {} whole packs · {} mixed packs",
+                preview.loose_object_count,
+                preview.affected_pack_count,
+                preview.whole_pack_count,
+                preview.mixed_pack_count
+            )),
+            horizontal_rule(1),
+            text("Audit boundary: this removes only exclusive local payload representations. Collection tombstones, logical metadata, object hashes, manifests, integrity evidence, and operation records remain."),
+            text("External-copy warning: backups, filesystem snapshots, exports, replicas, caches, and copies on other devices are outside this purge and are not erased."),
+            text("Erasure warning: unlinking and pack replacement are not secure physical erasure. Storage media, wear-leveling, journal, and forensic remnants may persist."),
+            text("Type the exact collection name:"),
+            text_input("Exact collection name", &dialog.typed_name)
+                .on_input(Message::CollectionPurgeNameChanged)
+                .padding(10),
+            text("Type the exact preview fingerprint:"),
+            text_input("Exact preview fingerprint", &dialog.typed_fingerprint)
+                .on_input(Message::CollectionPurgeFingerprintChanged)
+                .padding(10),
+            checkbox(
+                "I understand this purges payload only; retained audit metadata, hashes, manifests, and integrity evidence remain.",
+                dialog.payload_only_acknowledged,
+            )
+            .on_toggle(Message::CollectionPurgePayloadAcknowledged),
+            checkbox(
+                "I understand backups, snapshots, exports, other copies, and physical-device remnants are not erased.",
+                dialog.external_copies_acknowledged,
+            )
+            .on_toggle(Message::CollectionPurgeExternalCopiesAcknowledged),
+            row![
+                button("Cancel").on_press_maybe(enabled.then_some(Message::CancelCollectionPurge)),
+                button("Recompute read-only preview").on_press_maybe(
+                    enabled.then_some(Message::RefreshCollectionPurgePreview)
+                ),
+                button("Permanently purge previewed payload").on_press_maybe(
+                    (enabled && confirmations_match).then_some(Message::ConfirmCollectionPurge)
+                ),
+            ]
+            .spacing(8),
+        ]
+        .spacing(9),
+    )
+    .padding(12)
+    .into()
+}
+
 fn notice_view(notice: Option<&Notice>) -> Element<'_, Message> {
     match notice {
         Some(notice) => {
@@ -4582,6 +5009,76 @@ mod tests {
         include_str!("../../../fixtures/mediawiki/reconciliation-content-middle.json");
     const HEAD_CONTENT: &str =
         include_str!("../../../fixtures/mediawiki/reconciliation-content-head.json");
+
+    fn purge_preview_fixture(collection_id: CollectionId, suffix: &str) -> PurgePreview {
+        PurgePreview {
+            collection_id,
+            collection_name: format!("Stopped collection {suffix}"),
+            collection_generation: 2,
+            tombstoned_at: 1_777_000_000,
+            manifest_head_sequence: None,
+            manifest_head_id: None,
+            catalog_fingerprint: format!("catalog-{suffix}"),
+            fingerprint: format!("b3:{suffix}"),
+            object_count: 3,
+            wikitext_object_count: 2,
+            media_object_count: 1,
+            logical_bytes: 1_024,
+            reclaimable_bytes: 768,
+            loose_object_count: 1,
+            affected_pack_count: 2,
+            whole_pack_count: 1,
+            mixed_pack_count: 1,
+        }
+    }
+
+    #[test]
+    fn purge_confirmation_requires_both_exact_strings_and_two_acknowledgements() {
+        let collection_id = CollectionId::new(7).unwrap();
+        let preview = purge_preview_fixture(collection_id, "abcdef");
+        let mut dialog = CollectionPurgeDialog::new(collection_id);
+        dialog.install_preview(preview.clone());
+
+        dialog.typed_name = preview.collection_name.clone();
+        dialog.typed_fingerprint = preview.fingerprint.clone();
+        dialog.payload_only_acknowledged = true;
+        assert!(!dialog.is_confirmed());
+        assert!(dialog.confirmed_request().is_none());
+
+        dialog.external_copies_acknowledged = true;
+        assert!(dialog.is_confirmed());
+        let request = dialog.confirmed_request().expect("complete confirmation");
+        assert_eq!(request.collection_name, preview.collection_name);
+        assert_eq!(request.preview_fingerprint, preview.fingerprint);
+
+        dialog.typed_name.push(' ');
+        assert!(!dialog.is_confirmed(), "name matching must be exact");
+        dialog.typed_name = preview.collection_name;
+        dialog.typed_fingerprint.make_ascii_uppercase();
+        assert!(!dialog.is_confirmed(), "fingerprint matching must be exact");
+    }
+
+    #[test]
+    fn installing_changed_purge_preview_clears_every_confirmation() {
+        let collection_id = CollectionId::new(8).unwrap();
+        let first = purge_preview_fixture(collection_id, "first");
+        let mut dialog = CollectionPurgeDialog::new(collection_id);
+        dialog.install_preview(first.clone());
+        dialog.typed_name = first.collection_name;
+        dialog.typed_fingerprint = first.fingerprint;
+        dialog.payload_only_acknowledged = true;
+        dialog.external_copies_acknowledged = true;
+        assert!(dialog.is_confirmed());
+
+        let changed = purge_preview_fixture(collection_id, "changed");
+        dialog.install_preview(changed.clone());
+        assert_eq!(dialog.preview, Some(changed));
+        assert!(dialog.typed_name.is_empty());
+        assert!(dialog.typed_fingerprint.is_empty());
+        assert!(!dialog.payload_only_acknowledged);
+        assert!(!dialog.external_copies_acknowledged);
+        assert!(!dialog.is_confirmed());
+    }
 
     #[derive(Debug)]
     struct FixtureServer {
@@ -5028,6 +5525,96 @@ mod tests {
             wiki_id,
             added_collection_id(outcome).expect("added outcome"),
         )
+    }
+
+    fn seeded_purge_collection(path: &Path) -> CollectionId {
+        let mut library = Library::open(path).expect("purge fixture library");
+        let wiki_id = library
+            .register_wiki("https://example.invalid/w/api.php", "en")
+            .expect("purge fixture source");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Exact purge fixture")
+            .expect("purge fixture collection");
+        let title = PageTitle::new("Exclusive purge page").expect("purge fixture title");
+        library
+            .capture_current_revision(
+                wiki_id,
+                collection_id,
+                &CurrentRevisionCapture {
+                    page_id: PageId::new(91).unwrap(),
+                    namespace: 0,
+                    title: &title,
+                    revision_id: RevisionId::new(901).unwrap(),
+                    parent_id: None,
+                    timestamp: "2026-08-25T08:00:00Z",
+                    author: None,
+                    author_id: None,
+                    comment: None,
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: b"exclusive canonical purge fixture payload",
+                },
+            )
+            .expect("capture purge fixture");
+        library
+            .tombstone_collection(collection_id)
+            .expect("tombstone purge fixture");
+        collection_id
+    }
+
+    fn confirmed_purge_request(path: &Path, collection_id: CollectionId) -> CollectionPurgeRequest {
+        let preview =
+            preview_collection_purge(path, collection_id).expect("read-only purge preview");
+        CollectionPurgeRequest {
+            collection_id,
+            collection_name: preview.collection_name,
+            preview_fingerprint: preview.fingerprint,
+            payload_only_acknowledged: true,
+            external_copies_not_erased_acknowledged: true,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn collection_purge_matches_direct_and_daemon_writer_paths() {
+        let direct_root = tempfile::tempdir().expect("direct purge library");
+        let daemon_root = tempfile::tempdir().expect("daemon purge library");
+        let direct_id = seeded_purge_collection(direct_root.path());
+        let daemon_id = seeded_purge_collection(daemon_root.path());
+        let direct_request = confirmed_purge_request(direct_root.path(), direct_id);
+        let daemon_request = confirmed_purge_request(daemon_root.path(), daemon_id);
+
+        let handler = ApplicationHandler::new(daemon_root.path()).expect("purge daemon handler");
+        let daemon = wikisyncd::Daemon::bind(daemon_root.path(), handler).expect("purge daemon");
+        let shutdown = daemon.shutdown_handle();
+        let daemon_thread = thread::spawn(move || daemon.run());
+        wikisyncd::Client::for_library(daemon_root.path())
+            .expect("purge daemon client")
+            .health()
+            .expect("purge daemon readiness");
+
+        let direct = execute_collection_purge(direct_root.path().to_path_buf(), direct_request)
+            .await
+            .expect("direct purge");
+        let forwarded = execute_collection_purge(daemon_root.path().to_path_buf(), daemon_request)
+            .await
+            .expect("daemon purge");
+        for result in [&direct, &forwarded] {
+            assert_eq!(result.outcome.progress.state, PurgeJournalState::Succeeded);
+            assert!(result.outcome.progress.manifest_installed);
+            assert_eq!(result.outcome.progress.pending_file_count, 0);
+            assert_eq!(result.snapshot.tombstoned_collections.len(), 1);
+        }
+        assert_eq!(
+            direct.outcome.progress.net_reclaimed_file_bytes,
+            forwarded.outcome.progress.net_reclaimed_file_bytes
+        );
+
+        shutdown.shutdown();
+        daemon_thread
+            .join()
+            .expect("purge daemon thread")
+            .expect("purge daemon shutdown");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -15,6 +15,9 @@ use wikisync_sync::{
 };
 
 use crate::collection::{DecodedCollectionDraft, decode_collection_draft_version};
+use crate::purge::{
+    COLLECTION_PURGE_EXTENSION, execute_collection_purge, recover_unfinished_purges,
+};
 use crate::{
     CollectionAdminProtocolOutcome, CollectionAdminRequest, CollectionAdministration,
     HandlerStatus, MAX_COLLECTION_DRAFT_BYTES, MAX_COLLECTION_DRAFT_CHUNK_BYTES,
@@ -705,6 +708,17 @@ impl ApplicationHandler {
 }
 
 impl RequestHandler for ApplicationHandler {
+    fn startup(&mut self, control: OperationControl) -> Result<(), OperationError> {
+        let mut library = Library::open(&self.library_root).map_err(operation_failed)?;
+        let recovered = recover_unfinished_purges(&mut library, &control)?;
+        if recovered != 0 {
+            self.last_operation = Some(format!(
+                "recovered {recovered} unfinished collection purge(s) before accepting mutations"
+            ));
+        }
+        Ok(())
+    }
+
     fn status(&self) -> HandlerStatus {
         let network_detail = self.last_network_status.map_or_else(String::new, |status| {
             format!(
@@ -729,6 +743,13 @@ impl RequestHandler for ApplicationHandler {
         mutation: Mutation,
         control: OperationControl,
     ) -> Result<MutationOutcome, OperationError> {
+        if !matches!(
+            &mutation,
+            Mutation::Extension { name, .. } if name == COLLECTION_PURGE_EXTENSION
+        ) {
+            let mut library = Library::open(&self.library_root).map_err(operation_failed)?;
+            recover_unfinished_purges(&mut library, &control)?;
+        }
         match mutation {
             Mutation::SyncAll => self.sync_all(&control),
             Mutation::SyncCollection(collection_id) => self.sync_one(collection_id, &control),
@@ -747,6 +768,12 @@ impl RequestHandler for ApplicationHandler {
             {
                 self.bootstrap_current_dump(&payload, &control)
             }
+            Mutation::Extension { name, payload } if name == COLLECTION_PURGE_EXTENSION => {
+                let mut library = Library::open(&self.library_root).map_err(operation_failed)?;
+                let outcome = execute_collection_purge(&mut library, &payload, &control)?;
+                self.last_operation = Some("completed authenticated collection purge".to_owned());
+                Ok(outcome)
+            }
             Mutation::Extension { name, .. } => Err(OperationError::unsupported(format!(
                 "extension operation {name:?} is not implemented"
             ))),
@@ -758,6 +785,9 @@ impl RequestHandler for ApplicationHandler {
         request: CollectionAdminRequest,
         control: OperationControl,
     ) -> Result<CollectionAdminProtocolOutcome, OperationError> {
+        let mut library = Library::open(&self.library_root).map_err(operation_failed)?;
+        recover_unfinished_purges(&mut library, &control)?;
+        drop(library);
         self.administer(request, &control)
     }
 
@@ -766,6 +796,9 @@ impl RequestHandler for ApplicationHandler {
         administration: SourceAdministration,
         control: OperationControl,
     ) -> Result<SourceAdministrationOutcome, OperationError> {
+        let mut library = Library::open(&self.library_root).map_err(operation_failed)?;
+        recover_unfinished_purges(&mut library, &control)?;
+        drop(library);
         if control.is_shutdown_requested() {
             return Err(OperationError::failed(
                 "source administration cancelled by shutdown request",
@@ -796,6 +829,9 @@ impl RequestHandler for ApplicationHandler {
         &mut self,
         control: OperationControl,
     ) -> Result<Option<MutationOutcome>, OperationError> {
+        let mut library = Library::open(&self.library_root).map_err(operation_failed)?;
+        recover_unfinished_purges(&mut library, &control)?;
+        drop(library);
         self.poll_schedule(&control)
     }
 }

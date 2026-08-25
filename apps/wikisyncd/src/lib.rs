@@ -9,6 +9,7 @@ mod application;
 mod collection;
 mod dump_bootstrap;
 mod network;
+mod purge;
 mod schedule;
 mod source;
 
@@ -25,6 +26,10 @@ pub use dump_bootstrap::{
 };
 pub use network::{
     MeteredNetworkProbeOutcome, MeteredNetworkState, MeteredNetworkStatus, detect_metered_network,
+};
+pub use purge::{
+    COLLECTION_PURGE_EXTENSION, COLLECTION_PURGE_RESULT, CollectionPurgeOutcome,
+    CollectionPurgeRequest, collection_purge_mutation, decode_collection_purge_outcome,
 };
 pub use schedule::{
     RecoveryDecision, jittered_occurrence, next_nominal_after, next_occurrence_after, recover,
@@ -326,6 +331,12 @@ pub enum ErrorCode {
 
 /// Application-service dispatch run by the daemon's single writer thread.
 pub trait RequestHandler: fmt::Debug + Send + 'static {
+    /// Recovers durable work after writer ownership is acquired and before the
+    /// daemon socket accepts requests.
+    fn startup(&mut self, _control: OperationControl) -> Result<(), OperationError> {
+        Ok(())
+    }
+
     /// Produces read-only application status.
     fn status(&self) -> HandlerStatus;
 
@@ -906,9 +917,15 @@ pub struct Daemon<H: RequestHandler> {
 
 impl<H: RequestHandler> Daemon<H> {
     /// Acquires writer ownership and binds private library-local IPC.
-    pub fn bind(library_root: impl AsRef<Path>, handler: H) -> Result<Self, DaemonError> {
+    pub fn bind(library_root: impl AsRef<Path>, mut handler: H) -> Result<Self, DaemonError> {
         let root = canonical_library_root(library_root.as_ref())?;
         let writer_lease = WriterLease::acquire(&root)?;
+        let running = Arc::new(AtomicBool::new(true));
+        handler
+            .startup(OperationControl {
+                running: Arc::clone(&running),
+            })
+            .map_err(|error| DaemonError::Startup(error.to_string()))?;
         let path = daemon_socket_path(&root);
         let (listener, socket) = bind_exclusive(&root, &path, BusyKind::Daemon)?;
         listener.set_nonblocking(true)?;
@@ -917,7 +934,7 @@ impl<H: RequestHandler> Daemon<H> {
             _socket: socket,
             _writer_lease: writer_lease,
             handler,
-            running: Arc::new(AtomicBool::new(true)),
+            running,
             started: Instant::now(),
             completed_mutations: 0,
             last_background_poll: Instant::now(),
@@ -1165,6 +1182,8 @@ pub enum DaemonError {
     FrameTooLarge { size: usize },
     /// Malformed or inconsistent protocol data.
     Protocol(&'static str),
+    /// Application recovery failed while writer ownership was held.
+    Startup(String),
     /// Compatible remote daemon rejected the request.
     Remote(ResponseError),
 }
@@ -1190,6 +1209,9 @@ impl fmt::Display for DaemonError {
                 "IPC frame is {size} bytes; maximum is {MAX_FRAME_BYTES}"
             ),
             Self::Protocol(message) => write!(formatter, "invalid daemon protocol: {message}"),
+            Self::Startup(message) => {
+                write!(formatter, "daemon startup recovery failed: {message}")
+            }
             Self::Remote(error) => write!(
                 formatter,
                 "daemon rejected request ({:?}): {}",

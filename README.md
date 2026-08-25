@@ -23,6 +23,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+Maintained bounded fuzz targets and seed corpora live under [`fuzz/`](fuzz/README.md).
+The native release-mode offline audit is documented under
+[`scripts/`](scripts/README.md) and is run by the macOS/Linux release-candidate
+workflow after building the locked release binaries.
+
 Inspect durable synchronization progress without network access:
 
 ```sh
@@ -37,7 +42,30 @@ wikisync --library /path/to/library export --format markdown
 wikisync --library /path/to/library export --format text --collection 1
 ```
 
-Historical `--at` export remains a later checkpoint and currently fails explicitly.
+Export a historical slice without replacing `exports/current` by selecting an
+inclusive captured revision ID or RFC 3339 time:
+
+```sh
+wikisync --library /path/to/library export --format markdown --at 1300000000
+wikisync --library /path/to/library export --format text --at 2026-08-20T12:00:00Z
+```
+
+Current and historical exports are private, deterministic derived views with source,
+revision, capture, transformer, and content-hash provenance. They are not canonical
+backups or integrity evidence.
+
+`collection remove` only stops tracking and retains captured history. Reclaiming
+collection-exclusive canonical payload is a separate preview-first operation for an
+already tombstoned collection:
+
+```sh
+wikisync --library /path/to/library purge preview --collection 1
+```
+
+Execution requires the exact previewed collection name and fingerprint plus separate
+acknowledgements that audit evidence remains and external copies are not erased. The
+same contract is available through the daemon and Iced GUI; see the
+[destructive-purge contract](docs/operations/destructive-purge.md) before using it.
 
 Serve the read-only local encyclopedia on the loopback interface:
 

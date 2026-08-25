@@ -4,9 +4,11 @@ This guide describes the behavior present in the repository, not a signed beta
 installer. WikiSyncer currently provides source builds, reproducible unsigned macOS
 and Linux release-candidate archives, detached checksum-signing/verification hooks,
 and parameterized user-service templates. It does not yet provide signed/notarized
-macOS installers, a Linux repository/package trust chain, or a stable backup format.
-The CLI provides an offline redacted `doctor` report/bundle, and the GUI includes the
-current schedule editor.
+macOS installers, a Linux repository/package trust chain, or a portable backup
+archive. Stable v1 instead defines a permission-preserving, quiescent copy of the
+complete library directory as its backup representation; a database-only copy is not
+a backup. The CLI provides an offline redacted `doctor` report/bundle, and the GUI
+includes the current schedule editor.
 
 - [Service management](service-management.md): install, start, stop, uninstall,
   permission, and sleep/wake guidance.
@@ -16,6 +18,9 @@ current schedule editor.
   copy.
 - [Diagnostics](diagnostics.md): collect local, redacted evidence and distinguish
   database checks from canonical-object verification.
+- [Destructive purge](destructive-purge.md): understand the preview-first payload-only
+  workflow, retained audit evidence, shared-reference safety, restart recovery, and
+  explicit non-erasure guarantees before using the CLI, daemon, or GUI operation.
 - [Packaging](../../packaging/README.md): build and verify reproducible candidate
   archives, authenticate their checksum manifest, and understand the remaining
   credentialed platform-release gates.

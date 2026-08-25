@@ -2,7 +2,7 @@
 
 Status: pre-beta security baseline
 
-Last reviewed against the repository: 2026-08-21
+Last reviewed against the repository: 2026-08-25
 
 This document describes the security and privacy properties WikiSyncer intends to
 provide, the controls present at the review date, and the work that remains before a
@@ -68,7 +68,7 @@ The model considers:
 - a malicious or compromised MediaWiki source that can return false, inconsistent,
   adversarial, oversized, or specially structured content and metadata;
 - an on-path attacker, compromised proxy, or corrupted transport response;
-- hostile wikitext, derived Markdown/HTML, links, and future media files;
+- hostile wikitext, derived Markdown/HTML, links, and captured media files;
 - another unprivileged user on the same computer;
 - untrusted local web content attempting to reach the reader through a browser;
 - an accidental or deliberate non-loopback listener;
@@ -228,9 +228,14 @@ token stream.
   embedded. Tests also cover hostile-looking content, header policy, non-loopback
   rejection, and listener shutdown.
 
-Media capture is not implemented and should remain disabled until MIME validation,
-byte/decompression/pixel limits, active-format handling, attribution, and safe serving
-are implemented and tested.
+Optional thumbnail capture is implemented and remains default-off. The supported path
+accepts only bounded passive JPEG/PNG renditions whose MIME type, structure, decoded
+dimensions, pixel count, animation state, and allocation requirements validate. It
+stores immutable attribution, licensing, source, rendition, placement, and capture
+metadata; authenticates media inventory and placements in current manifest schemas;
+revalidates local bytes during full verification, reader serving, and export; and
+treats per-image source failures as nonfatal to already durable text. Active formats,
+higher-resolution policies, and unbounded media remain unsupported.
 
 ### Dependency and build policy
 
@@ -428,14 +433,21 @@ the maintained current export.
 **Residual risk and action.** Onboarding, export, backup, and restore documentation
 must warn about retained suppressed material and legal obligations. Diagnostic
 redaction must remain an explicit versioned allowlist, and users must review bundles
-before sharing them. Define bounded log retention and verify no telemetry endpoints
-or unexpected outbound requests in release binaries. Destructive purge is not
-implemented. Its required preview, authorization, shared-reference, authenticated-
-absence, crash-recovery, and erasure-limit contract is defined in
-`docs/operations/destructive-purge.md`; no product surface may claim it before the
-implementation and failure-path tests satisfy that contract.
+before sharing them. Define bounded log retention and extend the native release audit
+to GUI launch. The current macOS/Linux workflow denies and records libc IPv4/IPv6
+connection, addressed-datagram, and hostname-resolution attempts while exercising
+offline CLI commands, idle daemon IPC, and a browser-like default-reader crawl.
+Destructive purge is implemented
+and validated through the CLI, daemon, and Iced GUI. The library
+foundation implements bounded preview and authorization, authenticated purge events,
+exact authorized-absence verification, and restartable loose, whole-pack, and retained-
+subset mixed-pack cleanup. The writer boundary adds exact confirmations, one-lease
+execution, and fail-closed daemon startup recovery. The GUI uses the same bounded
+mutation and requires a local preview, exact typed name/fingerprint, and two initially
+unchecked acknowledgements that reset when the preview changes. The erasure-limit
+contract and non-promises remain defined in `docs/operations/destructive-purge.md`.
 
-### Destructive purge authorization and recoverability (pending)
+### Destructive purge authorization and recoverability
 
 **Scenario.** A user or local client mistakes non-destructive collection removal for
 data erasure; an unauthorized, stale, or partial purge removes shared or manifested
@@ -473,12 +485,12 @@ separate retention/media-destruction controls remain external responsibilities.
 
 | Requirement | State at review | Evidence / remaining work |
 | --- | --- | --- |
-| No telemetry or external reader assets | **Present for tested reader path** | Bundled CSS, restrictive CSP, and in-process outbound-resource crawl; add release-level outbound test and audit diagnostics/updater behavior |
+| No telemetry or external reader assets | **Present for default CLI/daemon/reader release paths; GUI evidence partial** | Bundled CSS, restrictive CSP, in-process populated-library crawl, and a native release-mode interposer audit for offline CLI commands, idle daemon IPC, and the default reader. The audit passed on macOS with zero outbound attempts and runs in the macOS/Linux release workflow; add GUI-launch coverage and reassess any future updater/telemetry behavior |
 | Explicit source allowlist | **Present for configured source and bounded Wikimedia CDN origins** | Each client derives exact normalized origins from its selected endpoint, plus only `https://upload.wikimedia.org:443` for recognized standard-port Wikimedia project sources; third-party/nonstandard/loopback sources remain exact-origin. Ambient proxies are disabled, unsafe literal and whole DNS answers are rejected, new connections revalidate DNS, and redirects must remain on an approved exact origin. Loopback HTTP enables a loopback-only fixture exception |
 | HTTPS through Rustls | **Present** | `wikisync-mediawiki` disables reqwest defaults and enables `rustls-tls`; loopback HTTP is fixture-only by validation |
 | Application User-Agent and operator contact | **Partial** | Non-empty controlled User-Agent and `maxlag` exist; configuration/UI contract for operator contact remains |
-| Response, timeout, parser, redirect, and decompression bounds | **Partial** | Request/connect timeout, per-response and aggregate run-byte limits, clone-shared concurrency and byte-rate shaping, redirect count/origin policy, object/pack and inline-depth limits exist; decompression-ratio coverage, broader parser/allocation budgets, and fuzzing remain |
-| Sanitized HTML and restrictive CSP | **Present for text reader** | Raw HTML events become text, links/images are rewritten, headers are tested; continue adversarial corpus testing |
+| Response, timeout, parser, redirect, and decompression bounds | **Partial** | Request/connect timeout, per-response and aggregate run-byte limits, clone-shared concurrency and byte-rate shaping, redirect count/origin policy, object/pack and inline-depth limits exist. Maintained bounded fuzz targets now cover content rewriting, trusted-head JSON, dump parsing, loose decompression, pack/index reads, repacking, and delta reconstruction; broader adversarial corpora, sustained runs, decompression-ratio coverage, and parser/allocation budgets remain |
+| Sanitized HTML and restrictive CSP | **Present for the tested reader path** | Raw HTML events become text, links are rewritten, passive local media is revalidated before serving, and headers are tested; continue adversarial corpus testing |
 | User-restricted data-directory permissions | **Present on Unix core paths** | Directories including manifests/exports are `0700`; SQLite/WAL/SHM and created manifest/export files are `0600`; extend release auditing to logs, IPC, and backups |
 | BLAKE3 identities for canonical text/media | **Present** | Domain-separated text/media object kinds, bounded validated ingestion, and verified reader/export reads are implemented |
 | Predecessor-linked manifests | **Present, optionally head-authenticated** | Bounded canonical JSON, BLAKE3 body identity, immutable run configuration snapshots, strict predecessor/sequence checks, atomic durable append, bounded crash-gap repair, catalog-difference revisions, resulting heads, deterministic media inventory/placements, and tamper tests are implemented. Schema-v1 manifests remain readable and explicitly report no media coverage. A signature covers a validated chain head rather than modifying every manifest file |
@@ -486,9 +498,9 @@ separate retention/media-destruction controls remain external responsibilities.
 | Full verify contract | **Partial** | Loose/pack/delta objects, manifest identity/chain/run coverage, revision/page/object/media reachability, authenticated v2 media inventory/placements, page heads, checkpoint run/scope/boundary, search/FTS pointers, and search transformer versions are checked with bounded stable scans. An exact external head comparison detects a different restored head. The current schema has no derived-cache table; contentless FTS bodies, full revision-chain policy completeness, older v1 media coverage, and broader database truncation detection remain limited |
 | Loopback-only read-only reader | **Present, confidentiality gap** | Non-loopback addresses are rejected and only GET routes exist; localhost is unauthenticated and not an OS-user boundary |
 | Daemon single-writer authorization | **Partial** | Versioned bounded Unix IPC, `0600` sockets inside the private library, cooperative writer leases, scheduling, signal cancellation, advisory-lock stale-socket recovery, GUI/CLI forwarding, and exclusion/recovery tests exist; peer-credential review and hostile same-UID analysis remain |
-| Destructive purge | **Contract defined; implementation pending** | `collection remove` remains non-destructive. The future workflow must pass preview/authorization staleness, tombstone-only, shared-reference, manifest/journal recovery, replacement-pack, verification, and explicit non-erasure tests before exposure in CLI/GUI/daemon |
-| Locked/audited dependencies | **Partial** | Lockfile, cargo-deny policy, locked CI tests; formal audit response, immutable CI action pins, SBOM/provenance remain |
-| Signed beta packages | **Credential-free substrate present; credentialed release pending** | Deterministic bounded macOS/Linux candidate archives, exact signed-set verification, detached OpenSSH Ed25519 checksum-signing hooks, a defined Linux archive/repository/key-distribution trust model, deterministic macOS Mach-O/signing plans, fail-closed Developer ID/receipt/final-archive validation, eleven packaging tests, and a no-secret/no-publish native CI dry run are present. Real Apple Developer ID signing, timestamping, notarization and clean-host Gatekeeper evidence; protected release identities and independent trust-anchor distribution; credentialed native validation; and signed publication remain |
+| Destructive purge | **Present for the payload-only product workflow** | Bounded preview/authorization, typed purge events, authorized-absence verification, and restartable loose, whole-pack, and retained-subset mixed-pack cleanup are implemented. CLI/daemon add exact confirmations, one-lease execution, bounded IPC, and fail-closed startup recovery. Iced uses the same mutation with read-only preview, exact typed values, two reset-on-change acknowledgements, durable terminal receipts, and direct/daemon parity tests. `collection remove` remains non-destructive. Audit metadata, shared payload, external copies, backups, snapshots, exports, and storage-device remnants are explicitly not erased |
+| Locked/audited dependencies | **Partial** | Lockfile, cargo-deny policy, locked CI tests, and immutable commit-SHA pins for all third-party normal/release workflow actions are present; formal audit response, SBOM, and provenance remain |
+| Signed beta packages | **Credential-free substrate present; credentialed release pending** | Deterministic bounded macOS/Linux candidate archives, exact signed-set verification, detached OpenSSH Ed25519 checksum-signing hooks, a defined Linux archive/repository/key-distribution trust model, deterministic macOS Mach-O/signing plans, fail-closed Developer ID/receipt/final-archive validation, fifteen packaging tests, a native zero-outbound default-path audit, and a no-secret/no-publish native CI dry run are present. Real Apple Developer ID signing, timestamping, notarization and clean-host Gatekeeper evidence; protected release identities and independent trust-anchor distribution; credentialed native validation; and signed publication remain |
 | Safe optional media | **Present, default-off** | Bounded discovery/download, source-bound CDN policy, passive-raster validation, hard collection budgets, immutable attribution/licensing metadata, media-aware manifests/full verification, local-only reader serving, and attributed deterministic exports are fixture-tested. Higher-resolution/active media remain unsupported |
 | At-rest confidentiality | **External control** | Recommend full-disk encryption; application-managed encryption is intentionally deferred |
 
@@ -545,14 +557,15 @@ result on macOS and Ubuntu. Deferred items must be disabled and accurately docum
 13. **Privacy documentation:** onboarding and release docs cover bandwidth, storage
     growth, external-link behavior, local-listener exposure, full-disk encryption,
     logs/diagnostics, backups, and retention of material later removed upstream.
-14. **Media decision:** media remains disabled, or its bounded decode/rasterization,
-    MIME handling, CSP, source/license/attribution, budget, and malicious corpus tests
-    all pass. Text synchronization must remain usable when media fails.
-15. **Destructive purge:** purge remains unavailable, or complete preview binding,
-    exact confirmations, tombstone-only enforcement, shared-reference closure,
-    authenticated purge events, restartable cleanup, replacement-pack activation,
-    authorized-absence verification, and non-erasure language pass direct/daemon and
-    CLI/GUI failure-path tests.
+14. **Media decision:** optional thumbnails remain default-off; their bounded passive-
+    raster decode, MIME handling, CSP, source/license/attribution, budget, and malicious
+    corpus tests all pass before beta. Text synchronization remains usable when an
+    optional image fails. Active and higher-resolution media remain unavailable.
+15. **Destructive purge:** retain passing coverage for complete preview binding, exact
+    confirmations, tombstone-only enforcement, shared-reference closure, authenticated
+    purge events, restartable cleanup, replacement-pack activation, authorized-absence
+    verification, direct/daemon/GUI parity, and explicit non-erasure language. A
+    partial or unvalidated surface is not completion.
 
 ## Review triggers
 

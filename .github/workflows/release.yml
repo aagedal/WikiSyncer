@@ -4,7 +4,12 @@ on:
   pull_request:
     paths:
       - ".github/workflows/release.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "apps/**"
+      - "crates/**"
       - "packaging/**"
+      - "scripts/**"
       - "docs/operations/**"
       - "docs/security/linux-package-repository-trust.md"
       - "docs/security/macos-signing-notarization.md"
@@ -38,6 +43,8 @@ jobs:
         run: python3 -m unittest discover -s packaging/tests -v
       - name: Build release binaries
         run: cargo build --workspace --bins --release --locked
+      - name: Audit default offline behavior for outbound networking
+        run: python3 scripts/release_offline_audit.py --skip-build
       - name: Build and verify deterministic release candidate
         env:
           TARGET_OS: ${{ matrix.target_os }}

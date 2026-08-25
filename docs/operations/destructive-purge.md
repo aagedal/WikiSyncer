@@ -1,19 +1,30 @@
 # Destructive purge contract
 
-Destructive purge is not implemented in the current WikiSyncer CLI, daemon, or GUI.
+Destructive purge is implemented and validated through the CLI, daemon, and Iced GUI.
 `collection remove` remains a non-destructive operation: it tombstones a collection,
 stops future tracking, and retains every captured payload and audit record. Do not
 delete SQLite rows, loose objects, packs, indexes, or manifests by hand to simulate a
 purge. Manual deletion can strand pack-delta dependants and can make manifested
 content disappear without an authenticated explanation.
 
-This document defines the required contract for the complete purge product. A partial
-library foundation now implements bounded preview/authorization, the authenticated
+This document defines the contract for the purge product. The library implementation
+provides bounded preview/authorization, the authenticated
 manifest event, exact authorized-absence verification, and restartable cleanup for
-loose objects and whole-target packs. Mixed-pack retained-subset replacement,
-single-writer startup/resume integration, and the CLI/daemon/GUI workflow remain
-unfinished. The complete implementation must satisfy this contract and its
-failure-path tests before a product surface may describe purge as available.
+loose objects, whole-target packs, and mixed packs. Mixed-pack cleanup builds a
+bounded immutable replacement containing exactly the retained objects, verifies the
+old and new pack contents, atomically activates the replacement with checked metrics,
+and keeps the old pack readable until a later authorized cleanup phase can retire it.
+The CLI exposes a read-only preview and an exact-name/fingerprint execute
+step with separate payload-only/audit-retention and external-copy acknowledgements.
+The daemon uses the same bounded mutation, holds one writer lease through
+authorization and cleanup, and recovers or fails closed on unfinished cleanup before
+binding its request socket. Focused direct, daemon, restart, and fail-closed tests
+validate these paths. The Iced GUI uses the same mutation and keeps payload purge
+separate from non-destructive stop-tracking. It displays a local read-only preview,
+requires the exact collection name and preview fingerprint plus two initially unchecked
+acknowledgements, clears every confirmation when the preview changes, and requires a
+durable succeeded receipt before reporting cleanup metrics. Preview and purge are
+local operations and do not contact MediaWiki.
 
 ## Meaning and scope
 

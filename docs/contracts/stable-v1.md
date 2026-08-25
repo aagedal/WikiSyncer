@@ -24,6 +24,8 @@ The v1 command-specific top-level fields are:
 | `collection add`, `edit`, `estimate` | `operation`, `committed`, `configuration`, `preview`, `result` |
 | `collection remove` | `operation`, `committed`, `collection`, `result`, `effect` |
 | `collection list` | `includes_tombstones`, `collections` |
+| `purge preview` | `collection_id`, `collection_name`, `collection_generation`, `tombstoned_at`, `manifest_head_sequence`, `manifest_head_id`, `catalog_fingerprint`, `preview_fingerprint`, `object_count`, `wikitext_object_count`, `media_object_count`, `logical_bytes`, `reclaimable_bytes`, `loose_object_count`, `affected_pack_count`, `whole_pack_count`, `mixed_pack_count`, `payload_only_audit_retained`, `external_copies_erased` |
+| `purge execute` | `purge_id`, `state`, `manifest_installed`, `retired_pack_count`, `retired_file_count`, `retired_file_bytes`, `replacement_file_bytes`, `net_reclaimed_file_bytes`, `audit_metadata_retained`, `external_copies_erased` |
 | `category-preview` | `root`, `recursion_depth`, counts, `limits`, `categories`, `pages` |
 | `search` | `results` |
 | `show` | wiki/page/revision identity, `format`, `content` |
@@ -165,15 +167,23 @@ The operational stop/copy/verify and restore sequences are expanded in
 be an additional versioned format, not an implicit reinterpretation of this directory
 contract.
 
-## Pending destructive purge contract
+## Destructive purge product contract
 
-Destructive purge is not part of the currently implemented stable-v1 CLI, daemon, or
-GUI. `collection remove` has one stable meaning: stop tracking by tombstoning the
-collection while retaining captured payload and audit history. A future purge must be
-a separate preview-first operation and must not repurpose that command or its JSON
-fields.
+Destructive purge is implemented and validated through the CLI, daemon, and Iced GUI.
+`collection remove` has one stable meaning: stop tracking by tombstoning the collection
+while retaining captured payload and audit history. Purge is a separate preview-first
+operation and must not repurpose that command or its JSON fields.
 
-The normative product and durability requirements for that future operation are in
+The library provides bounded preview and authorization,
+typed schema-3 purge events, exact authorized-absence verification, and restartable
+loose, whole-pack, and retained-subset mixed-pack cleanup. The CLI/daemon path adds
+read-only preview, exact confirmations, one-lease execution, and fail-closed daemon
+startup recovery. Internal APIs, tables, and protocol messages remain private; the
+documented CLI JSON fields above are the public v1 boundary. The GUI uses the same
+preview fingerprint, exact confirmations, acknowledgements, and terminal durable
+receipt rather than defining a second purge contract.
+
+The normative product and durability requirements for this operation are in
 `docs/operations/destructive-purge.md`. In summary, purge may reclaim only canonical
 text/media payload proved exclusive to one tombstoned collection. It retains audit
 metadata and content hashes; requires exact collection-name, preview-fingerprint, and
@@ -183,8 +193,7 @@ authenticates absence with a typed manifest event and durable cleanup journal;
 preserves shared objects; and activates verified replacement packs before retiring
 old packed bytes.
 
-This pending contract is not a claim of personal-metadata erasure, secure erase, or
-removal from backups, snapshots, exports, synchronized copies, or SSD remnants. When
-the command is implemented, its successful JSON shape and any durable manifest/journal
-format must be independently versioned and added to this compatibility document
-before being called stable.
+This product contract is not a claim of personal-metadata erasure, secure erase, or
+removal from backups, snapshots, exports, synchronized copies, or SSD remnants. The
+successful CLI JSON shapes and durable manifest/journal formats are versioned; future
+incompatible changes require new versions rather than reinterpretation.

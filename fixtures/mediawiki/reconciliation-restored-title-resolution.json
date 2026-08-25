@@ -1,0 +1,20 @@
+{
+  "batchcomplete": true,
+  "query": {
+    "pages": [
+      {
+        "pageid": 25357340,
+        "ns": 0,
+        "title": "Rust language",
+        "revisions": [
+          {
+            "revid": 1300000005,
+            "parentid": 1300000004,
+            "timestamp": "2026-08-23T12:00:00Z",
+            "size": 62
+          }
+        ]
+      }
+    ]
+  }
+}

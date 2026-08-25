@@ -1,0 +1,26 @@
+{
+  "batchcomplete": true,
+  "query": {
+    "pages": [
+      {
+        "pageid": 25357340,
+        "ns": 0,
+        "title": "Rust language",
+        "revisions": [
+          {
+            "revid": 1300000004,
+            "parentid": 1300000003,
+            "timestamp": "2026-08-22T12:00:00Z",
+            "size": 57,
+            "slots": {
+              "main": {
+                "contentmodel": "wikitext",
+                "content": "== Rust ==\nRestored after deletion with archived history."
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

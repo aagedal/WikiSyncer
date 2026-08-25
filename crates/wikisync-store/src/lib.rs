@@ -6857,6 +6857,14 @@ impl Library {
     }
 
     fn activate_pack_sources(&mut self, sources: &[PackSource]) -> Result<PackSummary, StoreError> {
+        self.activate_pack_sources_for_purge(sources, None)
+    }
+
+    fn activate_pack_sources_for_purge(
+        &mut self,
+        sources: &[PackSource],
+        purge_replacement: Option<(u64, &str, u64)>,
+    ) -> Result<PackSummary, StoreError> {
         self.ensure_writable()?;
         let raw_generation: i64 = self.connection.query_row(
             "SELECT COALESCE(MAX(generation), 0) + 1 FROM packs",
@@ -6910,6 +6918,13 @@ impl Library {
             self.config.max_object_bytes,
             entries.len() as u64,
         )?;
+        let verified_pack_bytes = purge_cleanup::checked_regular_file_length(&pack_absolute)?;
+        let verified_index_bytes = purge_cleanup::checked_regular_file_length(&index_absolute)?;
+        if verified_pack_bytes != pack_bytes || verified_index_bytes != index_bytes {
+            return Err(StoreError::CorruptPack(
+                "verified pack lengths changed before activation",
+            ));
+        }
 
         let now = unix_time()?;
         let transaction = self
@@ -6951,6 +6966,101 @@ impl Library {
                     i64::from(entry.delta_depth),
                 ],
             )?;
+        }
+        if let Some((purge_id, old_pack_id, retained_object_count)) = purge_replacement {
+            let raw_purge_id = to_sql_integer(purge_id)?;
+            let work: Option<(i64, Option<String>, String)> = transaction
+                .query_row(
+                    "SELECT retained_object_count, replacement_pack_id, state
+                     FROM purge_pack_work
+                     WHERE purge_id = ?1 AND old_pack_id = ?2",
+                    params![raw_purge_id, old_pack_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let (recorded_retained, recorded_replacement, work_state) = work.ok_or(
+                StoreError::CorruptMetadata("mixed purge pack work disappeared"),
+            )?;
+            if sql_u64(recorded_retained, "invalid retained purge pack count")?
+                != retained_object_count
+                || retained_object_count != entries.len() as u64
+                || recorded_replacement.is_some()
+                || work_state != "pending"
+            {
+                return Err(StoreError::CorruptMetadata(
+                    "mixed purge pack work changed before activation",
+                ));
+            }
+
+            let current_retained_ids = {
+                let mut statement = transaction.prepare(
+                    "SELECT location.object_id
+                     FROM object_locations AS location
+                     LEFT JOIN purge_objects AS selected
+                       ON selected.purge_id = ?1
+                      AND selected.object_id = location.object_id
+                     WHERE location.pack_id = ?2
+                       AND location.verification_state = 'verified'
+                       AND selected.object_id IS NULL
+                     ORDER BY location.object_id LIMIT ?3",
+                )?;
+                statement
+                    .query_map(
+                        params![
+                            raw_purge_id,
+                            old_pack_id,
+                            i64::from(MAX_SUPPORTED_PACK_OBJECTS) + 1
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            if current_retained_ids.len() > MAX_SUPPORTED_PACK_OBJECTS as usize {
+                return Err(StoreError::PackLimitExceeded);
+            }
+            let mut replacement_ids = entries
+                .iter()
+                .map(|entry| entry.id.to_string())
+                .collect::<Vec<_>>();
+            replacement_ids.sort_unstable();
+            if current_retained_ids != replacement_ids {
+                return Err(StoreError::CorruptMetadata(
+                    "mixed purge retained inventory changed before activation",
+                ));
+            }
+
+            transaction.execute(
+                "INSERT INTO purge_replacement_metrics (
+                    purge_id, old_pack_id, replacement_pack_id,
+                    pack_bytes, index_bytes, activated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    raw_purge_id,
+                    old_pack_id,
+                    pack_id,
+                    to_sql_integer(verified_pack_bytes)?,
+                    to_sql_integer(verified_index_bytes)?,
+                    now,
+                ],
+            )?;
+            let changed = transaction.execute(
+                "UPDATE purge_pack_work
+                 SET replacement_pack_id = ?3, state = 'replacement-ready'
+                 WHERE purge_id = ?1 AND old_pack_id = ?2
+                   AND retained_object_count = ?4
+                   AND replacement_pack_id IS NULL AND state = 'pending'",
+                params![
+                    raw_purge_id,
+                    old_pack_id,
+                    pack_id,
+                    to_sql_integer(retained_object_count)?,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::CorruptMetadata(
+                    "mixed purge replacement changed concurrently",
+                ));
+            }
         }
         transaction.commit()?;
 

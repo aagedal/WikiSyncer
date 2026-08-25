@@ -77,6 +77,14 @@ const RECONCILIATION_MISSING_PAGE: &str =
     include_str!("../../../fixtures/mediawiki/reconciliation-missing-page.json");
 const RECONCILIATION_REVISIONS_FROM_MIDDLE: &str =
     include_str!("../../../fixtures/mediawiki/reconciliation-revisions-from-middle.json");
+const RECONCILIATION_RESTORED_TITLE_RESOLUTION: &str =
+    include_str!("../../../fixtures/mediawiki/reconciliation-restored-title-resolution.json");
+const RECONCILIATION_RESTORED_REVISIONS: &str =
+    include_str!("../../../fixtures/mediawiki/reconciliation-restored-revisions.json");
+const RECONCILIATION_CONTENT_RESTORED_MIDDLE: &str =
+    include_str!("../../../fixtures/mediawiki/reconciliation-content-restored-middle.json");
+const RECONCILIATION_CONTENT_RESTORED_HEAD: &str =
+    include_str!("../../../fixtures/mediawiki/reconciliation-content-restored-head.json");
 const REVISION_IMAGES: &str = r#"
 {"parse":{"pageid":25357340,"revid":1300000001,"images":["Fixture.png"]}}
 "#;
@@ -1583,6 +1591,177 @@ async fn missing_page_is_reported_without_discarding_history_or_wedging_the_scop
     let requests = server.finish();
     assert_eq!(requests.len(), 3);
     assert!(requests[2].contains("pageids=25357340"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn moved_page_restoration_preserves_stable_identity_and_all_prior_history() {
+    let server = FixtureServer::start(vec![
+        FixtureResponse::json(TITLE_RESOLUTION),
+        FixtureResponse::json(REVISION_CONTENT),
+        FixtureResponse::json(RECONCILIATION_TITLE_RESOLUTION),
+        FixtureResponse::json(RECONCILIATION_REVISIONS),
+        FixtureResponse::json(RECONCILIATION_CONTENT_MIDDLE),
+        FixtureResponse::json(RECONCILIATION_CONTENT_HEAD),
+        FixtureResponse::json(RECONCILIATION_MISSING_PAGE),
+        FixtureResponse::json(RECONCILIATION_RESTORED_TITLE_RESOLUTION),
+        FixtureResponse::json(RECONCILIATION_RESTORED_REVISIONS),
+        FixtureResponse::json(RECONCILIATION_CONTENT_RESTORED_MIDDLE),
+        FixtureResponse::json(RECONCILIATION_CONTENT_RESTORED_HEAD),
+    ]);
+    let client = MediaWikiClient::new(
+        ClientConfig::new(server.endpoint(), "WikiSyncer/0.1 restoration-test")
+            .expect("client configuration"),
+    )
+    .expect("client");
+    let directory = tempfile::tempdir().expect("temporary library");
+    let mut library = Library::open(directory.path()).expect("library");
+    let wiki_id = library
+        .register_wiki(server.endpoint(), "en")
+        .expect("wiki");
+    let collection_id = library
+        .create_explicit_collection(wiki_id, "Fixture pages")
+        .expect("collection");
+    let selection =
+        TitleSelection::new([PageTitle::new("Rust_programming_language").expect("title")])
+            .expect("selection");
+    let initial =
+        capture_explicit_titles(&client, &mut library, wiki_id, collection_id, &selection)
+            .await
+            .expect("initial capture");
+    let page_id = initial.pages[0].page_id;
+    assert_eq!(page_id.get(), 25_357_340);
+
+    let moved =
+        reconcile_collection_heads(&client, &mut library, wiki_id, collection_id, 1_776_945_600)
+            .await
+            .expect("moved-page reconciliation");
+    assert_eq!(moved.status.state, SyncRunState::Succeeded);
+    assert_eq!(moved.pages_checked, 1);
+    assert_eq!(moved.differing_heads, 1);
+    assert_eq!(moved.revisions_enumerated, 2);
+    assert_eq!(moved.revisions_captured, 2);
+    let moved_page = library
+        .page(wiki_id, page_id)
+        .expect("moved page lookup")
+        .expect("moved page");
+    assert_eq!(moved_page.page_id, page_id);
+    assert_eq!(moved_page.title.as_str(), "Rust language");
+    assert_eq!(
+        moved_page.current_revision_id,
+        Some(RevisionId::new(1_300_000_003).expect("moved head"))
+    );
+    let titles = library
+        .page_titles(wiki_id, page_id)
+        .expect("title history");
+    assert_eq!(
+        titles
+            .iter()
+            .map(|title| title.as_str())
+            .collect::<Vec<_>>(),
+        ["Rust (programming language)", "Rust language"]
+    );
+    let history_before_deletion = library
+        .revisions_for_page(wiki_id, page_id)
+        .expect("history before deletion");
+    assert_eq!(
+        history_before_deletion
+            .iter()
+            .map(|revision| revision.revision_id.get())
+            .collect::<Vec<_>>(),
+        [1_300_000_003, 1_300_000_002, 1_300_000_001]
+    );
+
+    let missing =
+        reconcile_collection_heads(&client, &mut library, wiki_id, collection_id, 1_776_945_700)
+            .await
+            .expect("deleted-page observation");
+    assert_eq!(missing.status.state, SyncRunState::Succeeded);
+    assert_eq!(missing.pages_checked, 1);
+    assert_eq!(missing.missing_pages, 1);
+    assert_eq!(missing.differing_heads, 0);
+    assert_eq!(
+        library
+            .revisions_for_page(wiki_id, page_id)
+            .expect("history retained while missing"),
+        history_before_deletion
+    );
+    assert_eq!(
+        library
+            .page(wiki_id, page_id)
+            .expect("missing page lookup")
+            .expect("missing page metadata")
+            .current_revision_id,
+        Some(RevisionId::new(1_300_000_003).expect("retained head"))
+    );
+
+    let restored =
+        reconcile_collection_heads(&client, &mut library, wiki_id, collection_id, 1_776_945_800)
+            .await
+            .expect("restored-page reconciliation");
+    assert_eq!(restored.status.state, SyncRunState::Succeeded);
+    assert_eq!(restored.pages_checked, 1);
+    assert_eq!(restored.missing_pages, 0);
+    assert_eq!(restored.differing_heads, 1);
+    assert_eq!(restored.revision_batches, 1);
+    assert_eq!(restored.revisions_enumerated, 2);
+    assert_eq!(restored.revisions_captured, 2);
+    let restored_page = library
+        .page(wiki_id, page_id)
+        .expect("restored page lookup")
+        .expect("restored page");
+    assert_eq!(restored_page.page_id, page_id);
+    assert_eq!(restored_page.title.as_str(), "Rust language");
+    assert_eq!(
+        restored_page.current_revision_id,
+        Some(RevisionId::new(1_300_000_005).expect("restored head"))
+    );
+    let restored_history = library
+        .revisions_for_page(wiki_id, page_id)
+        .expect("restored history");
+    assert_eq!(
+        restored_history
+            .iter()
+            .map(|revision| revision.revision_id.get())
+            .collect::<Vec<_>>(),
+        [
+            1_300_000_005,
+            1_300_000_004,
+            1_300_000_003,
+            1_300_000_002,
+            1_300_000_001
+        ]
+    );
+    assert_eq!(
+        &restored_history[2..],
+        history_before_deletion.as_slice(),
+        "restoration must retain the exact canonical records captured before deletion"
+    );
+    assert_eq!(
+        library
+            .read_object(restored_history[1].content_object_id)
+            .expect("restoration intermediate source"),
+        b"== Rust ==\nRestored after deletion with archived history."
+    );
+    assert_eq!(
+        library
+            .read_object(restored_history[0].content_object_id)
+            .expect("restored head source"),
+        b"== Rust ==\nRestored page with a current post-restoration head."
+    );
+    assert_eq!(
+        library.sync_checkpoints().expect("checkpoint")[0].committed_through,
+        1_776_945_800
+    );
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 11);
+    assert!(requests[2].contains("pageids=25357340"));
+    assert!(requests[3].contains("rvstartid=1300000001"));
+    assert!(requests[6].contains("pageids=25357340"));
+    assert!(requests[7].contains("pageids=25357340"));
+    assert!(requests[8].contains("rvstartid=1300000003"));
+    assert!(requests[9].contains("rvstartid=1300000004"));
+    assert!(requests[10].contains("rvstartid=1300000005"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
