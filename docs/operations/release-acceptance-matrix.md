@@ -6,20 +6,20 @@ native environment, command or CI run, and outcome. Credential-free checks canno
 used as evidence for Developer ID, notarization, repository signing, clean-system
 installation, or publication.
 
-Candidate under review: working tree based on `03e14aa` (2026-08-29).
+Candidate under review: working tree based on `23e4aa0` (2026-08-29).
 
 | Evidence | macOS arm64 | Ubuntu x86_64 | Stable-v1 requirement |
 | --- | --- | --- | --- |
 | Format, warning-denied Clippy, workspace tests | Pass: local macOS 27.0 arm64 integrated run, 2026-08-29 | Pending native CI result for this candidate | Required |
 | Representative multi-language GUI/daemon lifecycle | Pass: `en` direct writer plus `nb` daemon writer in full workspace run | Pending native CI result | Required |
 | Older beta schema-11 whole-library migration fixture | Pass in full workspace run | Pending native CI result | Required |
-| Release-candidate archive and layout verification | Pass: 26 credential-free packaging/service-policy tests executed; native-Linux systemd test skipped as designed | Pending native CI result; the release job verifies ELF architecture, systemd units, checksum, and layout | Required |
+| Release-candidate archive and layout verification | Pass: 33 credential-free packaging/service-policy tests executed; native-Linux systemd test skipped as designed | Pending native CI result; the release job verifies ELF architecture, systemd units, checksum, layout, and rootless installation rehearsal, then retains candidate-bound evidence | Required |
 | Release-mode CLI, daemon, and reader outbound audit | Pass: CLI, idle daemon/IPC, and six reader routes; zero outbound attempts | Pending native CI result | Required |
 | Packaged GUI default-launch outbound audit | Pass: bounded no-action launch in an Aqua session; zero outbound attempts | Pending native graphical Ubuntu result; a headless pass must remain explicitly incomplete | Required |
-| Maintained fuzz targets build and bounded smoke corpus | Pass: six bins compile; all six maintained corpora completed bounded direct smoke runs, with the new Action API target rechecked after integration | Pending native Ubuntu result | Required before release |
+| Maintained fuzz targets build and bounded smoke corpus | Pass: six bins compile; all six maintained corpora completed bounded direct smoke runs. The Action API target additionally completed a generated 11-input full-8-MiB-ceiling smoke (422 MiB peak RSS); this is not sustained-campaign evidence | Pending native Ubuntu result | Required before release |
 | Sustained instrumented fuzz campaigns | Partial: five clean 60-second target runs are [recorded](../benchmarks/fuzz-campaign-2026-08-25.md), and the sixth Action API target has a clean [61-second follow-up](../benchmarks/fuzz-campaign-2026-08-29-action-api-json.md); longer campaigns remain | Not recorded | Required before release; bounded runs do not close this row |
 | Signed artifact verification with production identity | Not authorized/provisioned | Not authorized/provisioned | Required for a signed beta |
-| Native install/service/upgrade on a clean supported host | Not recorded | Not recorded | Required |
+| Native install/service/upgrade on a clean supported host | Partial: a current-host rootless archive rehearsal initializes and inspects a fresh private library, exercises daemon health/status/shutdown, and renders launchd assets. It does not install/enable launchd or certify a clean host; no eligible older stable-administration archive was available for the optional upgrade rehearsal | Pending; CI will produce the same rootless rehearsal, not clean-host or enabled-systemd evidence | Required |
 | Gatekeeper/notarization assessment | Not authorized/provisioned | Not applicable | Required on macOS |
 | Independent public-key/repository trust distribution | Not recorded | Not recorded | Required for published packages |
 
@@ -35,6 +35,9 @@ cargo test --workspace --locked
 python3 -m unittest discover -s packaging/tests -p 'test_*.py'
 cargo build --workspace --bins --release --locked
 python3 scripts/release_offline_audit.py --skip-build
+python3 packaging/scripts/assess_install.py \
+  --archive /absolute/path/to/native-candidate.tar.gz \
+  --output /absolute/path/to/install-assessment.json
 ```
 
 On native Ubuntu x86_64, also run the candidate-format and service-template checks:

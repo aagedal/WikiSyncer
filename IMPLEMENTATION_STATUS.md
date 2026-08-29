@@ -504,6 +504,13 @@ Additional release-acceptance hardening now also includes:
   symbolizer limitation are recorded in `docs/benchmarks/fuzz-campaign-2026-08-25.md`
   and `docs/benchmarks/fuzz-campaign-2026-08-29-action-api-json.md`. Longer sustained
   native campaigns remain outstanding;
+- the Action API fuzz boundary now accepts the production response ceiling rather
+  than silently stopping at the routine 256 KiB campaign size. A deterministic,
+  symlink-safe generator derives all seven response kinds at exactly 8 MiB plus the
+  harness selector and adds the typed 50-page, 500-revision, 500-category-member, and
+  4,096-image-reference maxima without committing large fixtures. Its five tests pass,
+  and an 11-input full-ceiling bounded smoke completed cleanly at 422 MiB peak RSS;
+  this does not substitute for a sustained campaign;
 - the missing written renderer evaluation and fixture-backed Milestone 0 API/disk
   characterization artifacts, which record the conservative offline renderer choice,
   its fidelity boundary, reproducible commands, and non-SLA measurements; and
@@ -511,8 +518,20 @@ Additional release-acceptance hardening now also includes:
   results from workflow definitions and credential-free evidence from production
   signing, notarization, clean-system, trust-distribution, and publication gates. The
   current local macOS row records the integrated workspace, packaging, migration,
-  multi-language, fuzz-build/smoke, and release offline-audit results; Ubuntu remains
-  pending native CI evidence for this working tree;
+  multi-language, fuzz-build/smoke, release offline-audit, and rootless archive-
+  rehearsal results. The pinned native release workflow binds each candidate archive
+  and SHA-256 to its generated evidence, retains the complete credential-free evidence
+  set for 30 days, and keeps read-only repository permissions. Ubuntu remains pending
+  actual native CI evidence for this working tree;
+- a bounded rootless native install/upgrade rehearsal that snapshots and validates
+  current or explicitly legacy-layout archives, extracts them into isolated private
+  slots, checks the stable administration surface, initializes and inspects a fresh
+  private library, exercises daemon health/status/shutdown, renders private user-
+  service assets, and emits create-new deterministic JSON evidence. The current macOS
+  archive path passes. The optional older-candidate path migrates before read-only
+  comparison and is fixture-tested, but no eligible older packaged candidate with the
+  stable administration CLI was available for a real archive-to-archive run. The
+  rehearsal neither installs/enables a service nor claims clean-system certification;
 - one bounded application User-Agent policy for every production MediaWiki and dump
   client. `WIKISYNC_OPERATOR_CONTACT` accepts a non-secret public contact, rejects
   malformed or oversized values before contact without echoing them, and safely
@@ -531,7 +550,7 @@ Additional release-acceptance hardening now also includes:
 Workspace formatting, warning-denied Clippy, and all workspace tests pass.
 `cargo-deny 0.20.2` reports advisories, bans, licenses, and sources clean; expected
 duplicate-version and unused-license-allowance diagnostics remain warnings. The
-packaging suite has twenty-seven tests: twenty-six pass on this macOS host and the
+packaging suite has thirty-three tests: thirty-two pass on this macOS host and the
 native-Linux systemd test is skipped as designed. Workflow YAML parsing,
 immutable-action-pin checks, fuzz-target compilation, smoke and bounded instrumented
 runs, fixture checksums, the native release offline audit, and final packaging
@@ -581,11 +600,11 @@ maintained fuzz targets and seed corpora, a native release-mode offline/outbound
 a real older-beta whole-library migration fixture, a representative multi-language
 GUI/daemon lifecycle, a recorded macOS/Ubuntu acceptance matrix, and the historical
 Milestone 0 API/disk and renderer-evaluation artifacts are present. Initial
-instrumented fuzz resource outcomes are now recorded; the next locally actionable
-release-acceptance work is longer sustained campaigns, including larger Action API
-inputs up to the production response ceiling, native Ubuntu execution for the current
-candidate matrix, and a clean-system macOS/Ubuntu install/service/upgrade assessment
-once candidate artifacts are available.
+instrumented fuzz resource outcomes and a production-ceiling Action API seed/smoke
+mechanism are now recorded. The next locally actionable release-acceptance work is
+longer sustained campaigns using those production-sized inputs, native Ubuntu
+execution for the current candidate matrix, and a clean-system macOS/Ubuntu install,
+service-manager, and upgrade assessment once signed candidate artifacts are available.
 
 The credential-free security-exit slice named by the previous checkpoint is now
 implemented: bounded operator-contact configuration reaches every production source

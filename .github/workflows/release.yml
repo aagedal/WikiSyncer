@@ -105,12 +105,22 @@ jobs:
           archive="target/release-candidate/wikisync-${version}-${TARGET_OS}-${target_arch}.tar.gz"
           python3 packaging/scripts/release.py verify-archive --archive "$archive"
           test ! -e target/release-candidate/SHA256SUMS.sig
+          archive_sha256="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$archive")"
+          grep -F -- "$archive_sha256  $(basename "$archive")" target/release-candidate/SHA256SUMS
+          echo "RELEASE_CANDIDATE_ARCHIVE=$archive" >> "$GITHUB_ENV"
+          echo "RELEASE_CANDIDATE_SHA256=$archive_sha256" >> "$GITHUB_ENV"
+          python3 packaging/scripts/assess_install.py \
+            --archive "$archive" \
+            --output target/release-candidate/install-assessment.json
       - name: Record successful native evidence
         env:
           TARGET_OS: ${{ matrix.target_os }}
         run: |
           set -eu
           test -z "$(git status --porcelain --untracked-files=all)"
+          test -f "$RELEASE_CANDIDATE_ARCHIVE"
+          observed_candidate_sha256="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$RELEASE_CANDIDATE_ARCHIVE")"
+          test "$observed_candidate_sha256" = "$RELEASE_CANDIDATE_SHA256"
           evidence=target/release-candidate/native-evidence.md
           lock_sha256="$(python3 -c 'import hashlib; print(hashlib.sha256(open("Cargo.lock", "rb").read()).hexdigest())')"
           finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -119,6 +129,8 @@ jobs:
             echo
             echo "- Result: PASS (all preceding steps in this job completed)"
             echo "- Candidate commit: \`$GITHUB_SHA\` (clean checkout after validation)"
+            echo "- Candidate archive: \`$(basename "$RELEASE_CANDIDATE_ARCHIVE")\`"
+            echo "- Candidate archive SHA-256: \`$RELEASE_CANDIDATE_SHA256\`"
             echo "- Target: \`$TARGET_OS/$(uname -m)\` on \`${{ matrix.runner }}\`"
             echo "- Started: \`$RELEASE_EVIDENCE_STARTED_AT\`"
             echo "- Finished: \`$finished_at\`"
@@ -137,23 +149,49 @@ jobs:
             cargo -V
             echo '```'
             echo
-            echo "Validated commands: formatting, warning-denied Clippy, locked workspace tests, packaging tests, locked release build, default-path offline audit, deterministic packaging, checksum verification, and archive-layout verification."
+            echo "Validated commands: formatting, warning-denied Clippy, locked workspace tests, packaging tests, locked release build, default-path offline audit, deterministic packaging, checksum verification, archive-layout verification, and rootless native install rehearsal."
             if [ "$TARGET_OS" = linux ]; then
               echo "Linux-specific gates: native 64-bit ELF architecture validation and rendered systemd user-unit validation."
             fi
             echo
             echo '```text'
             cat target/release-candidate/offline-audit.log
+            cat target/release-candidate/install-assessment.json
             cat target/release-candidate/SHA256SUMS
             echo '```'
           } > "$evidence"
+          grep -F -- "- Candidate commit: \`$GITHUB_SHA\`" "$evidence"
+          grep -F -- "- Candidate archive: \`$(basename "$RELEASE_CANDIDATE_ARCHIVE")\`" "$evidence"
+          grep -F -- "- Candidate archive SHA-256: \`$RELEASE_CANDIDATE_SHA256\`" "$evidence"
           cat "$evidence"
           cat "$evidence" >> "$GITHUB_STEP_SUMMARY"
+      # actions/upload-artifact v4.6.2. This retains the exact credential-free candidate
+      # beside its native evidence; it does not publish a GitHub Release or sign anything.
+      - name: Preserve candidate-bound native evidence
+        id: preserve-native-evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: wikisync-${{ matrix.target_os }}-native-candidate-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/release-candidate/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+      - name: Record preserved evidence digest
+        env:
+          EVIDENCE_ARTIFACT_DIGEST: ${{ steps.preserve-native-evidence.outputs.artifact-digest }}
+        run: |
+          set -eu
+          test -n "$EVIDENCE_ARTIFACT_DIGEST"
+          echo "Preserved credential-free CI evidence artifact SHA-256: \`$EVIDENCE_ARTIFACT_DIGEST\`" \
+            >> "$GITHUB_STEP_SUMMARY"
 
 # This workflow deliberately performs no publication, platform signing, notarization,
 # Gatekeeper assessment, or secret-backed checksum signing. The macOS plan contains an
 # all-zero certificate fingerprint and an explicitly unprovisioned identity. Real
 # release gates require explicit identities and protected credentials, and the
-# resulting artifacts need separate native review. The final job summary is a native,
-# candidate-bound credential-free record; it is not production signing, graphical
+# resulting artifacts need separate native review. The retained Actions artifact and
+# final job summary are a native, candidate-bound credential-free record; neither is
+# production signing, graphical
 # Linux GUI evidence on a headless runner, or a clean-system install/upgrade result.

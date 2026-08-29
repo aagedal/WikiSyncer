@@ -1,9 +1,13 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use wikisync_mediawiki::{ActionApiResponseKind, validate_action_api_response};
+use wikisync_mediawiki::{
+    ActionApiResponseKind, MAX_ACTION_API_RESPONSE_BYTES, validate_action_api_response,
+};
 
-const MAX_INPUT_BYTES: usize = 256 * 1024;
+// The selector is private to this harness; the remaining bytes are subject to the
+// same 8 MiB ceiling as a production response body.
+const MAX_INPUT_BYTES: usize = MAX_ACTION_API_RESPONSE_BYTES + 1;
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > MAX_INPUT_BYTES {

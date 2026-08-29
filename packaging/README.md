@@ -58,6 +58,61 @@ Run the packaging tests without a Rust build:
 python3 -m unittest discover -s packaging/tests -v
 ```
 
+## Rootless install and upgrade rehearsal
+
+After producing a native candidate archive, exercise its installed layout, fresh
+library initialization, offline inspection commands, foreground daemon lifecycle,
+and rendered user-service assets in a disposable private home directory:
+
+```sh
+python3 packaging/scripts/assess_install.py \
+  --archive target/release-candidate/wikisync-0.1.0-macos-aarch64.tar.gz \
+  --output target/release-candidate/install-assessment.json
+```
+
+To rehearse an archive-to-archive upgrade, also supply an older native candidate. The
+older CLI creates a separate empty library and completes its daemon lifecycle. The
+current CLI then runs `status` first to open that same library through the writable
+forward-migration path. Only after migration does the harness run read-only source
+and collection inspection. The stable JSON source, collection, and status state must
+remain unchanged before the current daemon lifecycle succeeds. Both archives must
+expose the stable administration commands used by the rehearsal; a prototype archive
+from before `init`, source listing, or collection listing is rejected explicitly:
+
+```sh
+python3 packaging/scripts/assess_install.py \
+  --previous-archive /trusted/older/wikisync-0.0.9-macos-aarch64.tar.gz \
+  --archive target/release-candidate/wikisync-0.1.0-macos-aarch64.tar.gz \
+  --output target/release-candidate/install-upgrade-assessment.json
+```
+
+The current candidate must pass the complete current archive-layout policy. The
+previous candidate instead uses the explicit
+`bounded-legacy-upgrade-input-v1` minimum: the same member-count, compressed and
+expanded-size, safe-path, regular-file, mode, ownership, single-root, timestamp, and
+exact-binary checks still apply, while the required documentation is limited to
+`RELEASE.txt`, `LICENSE`, top-level and packaging readmes, plus the platform's primary
+user-service template. This permits genuine earlier candidates that predate newer
+security documents or log-maintenance companions without weakening archive safety or
+silently treating the legacy layout as a publishable current candidate.
+
+The harness snapshots and validates each bounded archive before manual extraction,
+requires its target OS and architecture to match the current host, caps each command
+at 1 MiB per output stream and 1–60 seconds, installs no persistent files, invokes no
+privileged operation, and never calls `launchctl` or `systemctl`. Rendered files are
+private and are structurally parsed with `plistlib` on macOS or, when available,
+`systemd-analyze --user verify` on Linux. The daemon is exercised directly in the
+foreground through its local control plane.
+
+This result is only a rootless archive rehearsal on the current host. It is not
+clean-system certification, does not install or enable a real service-manager unit,
+does not enforce network isolation around the candidate processes, and does not test
+GUI interaction, signing, notarization, Gatekeeper, repository trust, or publication.
+The optional upgrade starts from an empty older library; use the maintained
+materialized migration fixture and native release-acceptance matrix for populated
+schema/data evidence. Final clean-system macOS and Ubuntu installation, service, and
+upgrade assessments remain release-operator work on the actual signed candidates.
+
 ## macOS signing and notarization preparation
 
 On a native unsigned build, `macos-signing-plan` checks that the exact three inputs

@@ -57,6 +57,13 @@ LINUX_ELF_MACHINES = {
 MAX_MACHO_ARCHITECTURES = 32
 MAX_MACHO_LOAD_COMMANDS = 4_096
 MAX_MACHO_ALIGNMENT_EXPONENT = 30
+CURRENT_REQUIRED_RELATIVE_FILES = {
+    "RELEASE.txt",
+    "LICENSE",
+    "README.md",
+    "docs/security/linux-package-repository-trust.md",
+    "docs/security/macos-signing-notarization.md",
+}
 
 
 class ReleaseError(Exception):
@@ -877,7 +884,12 @@ def snapshot_archive(archive_path: Path, expected_sha256: str | None = None) -> 
         raise
 
 
-def verify_archive_file(archive_source: BinaryIO, archive_name: str) -> None:
+def verify_archive_file(
+    archive_source: BinaryIO,
+    archive_name: str,
+    *,
+    required_relative_files: set[str] | None = None,
+) -> None:
     seen: set[str] = set()
     roots: set[str] = set()
     binaries: set[str] = set()
@@ -929,13 +941,12 @@ def verify_archive_file(archive_source: BinaryIO, archive_name: str) -> None:
     root = next(iter(roots))
     if archive_name != f"{root}.tar.gz":
         raise ReleaseError("archive filename must match its top-level directory")
-    required = {
-        f"{root}/RELEASE.txt",
-        f"{root}/LICENSE",
-        f"{root}/README.md",
-        f"{root}/docs/security/linux-package-repository-trust.md",
-        f"{root}/docs/security/macos-signing-notarization.md",
-    }
+    required_relative_files = (
+        CURRENT_REQUIRED_RELATIVE_FILES
+        if required_relative_files is None
+        else required_relative_files
+    )
+    required = {f"{root}/{path}" for path in required_relative_files}
     missing = sorted(required - seen)
     if missing:
         raise ReleaseError(f"archive is missing required files: {', '.join(missing)}")

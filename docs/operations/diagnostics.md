@@ -127,11 +127,18 @@ canonical manifest JSON, embedded identities, strict append sequence, predecesso
 links, and coverage of manifest-eligible successful runs. Full verification also
 performs a stable, bounded metadata scan over revision-to-page/object references,
 locally present parents, page heads, checkpoint advancing runs, search-document/FTS
-pointers, orphan FTS rows, and the current search transformer version. The integrity
-library has Ed25519 trusted-head primitives, but the CLI/GUI does not yet expose key
-storage or anchor export/import. The current schema has no derived-cache table, and
-contentless FTS cannot reproduce its indexed token stream for comparison, so report
-the exact scope rather than saying the archive is universally verified.
+pointers, orphan FTS rows, and the current search transformer version. Full
+verification also checks the bounded media catalog and placements, canonical passive-
+raster bytes, authenticated purge evidence, and unfinished cleanup state. The CLI and
+GUI expose explicit external Ed25519 key and trusted-head workflows: generate or
+import a protected PKCS#8 key, export or refresh a canonical anchor only after clean
+full verification, inspect and compare an independently retained anchor, and rotate
+keys while retaining a recovery anchor. Keep the key and anchor outside the library
+and preserve the anchor through an independent channel; replacing the library together
+with its only anchor defeats rollback comparison. The current schema has no derived-
+cache table, and contentless FTS cannot reproduce its indexed token stream for
+comparison, so report the exact scope rather than saying the archive is universally
+verified or that verification proves source truth.
 
 If verification reports corruption, stop synchronization, keep the original library
 unchanged, and make a permission-preserving copy for investigation. Restoring a known
