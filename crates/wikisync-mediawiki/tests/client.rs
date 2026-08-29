@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use support::{FixtureResponse, FixtureServer};
 use wikisync_core::{PageId, PageTitle};
 use wikisync_mediawiki::{
-    CategoryMemberKind, ClientConfig, ClientError, MediaWikiClient, RetryPolicy, RevisionOrder,
-    TitleResolution,
+    CategoryMemberKind, ClientConfig, ClientError, MediaWikiClient, RecentChangeKind,
+    RecentChangesContinuation, RetryPolicy, RevisionOrder, TitleResolution,
 };
 
 const TITLE_RESOLUTION: &str = include_str!("../../../fixtures/mediawiki/title-resolution.json");
@@ -20,6 +20,16 @@ const CATEGORY_MEMBERS_PAGE_1: &str =
     include_str!("../../../fixtures/mediawiki/category-members-page-1.json");
 const CATEGORY_MEMBERS_PAGE_2: &str =
     include_str!("../../../fixtures/mediawiki/category-members-page-2.json");
+const RECENT_CHANGES_PAGE_1: &str = include_str!("fixtures/recent-changes-page-1.json");
+const RECENT_CHANGES_PAGE_2: &str = include_str!("fixtures/recent-changes-page-2.json");
+const SOURCE_TIMESTAMP: &str = r#"{"batchcomplete":true,"curtimestamp":"2026-08-30T12:05:00Z"}"#;
+const RECENT_CHANGES_WRONG_NAMESPACE: &str = r#"{
+  "curtimestamp":"2026-08-30T12:06:00Z",
+  "query":{"recentchanges":[{
+    "type":"edit","ns":1,"title":"Talk:Wrong","pageid":1,
+    "revid":2,"old_revid":1,"rcid":3,"timestamp":"2026-08-30T12:05:00Z"
+  }]}
+}"#;
 
 fn fixture_client(server: &FixtureServer) -> MediaWikiClient {
     let config = ClientConfig::new(
@@ -193,6 +203,146 @@ async fn category_members_are_namespace_filtered_and_continuation_round_trips() 
     assert!(!requests[0].contains("cmcontinue="));
     assert!(requests[1].contains("continue=-%7C%7C"));
     assert!(requests[1].contains("cmcontinue=page%7C42455441%7C0%7CBETA"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recent_changes_stream_forward_with_identifiers_logs_and_opaque_continuation() {
+    let server = FixtureServer::start(vec![
+        FixtureResponse::json(SOURCE_TIMESTAMP),
+        FixtureResponse::json(RECENT_CHANGES_PAGE_1),
+        FixtureResponse::json(RECENT_CHANGES_PAGE_2),
+    ]);
+    let config = ClientConfig::new(server.endpoint(), "WikiSyncer/0.1 RecentChanges tests")
+        .expect("fixture config")
+        .with_recent_changes_per_request(3)
+        .expect("bounded RecentChanges page size");
+    let client = MediaWikiClient::new(config).expect("fixture client");
+    let race_window_end = client.source_timestamp().await.expect("source timestamp");
+    assert_eq!(race_window_end, "2026-08-30T12:05:00Z");
+
+    let first = client
+        .recent_changes_batch("2026-08-30T12:00:00Z", Some(&race_window_end), None)
+        .await
+        .expect("first RecentChanges page");
+    assert_eq!(first.source_timestamp, "2026-08-30T12:05:00Z");
+    assert_eq!(first.changes.len(), 2, "unrelated protect log is skipped");
+    assert_eq!(first.changes[0].change_id, 7001);
+    assert_eq!(first.changes[0].kind, RecentChangeKind::Edit);
+    assert_eq!(first.changes[0].page_id.expect("page ID").get(), 101);
+    assert_eq!(
+        first.changes[0].revision_id.expect("revision ID").get(),
+        1002
+    );
+    assert_eq!(
+        first.changes[0].old_revision_id.expect("old ID").get(),
+        1001
+    );
+    assert!(first.changes[0].minor);
+    assert_eq!(first.changes[1].kind, RecentChangeKind::New);
+    assert_eq!(first.changes[1].old_revision_id, None);
+    assert_eq!(
+        first.changes[1].user_id, None,
+        "anonymous user ID is absent"
+    );
+    let continuation = first.continuation.expect("continuation");
+    assert_eq!(continuation.generic(), "-||");
+    assert_eq!(continuation.recent_changes(), "20260830120200|7003");
+    let continuation = RecentChangesContinuation::from_parts(
+        continuation.generic(),
+        continuation.recent_changes(),
+    )
+    .expect("persisted continuation reconstructs");
+
+    let second = client
+        .recent_changes_batch(
+            "2026-08-30T12:00:00Z",
+            Some("2026-08-30T12:05:00Z"),
+            Some(&continuation),
+        )
+        .await
+        .expect("second RecentChanges page");
+    assert_eq!(second.source_timestamp, "2026-08-30T12:06:00Z");
+    assert!(second.continuation.is_none());
+    assert_eq!(
+        second
+            .changes
+            .iter()
+            .map(|change| change.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            RecentChangeKind::Move,
+            RecentChangeKind::Delete,
+            RecentChangeKind::Restore
+        ]
+    );
+    let move_log = second.changes[0].log.as_ref().expect("move log metadata");
+    assert_eq!(move_log.log_id, 8001);
+    assert_eq!(move_log.target_namespace, Some(0));
+    assert_eq!(
+        move_log
+            .target_title
+            .as_ref()
+            .expect("move target")
+            .as_str(),
+        "New title"
+    );
+    assert_eq!(second.changes[1].page_id, None);
+    assert_eq!(
+        second.changes[2]
+            .log
+            .as_ref()
+            .expect("restore log")
+            .parameters["count"]["revisions"],
+        3
+    );
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].contains("action=query"));
+    assert!(requests[0].contains("curtimestamp=1"));
+    assert!(!requests[0].contains("list=recentchanges"));
+    assert!(requests[1].contains("list=recentchanges"));
+    assert!(requests[1].contains("rcdir=newer"));
+    assert!(requests[1].contains("rcnamespace=0"));
+    assert!(requests[1].contains("rctype=edit%7Cnew%7Clog"));
+    assert!(requests[1].contains("rclimit=3"));
+    assert!(requests[1].contains("curtimestamp=1"));
+    assert!(requests[1].contains("rcstart=2026-08-30T12%3A00%3A00Z"));
+    assert!(requests[1].contains("rcend=2026-08-30T12%3A05%3A00Z"));
+    assert!(!requests[1].contains("rccontinue="));
+    assert!(requests[2].contains("continue=-%7C%7C"));
+    assert!(requests[2].contains("rccontinue=20260830120200%7C7003"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recent_changes_reject_invalid_windows_and_namespace_amplification() {
+    let no_request_server = FixtureServer::start(Vec::new());
+    let client = fixture_client(&no_request_server);
+    assert!(matches!(
+        client
+            .recent_changes_batch("2026-02-30T00:00:00Z", None, None)
+            .await,
+        Err(ClientError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        client
+            .recent_changes_batch("2026-08-30T12:00:00Z", Some("2026-08-30T11:59:59Z"), None)
+            .await,
+        Err(ClientError::InvalidRequest(_))
+    ));
+    assert!(no_request_server.finish().is_empty());
+
+    let server = FixtureServer::start(vec![FixtureResponse::json(RECENT_CHANGES_WRONG_NAMESPACE)]);
+    let client = fixture_client(&server);
+    assert!(matches!(
+        client
+            .recent_changes_batch("2026-08-30T12:00:00Z", None, None)
+            .await,
+        Err(ClientError::InvalidResponse(
+            "RecentChanges response contained a row outside namespace 0"
+        ))
+    ));
+    server.finish();
 }
 
 #[tokio::test(flavor = "multi_thread")]

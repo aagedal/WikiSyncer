@@ -569,42 +569,62 @@ and signed artifact publication remain.
 
 ## Whole-edition and GUI responsiveness checkpoint
 
-The storage foundation for a current Wikipedia language-edition snapshot is
-implemented and validated, but the end-user workflow is intentionally not exposed as
-complete yet:
+Progressive current-edition ingestion and its end-user entry point are implemented
+and validated:
 
 - `WholeMainNamespace` is a first-class titleless collection rule with a matching
   inclusion reason. It is limited to namespace 0 and current-and-future history, so it
   means all current articles from an accepted snapshot plus later public changes, not
   the complete historical revision archive;
-- schema migration 16 preserves existing configuration, membership, collection-page
-  rows, indexes, triggers, and foreign keys while allowing streamed whole-edition
-  membership;
+- schema migration 17 adds exact whole-edition snapshot/import identity, monotonic
+  artifact and page progress, an idempotent imported-member ledger, durable
+  RecentChanges discovery/application state, collection-wide change-ID deduplication,
+  and explicit long-gap recovery markers;
 - streamed current-revision admission leaves the configuration generation stable,
   rejects non-main namespaces and tombstones, and checks page/canonical-byte budgets
-  before persisting new object bytes; and
+  before persisting new object bytes;
+- authenticated acquisition now verifies the bounded index first and then alternates
+  one resumable artifact download with one streaming parse. Every article is indexed
+  before its durable page cursor advances, so a concurrent reader can read and search
+  completed parts while later parts are still transferring;
+- a fixed RecentChanges race window is durably discovered before dump parsing. Its
+  checkpoint/import/discovery boundary is extended atomically and tailed after every
+  completed artifact, then edits, new pages, moves, deletions, and restorations are
+  applied before the bootstrap checkpoint and manifest commit;
+- ordinary whole-edition updates use bounded forward RecentChanges pagination with
+  overlap and durable continuation. An interval beyond the conservative safe window
+  creates a fail-closed recovery marker and requires a fresh authenticated dump whose
+  closure must resolve that exact marker;
+- large manifest evidence uses schema-4 canonical content-addressed shards for
+  introduced revisions and complete page heads. Reads and full verification replay
+  those shards with bounded keyset access and verify descriptor, range, count, length,
+  canonical bytes, and digest; schemas 1--3 remain readable;
 - the Iced GUI now adapts its header, navigation, metrics, and source fields at compact
   widths, collapses advanced collection policy by default, and uses the hardware-
   accelerated `wgpu` renderer instead of the `tiny-skia` software renderer;
 - the actual first-launch view is now a centered, bounded-width onboarding form with
-  a Wikipedia-edition picker, an optional-images checkbox, a native storage-directory
-  chooser, and a clearly labeled `Start syncing` action. The existing selective-page
-  workflow is retained behind a collapsed advanced action, while an existing library
-  at the chosen location remains directly openable; and
-- the whole-edition start action is disabled and also fails closed if invoked
-  programmatically. It does not create a selective collection or imply that a complete
-  edition has been downloaded. The release GUI binary builds successfully and the
-  first-launch form was inspected in a real macOS window at release optimization.
+  a Wikipedia-edition picker, a native storage-directory chooser, the independently
+  authenticated dump-index identity, and an enabled `Start syncing` action. It commits
+  the metadata-only whole-edition collection, starts the loopback reader, and runs the
+  import concurrently so progressively committed pages are immediately usable. The
+  existing selective-page workflow remains behind a collapsed advanced action.
 
-Whole-edition synchronization remains partial. The existing dump bootstrap still
-filters an already resolved selective collection, ordinary updates still poll known
-pages, and there is no bounded MediaWiki RecentChanges discovery client. Before an
-“All current articles” control can be truthful, the implementation still needs a
-metadata-only edition-bootstrap protocol, streaming dump admission, a source-bound
-dump race-window boundary and RecentChanges closure, long-gap fresh-dump recovery,
-bounded member access and progress reporting, and sharded integrity evidence beyond
-the current 100,000-entry manifest ceiling. The GUI currently fails visibly instead
-of routing this rule through the selective preview/draft path.
+The fixture gate blocks the second dump artifact and proves the first article is
+already searchable while the second is absent; after release it proves both are
+searchable. The same scenario applies a later RecentChanges edit, retains the prior
+revision, and proves an over-age checkpoint creates a durable long-gap marker. Store,
+client, integrity, daemon, and GUI tests additionally cover transfer resume, exact
+restart identities, all supported RecentChanges kinds, hard budgets, metadata-only
+whole-edition administration, sharded restart/tampering, and direct/daemon routing.
+
+Two product boundaries remain explicit. Initial whole-edition ingestion is text-first;
+the optional thumbnail policy applies to later changed articles rather than issuing
+millions of per-page API requests during the dump scan. Starting an authenticated dump
+also still requires a BLAKE3 index digest retained through an independent trusted
+channel; WikiSyncer does not treat a legacy checksum fetched beside the dump as an
+independent trust anchor. Media inventory/placement evidence remains inline under its
+existing 100,000-entry/16 MiB bounds, while the whole-edition revision/head evidence
+that exceeds those bounds is sharded.
 
 The native folder chooser adds `rfd 0.17.2` with its Wayland/XDG portal backend and
 locked macOS support dependencies. Workspace formatting, warning-denied Clippy, and
@@ -641,11 +661,11 @@ protection when the anchor is kept with and can be replaced alongside the librar
 
 ## Next checkpoint
 
-For the newly requested whole-edition product scope, the next safe checkpoint is the
-bounded RecentChanges client and durable discovery state, followed by sharded
-manifest evidence and a streaming dump-bootstrap branch. Only after fixture-backed
-restart, new-page/move/delete/restore, race-window, budget, and long-gap tests pass
-should the GUI expose “All current articles” as an available first-use choice.
+The newly requested progressive whole-edition text-ingestion scope is complete. The
+next product checkpoint is production trust-index publication/distribution and richer
+live progress/cancellation reporting; optional initial-snapshot media ingestion and
+sharded media evidence remain separate storage/bandwidth work rather than prerequisites
+for reading and searching the text edition.
 
 The initial robustness checkpoint and its next local evidence slice are complete:
 maintained fuzz targets and seed corpora, a native release-mode offline/outbound audit,

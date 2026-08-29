@@ -3,8 +3,9 @@
 mod dump_bootstrap;
 
 pub use dump_bootstrap::{
-    DumpBootstrapError, DumpBootstrapReport, DumpClosureReport,
-    bootstrap_collection_from_verified_dump,
+    DumpBootstrapError, DumpBootstrapReport, DumpClosureReport, WholeEditionBootstrapReport,
+    WholeEditionUpdateReport, bootstrap_collection_from_verified_dump,
+    bootstrap_whole_main_namespace_from_trusted_dump, update_whole_main_namespace,
 };
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1493,6 +1494,10 @@ pub async fn bootstrap_collection(
 }
 
 fn parse_mediawiki_timestamp(value: &str, revision_id: RevisionId) -> Result<i64, CaptureError> {
+    mediawiki_timestamp_seconds(value).ok_or(CaptureError::InvalidTimestamp(revision_id))
+}
+
+fn mediawiki_timestamp_seconds(value: &str) -> Option<i64> {
     let bytes = value.as_bytes();
     if bytes.len() != 20
         || bytes[4] != b'-'
@@ -1502,23 +1507,23 @@ fn parse_mediawiki_timestamp(value: &str, revision_id: RevisionId) -> Result<i64
         || bytes[16] != b':'
         || bytes[19] != b'Z'
     {
-        return Err(CaptureError::InvalidTimestamp(revision_id));
+        return None;
     }
     let number =
         |start: usize, end: usize| -> Option<i64> { value.get(start..end)?.parse::<i64>().ok() };
-    let year = number(0, 4).ok_or(CaptureError::InvalidTimestamp(revision_id))?;
-    let month = number(5, 7).ok_or(CaptureError::InvalidTimestamp(revision_id))?;
-    let day = number(8, 10).ok_or(CaptureError::InvalidTimestamp(revision_id))?;
-    let hour = number(11, 13).ok_or(CaptureError::InvalidTimestamp(revision_id))?;
-    let minute = number(14, 16).ok_or(CaptureError::InvalidTimestamp(revision_id))?;
-    let second = number(17, 19).ok_or(CaptureError::InvalidTimestamp(revision_id))?;
+    let year = number(0, 4)?;
+    let month = number(5, 7)?;
+    let day = number(8, 10)?;
+    let hour = number(11, 13)?;
+    let minute = number(14, 16)?;
+    let second = number(17, 19)?;
     if !(1..=12).contains(&month)
         || !(1..=31).contains(&day)
         || hour > 23
         || minute > 59
         || second > 60
     {
-        return Err(CaptureError::InvalidTimestamp(revision_id));
+        return None;
     }
     let adjusted_year = year - i64::from(month <= 2);
     let era = adjusted_year.div_euclid(400);
@@ -1527,7 +1532,7 @@ fn parse_mediawiki_timestamp(value: &str, revision_id: RevisionId) -> Result<i64
     let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     let days = era * 146_097 + day_of_era - 719_468;
-    Ok(days * 86_400 + hour * 3_600 + minute * 60 + second)
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
 }
 
 /// Reconciles every currently selected page against its remote head.
@@ -2002,6 +2007,25 @@ fn index_stored_current_revision(
     title: &PageTitle,
     revision_id: RevisionId,
 ) -> Result<(), CaptureError> {
+    let mut search_index = SqliteSearchIndex::open(library)?;
+    index_stored_current_revision_with(
+        library,
+        &mut search_index,
+        wiki_id,
+        page_id,
+        title,
+        revision_id,
+    )
+}
+
+fn index_stored_current_revision_with(
+    library: &Library,
+    search_index: &mut SqliteSearchIndex,
+    wiki_id: WikiId,
+    page_id: PageId,
+    title: &PageTitle,
+    revision_id: RevisionId,
+) -> Result<(), CaptureError> {
     let revision = library
         .revision(wiki_id, revision_id)?
         .ok_or(StoreError::RevisionNotFound(revision_id))?;
@@ -2015,7 +2039,6 @@ fn index_stored_current_revision(
         .map(PageTitle::into_string)
         .collect::<Vec<_>>()
         .join("\n");
-    let mut search_index = SqliteSearchIndex::open(library)?;
     search_index.index_document(&SearchDocument {
         wiki_id,
         page_id,

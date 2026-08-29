@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 #[derive(Clone, Debug)]
@@ -8,6 +8,7 @@ pub struct FixtureResponse {
     pub status: u16,
     pub body: Vec<u8>,
     pub content_type: &'static str,
+    gate: Option<FixtureGate>,
 }
 
 impl FixtureResponse {
@@ -16,6 +17,7 @@ impl FixtureResponse {
             status: 200,
             body: body.as_ref().as_bytes().to_vec(),
             content_type: "application/json",
+            gate: None,
         }
     }
 
@@ -24,6 +26,7 @@ impl FixtureResponse {
             status: 200,
             body: body.into(),
             content_type,
+            gate: None,
         }
     }
 
@@ -32,6 +35,48 @@ impl FixtureResponse {
             status,
             body: body.as_ref().as_bytes().to_vec(),
             content_type: "application/json",
+            gate: None,
+        }
+    }
+
+    pub fn blocked(mut self, gate: FixtureGate) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FixtureGate {
+    state: Arc<(Mutex<(bool, bool)>, Condvar)>,
+}
+
+impl FixtureGate {
+    pub fn wait_until_requested(&self, timeout: std::time::Duration) -> bool {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("fixture gate lock");
+        if !state.0 {
+            let (updated, _) = changed
+                .wait_timeout(state, timeout)
+                .expect("fixture gate wait");
+            state = updated;
+        }
+        state.0
+    }
+
+    pub fn release(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("fixture gate lock");
+        state.1 = true;
+        changed.notify_all();
+    }
+
+    fn arrive_and_wait(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("fixture gate lock");
+        state.0 = true;
+        changed.notify_all();
+        while !state.1 {
+            state = changed.wait(state).expect("fixture gate wait");
         }
     }
 }
@@ -105,6 +150,9 @@ fn read_request(stream: &mut TcpStream) -> String {
 }
 
 fn write_response(stream: &mut TcpStream, response: FixtureResponse, endpoint: &str) {
+    if let Some(gate) = &response.gate {
+        gate.arrive_and_wait();
+    }
     let body = if response.content_type == "application/json" {
         String::from_utf8(response.body)
             .expect("JSON fixture is UTF-8")

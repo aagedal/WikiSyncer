@@ -12,7 +12,8 @@ mod media;
 
 pub use acquisition::{
     CURRENT_DUMP_ARTIFACT_KIND, CURRENT_DUMP_INDEX_SCHEMA, DumpAcquisitionError,
-    DumpAcquisitionLimits, DumpDigest, TrustedDumpIndex, VerifiedDumpArtifact, VerifiedDumpSet,
+    DumpAcquisitionLimits, DumpDigest, TrustedDumpIndex, VerifiedDumpArtifact,
+    VerifiedDumpInventory, VerifiedDumpSet,
 };
 pub use dump::{
     DumpError, DumpFilter, DumpLimits, DumpNamespace, DumpPage, DumpReader, DumpRevision,
@@ -47,9 +48,13 @@ const DEFAULT_TITLES_PER_OPERATION: usize = 1_000;
 const DEFAULT_TITLES_PER_REQUEST: usize = 50;
 const DEFAULT_REVISIONS_PER_REQUEST: usize = 500;
 const DEFAULT_CATEGORY_MEMBERS_PER_REQUEST: usize = 500;
+const DEFAULT_RECENT_CHANGES_PER_REQUEST: usize = 500;
 const MAX_PAGES_PER_RESPONSE: usize = DEFAULT_TITLES_PER_REQUEST;
 const MAX_REVISIONS_PER_RESPONSE: usize = DEFAULT_REVISIONS_PER_REQUEST;
 const MAX_CATEGORY_MEMBERS_PER_RESPONSE: usize = DEFAULT_CATEGORY_MEMBERS_PER_REQUEST;
+const MAX_RECENT_CHANGES_PER_RESPONSE: usize = DEFAULT_RECENT_CHANGES_PER_REQUEST;
+const MAX_CONTINUATION_BYTES: usize = 4 * 1024;
+const MAX_TIMESTAMP_BYTES: usize = 64;
 const DEFAULT_RETRY_ATTEMPTS: usize = 4;
 const DEFAULT_CIRCUIT_FAILURE_THRESHOLD: usize = 3;
 const MAX_RESOLVED_DESTINATIONS: usize = 32;
@@ -183,6 +188,7 @@ pub struct ClientConfig {
     titles_per_request: NonZeroUsize,
     revisions_per_request: NonZeroUsize,
     category_members_per_request: NonZeroUsize,
+    recent_changes_per_request: NonZeroUsize,
     retry_policy: RetryPolicy,
 }
 
@@ -225,6 +231,7 @@ impl ClientConfig {
             titles_per_request: nonzero(DEFAULT_TITLES_PER_REQUEST),
             revisions_per_request: nonzero(DEFAULT_REVISIONS_PER_REQUEST),
             category_members_per_request: nonzero(DEFAULT_CATEGORY_MEMBERS_PER_REQUEST),
+            recent_changes_per_request: nonzero(DEFAULT_RECENT_CHANGES_PER_REQUEST),
             retry_policy: RetryPolicy::default(),
         })
     }
@@ -347,6 +354,21 @@ impl ClientConfig {
         Ok(self)
     }
 
+    /// Sets the number of RecentChanges entries requested in one bounded response.
+    ///
+    /// MediaWiki caps this at 500 for normal users. Reducing the value is useful
+    /// when a caller wants smaller durable discovery transactions.
+    pub fn with_recent_changes_per_request(mut self, count: usize) -> Result<Self, ConfigError> {
+        if !(1..=MAX_RECENT_CHANGES_PER_RESPONSE).contains(&count) {
+            return Err(ConfigError::InvalidLimit {
+                name: "recent changes per request",
+                maximum: MAX_RECENT_CHANGES_PER_RESPONSE,
+            });
+        }
+        self.recent_changes_per_request = nonzero(count);
+        Ok(self)
+    }
+
     /// Sets the bounded retry and shared circuit-breaker policy.
     #[must_use]
     pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
@@ -357,6 +379,73 @@ impl ClientConfig {
 
 fn nonzero(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).expect("constant limit is non-zero")
+}
+
+fn validate_mediawiki_timestamp(timestamp: &str) -> Result<(), ClientError> {
+    if canonical_mediawiki_timestamp(timestamp) {
+        Ok(())
+    } else {
+        Err(ClientError::InvalidRequest(
+            "RecentChanges timestamps must use canonical UTC YYYY-MM-DDTHH:MM:SSZ form",
+        ))
+    }
+}
+
+fn validate_response_timestamp(timestamp: &str) -> Result<(), ClientError> {
+    if canonical_mediawiki_timestamp(timestamp) {
+        Ok(())
+    } else {
+        Err(ClientError::InvalidResponse(
+            "MediaWiki returned an invalid RecentChanges timestamp",
+        ))
+    }
+}
+
+fn canonical_mediawiki_timestamp(timestamp: &str) -> bool {
+    if timestamp.len() != 20 || timestamp.len() > MAX_TIMESTAMP_BYTES {
+        return false;
+    }
+    let bytes = timestamp.as_bytes();
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+        || bytes.iter().enumerate().any(|(index, byte)| {
+            !matches!(index, 4 | 7 | 10 | 13 | 16 | 19) && !byte.is_ascii_digit()
+        })
+    {
+        return false;
+    }
+
+    let year = parse_timestamp_number(&bytes[0..4]);
+    let month = parse_timestamp_number(&bytes[5..7]);
+    let day = parse_timestamp_number(&bytes[8..10]);
+    let hour = parse_timestamp_number(&bytes[11..13]);
+    let minute = parse_timestamp_number(&bytes[14..16]);
+    let second = parse_timestamp_number(&bytes[17..19]);
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days_in_month).contains(&day) && hour < 24 && minute < 60 && second < 60
+}
+
+fn parse_timestamp_number(bytes: &[u8]) -> u32 {
+    bytes
+        .iter()
+        .fold(0, |value, byte| value * 10 + u32::from(*byte - b'0'))
+}
+
+fn continuation_value_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_CONTINUATION_BYTES
+        && !value.chars().any(char::is_control)
 }
 
 fn validate_endpoint(endpoint: &Url) -> Result<(), ConfigError> {
@@ -1139,6 +1228,74 @@ impl MediaWikiClient {
         parse_category_members_response(response)
     }
 
+    /// Reads a bounded UTC timestamp from the configured source server.
+    ///
+    /// Whole-edition import can retain this value before a long-running dump pass,
+    /// then use it as the start of a fixed RecentChanges race window without
+    /// trusting the local wall clock.
+    pub async fn source_timestamp(&self) -> Result<String, ClientError> {
+        let response: CurrentTimestampResponse = self
+            .get_json(&[("action", "query"), ("curtimestamp", "1")])
+            .await?;
+        validate_response_timestamp(&response.current_timestamp)?;
+        Ok(response.current_timestamp)
+    }
+
+    /// Discovers one bounded page of main-namespace changes in chronological order.
+    ///
+    /// `start_timestamp` is inclusive and must be a canonical MediaWiki UTC
+    /// timestamp (`YYYY-MM-DDTHH:MM:SSZ`). `end_timestamp`, when present, is the
+    /// inclusive upper boundary and must not precede the start. Callers should
+    /// retain an overlap when establishing successive windows because MediaWiki can
+    /// insert RecentChanges rows slightly out of timestamp order.
+    ///
+    /// The returned opaque continuation must be supplied with the same window to
+    /// fetch its next page. Results contain edits, creations, moves, and
+    /// delete/restore log events. Unrelated log events are ignored while their
+    /// continuation position is retained.
+    pub async fn recent_changes_batch(
+        &self,
+        start_timestamp: &str,
+        end_timestamp: Option<&str>,
+        continuation: Option<&RecentChangesContinuation>,
+    ) -> Result<RecentChangesBatch, ClientError> {
+        validate_mediawiki_timestamp(start_timestamp)?;
+        if let Some(end_timestamp) = end_timestamp {
+            validate_mediawiki_timestamp(end_timestamp)?;
+            if start_timestamp > end_timestamp {
+                return Err(ClientError::InvalidRequest(
+                    "RecentChanges start timestamp must not follow its end timestamp",
+                ));
+            }
+        }
+
+        let request_limit = self.config.recent_changes_per_request.get().to_string();
+        let mut params = vec![
+            ("action", "query"),
+            ("list", "recentchanges"),
+            ("rcdir", "newer"),
+            ("rcstart", start_timestamp),
+            ("rcnamespace", "0"),
+            ("rctype", "edit|new|log"),
+            ("curtimestamp", "1"),
+            (
+                "rcprop",
+                "title|ids|sizes|flags|user|userid|timestamp|comment|loginfo",
+            ),
+            ("rclimit", &request_limit),
+        ];
+        if let Some(end_timestamp) = end_timestamp {
+            params.push(("rcend", end_timestamp));
+        }
+        if let Some(continuation) = continuation {
+            params.push(("continue", continuation.generic.as_str()));
+            params.push(("rccontinue", continuation.recent_changes.as_str()));
+        }
+
+        let response: QueryResponse<RecentChangesQuery> = self.get_json(&params).await?;
+        parse_recent_changes_response(response)
+    }
+
     /// Fetches the canonical main-slot source for one known page revision.
     ///
     /// The caller supplies both identities so a malformed or surprising response
@@ -1430,6 +1587,35 @@ fn parse_category_members_response(
     })
 }
 
+fn parse_recent_changes_response(
+    response: QueryResponse<RecentChangesQuery>,
+) -> Result<RecentChangesBatch, ClientError> {
+    let source_timestamp = response
+        .current_timestamp
+        .ok_or(ClientError::InvalidResponse(
+            "RecentChanges response omitted the requested source timestamp",
+        ))?;
+    validate_response_timestamp(&source_timestamp)?;
+    let changes = response
+        .query
+        .recent_changes
+        .into_iter()
+        .map(Option::<RecentChange>::try_from)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    let continuation = response
+        .continuation
+        .map(RecentChangesContinuation::try_from)
+        .transpose()?;
+    Ok(RecentChangesBatch {
+        changes,
+        source_timestamp,
+        continuation,
+    })
+}
+
 /// MediaWiki response shape exercised by [`validate_action_api_response`].
 ///
 /// The variants cover every Action API success payload currently consumed by the
@@ -1449,6 +1635,10 @@ pub enum ActionApiResponseKind {
     RevisionContent,
     /// One resumable page of category members.
     CategoryMembers,
+    /// One resumable forward page of RecentChanges discovery rows.
+    RecentChanges,
+    /// One source-server timestamp used to establish a race-window boundary.
+    SourceTimestamp,
     /// Passive raster references for an exact revision.
     RevisionImages,
     /// Thumbnail attribution and rendition metadata.
@@ -1497,6 +1687,14 @@ pub fn validate_action_api_response(
         ActionApiResponseKind::CategoryMembers => {
             let response: QueryResponse<CategoryMembersQuery> = decode_action_api_json(data, None)?;
             let _ = parse_category_members_response(response)?;
+        }
+        ActionApiResponseKind::RecentChanges => {
+            let response: QueryResponse<RecentChangesQuery> = decode_action_api_json(data, None)?;
+            let _ = parse_recent_changes_response(response)?;
+        }
+        ActionApiResponseKind::SourceTimestamp => {
+            let response: CurrentTimestampResponse = decode_action_api_json(data, None)?;
+            validate_response_timestamp(&response.current_timestamp)?;
         }
         ActionApiResponseKind::RevisionImages => {
             media::validate_revision_images_response(data)?;
@@ -1678,6 +1876,133 @@ pub struct CategoryContinuation {
     category_members: String,
 }
 
+/// One discovery record from MediaWiki's RecentChanges feed.
+///
+/// The Action API does not attach a revision or even a currently public page ID to
+/// every log event, so those identities are optional. `change_id` remains suitable
+/// for deduplicating overlapping discovery windows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecentChange {
+    /// Stable row identity in the source wiki's RecentChanges table.
+    pub change_id: u64,
+    /// Discovery operation represented by this row.
+    pub kind: RecentChangeKind,
+    /// Namespace reported by MediaWiki. This client accepts namespace 0 only.
+    pub namespace: i32,
+    /// Stable page identity when the source can still associate one with the row.
+    pub page_id: Option<PageId>,
+    /// New revision identity for edits and creations, absent for ordinary log rows.
+    pub revision_id: Option<RevisionId>,
+    /// Previous revision identity, absent for a new page or ordinary log row.
+    pub old_revision_id: Option<RevisionId>,
+    /// Title to which MediaWiki attached the RecentChanges row.
+    pub title: PageTitle,
+    /// MediaWiki's UTC ISO-8601 observation timestamp.
+    pub timestamp: String,
+    /// Public actor name or IP, absent when hidden.
+    pub user: Option<String>,
+    /// Public registered-user ID, absent for anonymous or hidden actors.
+    pub user_id: Option<u64>,
+    /// Public edit or log comment, absent when hidden.
+    pub comment: Option<String>,
+    /// Whether MediaWiki marked the edit minor.
+    pub minor: bool,
+    /// Whether MediaWiki marked the actor as a bot.
+    pub bot: bool,
+    /// Previous page length for revision-backed changes, when public.
+    pub old_length: Option<u64>,
+    /// New page length for revision-backed changes, when public.
+    pub new_length: Option<u64>,
+    /// Log identity, action, and parameters for move/delete/restore events.
+    pub log: Option<RecentChangeLogInfo>,
+}
+
+/// A whole-edition change that requires durable reconciliation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecentChangeKind {
+    /// An existing main-namespace page received a revision.
+    Edit,
+    /// A main-namespace page was created.
+    New,
+    /// A page move was recorded in the move log.
+    Move,
+    /// A delete-log event other than restoration was recorded.
+    Delete,
+    /// A page restoration was recorded in the delete log.
+    Restore,
+}
+
+/// Structured log metadata retained for a move/delete/restore RecentChanges row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecentChangeLogInfo {
+    /// Stable logging-table identity.
+    pub log_id: u64,
+    /// MediaWiki log type, normally `move` or `delete` for returned rows.
+    pub log_type: String,
+    /// Type-specific action such as `move`, `delete`, or `restore`.
+    pub log_action: String,
+    /// Move target namespace when MediaWiki supplied new-style move parameters.
+    pub target_namespace: Option<i32>,
+    /// Move target title when MediaWiki supplied new-style move parameters.
+    pub target_title: Option<PageTitle>,
+    /// Complete source-provided parameter object for durable interpretation.
+    ///
+    /// Its allocation remains contained by the response-body byte ceiling.
+    pub parameters: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One bounded forward page of relevant RecentChanges rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecentChangesBatch {
+    /// Relevant rows in source order. This can be empty when an API page contained
+    /// only unrelated main-namespace log events.
+    pub changes: Vec<RecentChange>,
+    /// Source-server UTC timestamp returned with this API page. The first page's
+    /// value can bound a discovery pass without trusting the local wall clock.
+    pub source_timestamp: String,
+    /// Opaque token for the next request in the same window.
+    pub continuation: Option<RecentChangesContinuation>,
+}
+
+/// Opaque MediaWiki continuation values for RecentChanges enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecentChangesContinuation {
+    generic: String,
+    recent_changes: String,
+}
+
+impl RecentChangesContinuation {
+    /// Reconstructs a continuation previously persisted by the caller.
+    pub fn from_parts(
+        generic: impl Into<String>,
+        recent_changes: impl Into<String>,
+    ) -> Result<Self, ClientError> {
+        let generic = generic.into();
+        let recent_changes = recent_changes.into();
+        if !continuation_value_is_valid(&generic) || !continuation_value_is_valid(&recent_changes) {
+            return Err(ClientError::InvalidRequest(
+                "RecentChanges continuation was empty, oversized, or contained controls",
+            ));
+        }
+        Ok(Self {
+            generic,
+            recent_changes,
+        })
+    }
+
+    /// Returns MediaWiki's generic continuation component for durable encoding.
+    #[must_use]
+    pub fn generic(&self) -> &str {
+        &self.generic
+    }
+
+    /// Returns MediaWiki's RecentChanges-specific continuation component.
+    #[must_use]
+    pub fn recent_changes(&self) -> &str {
+        &self.recent_changes
+    }
+}
+
 /// A transport, bound, protocol, or remote API error.
 #[derive(Debug)]
 pub enum ClientError {
@@ -1723,6 +2048,8 @@ pub enum ClientError {
         /// Requested item count.
         actual: usize,
     },
+    /// Caller input cannot form a safe or meaningful Action API request.
+    InvalidRequest(&'static str),
     /// The remote response was valid JSON but violated an expected invariant.
     InvalidResponse(&'static str),
 }
@@ -1794,6 +2121,7 @@ impl fmt::Display for ClientError {
                 formatter,
                 "{operation} requested {actual} items, exceeding the configured limit of {limit}"
             ),
+            Self::InvalidRequest(message) => write!(formatter, "invalid request: {message}"),
             Self::InvalidResponse(message) => {
                 write!(formatter, "invalid MediaWiki response: {message}")
             }
@@ -1866,6 +2194,14 @@ struct QueryResponse<T> {
     query: T,
     #[serde(rename = "continue")]
     continuation: Option<ContinuationPayload>,
+    #[serde(rename = "curtimestamp")]
+    current_timestamp: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CurrentTimestampResponse {
+    #[serde(rename = "curtimestamp")]
+    current_timestamp: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1874,6 +2210,7 @@ struct ContinuationPayload {
     generic: String,
     rvcontinue: Option<String>,
     cmcontinue: Option<String>,
+    rccontinue: Option<String>,
 }
 
 impl TryFrom<ContinuationPayload> for RevisionContinuation {
@@ -1902,6 +2239,27 @@ impl TryFrom<ContinuationPayload> for CategoryContinuation {
     }
 }
 
+impl TryFrom<ContinuationPayload> for RecentChangesContinuation {
+    type Error = ClientError;
+
+    fn try_from(value: ContinuationPayload) -> Result<Self, Self::Error> {
+        let recent_changes = value.rccontinue.ok_or(ClientError::InvalidResponse(
+            "RecentChanges continuation omitted rccontinue",
+        ))?;
+        if !continuation_value_is_valid(&value.generic)
+            || !continuation_value_is_valid(&recent_changes)
+        {
+            return Err(ClientError::InvalidResponse(
+                "RecentChanges continuation was empty, oversized, or contained controls",
+            ));
+        }
+        Ok(Self {
+            generic: value.generic,
+            recent_changes,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct PagesQuery {
     #[serde(deserialize_with = "deserialize_pages")]
@@ -1915,6 +2273,191 @@ struct CategoryMembersQuery {
         deserialize_with = "deserialize_category_members"
     )]
     category_members: Vec<CategoryMemberPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecentChangesQuery {
+    #[serde(
+        rename = "recentchanges",
+        deserialize_with = "deserialize_recent_changes"
+    )]
+    recent_changes: Vec<RecentChangePayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecentChangePayload {
+    #[serde(rename = "type")]
+    change_type: String,
+    ns: i32,
+    title: String,
+    #[serde(rename = "pageid")]
+    page_id: Option<u64>,
+    #[serde(rename = "revid")]
+    revision_id: Option<u64>,
+    #[serde(rename = "old_revid")]
+    old_revision_id: Option<u64>,
+    #[serde(rename = "rcid")]
+    change_id: u64,
+    timestamp: String,
+    user: Option<String>,
+    #[serde(rename = "userid")]
+    user_id: Option<u64>,
+    comment: Option<String>,
+    #[serde(default)]
+    minor: bool,
+    #[serde(default)]
+    bot: bool,
+    #[serde(rename = "oldlen")]
+    old_length: Option<u64>,
+    #[serde(rename = "newlen")]
+    new_length: Option<u64>,
+    #[serde(rename = "logid")]
+    log_id: Option<u64>,
+    #[serde(rename = "logtype")]
+    log_type: Option<String>,
+    #[serde(rename = "logaction")]
+    log_action: Option<String>,
+    #[serde(default, rename = "logparams")]
+    log_parameters: serde_json::Map<String, serde_json::Value>,
+}
+
+impl TryFrom<RecentChangePayload> for Option<RecentChange> {
+    type Error = ClientError;
+
+    fn try_from(change: RecentChangePayload) -> Result<Self, Self::Error> {
+        if change.ns != wikisync_core::MAIN_NAMESPACE {
+            return Err(ClientError::InvalidResponse(
+                "RecentChanges response contained a row outside namespace 0",
+            ));
+        }
+        if change.change_id == 0 {
+            return Err(ClientError::InvalidResponse(
+                "RecentChanges response contained a zero change ID",
+            ));
+        }
+        validate_response_timestamp(&change.timestamp)?;
+        let title = PageTitle::new(change.title).map_err(|_| {
+            ClientError::InvalidResponse("MediaWiki returned an invalid RecentChanges title")
+        })?;
+
+        let page_id = optional_page_id(change.page_id)?;
+        let revision_id = optional_revision_id(change.revision_id)?;
+        let old_revision_id = optional_revision_id(change.old_revision_id)?;
+        let (kind, log) = match change.change_type.as_str() {
+            "edit" => {
+                if page_id.is_none() || revision_id.is_none() {
+                    return Err(ClientError::InvalidResponse(
+                        "RecentChanges edit omitted its page or revision ID",
+                    ));
+                }
+                (RecentChangeKind::Edit, None)
+            }
+            "new" => {
+                if page_id.is_none() || revision_id.is_none() {
+                    return Err(ClientError::InvalidResponse(
+                        "RecentChanges creation omitted its page or revision ID",
+                    ));
+                }
+                (RecentChangeKind::New, None)
+            }
+            "log" => {
+                let log_type = change.log_type.ok_or(ClientError::InvalidResponse(
+                    "RecentChanges log row omitted its log type",
+                ))?;
+                let log_action = change.log_action.ok_or(ClientError::InvalidResponse(
+                    "RecentChanges log row omitted its log action",
+                ))?;
+                let kind = match (log_type.as_str(), log_action.as_str()) {
+                    ("move", _) => RecentChangeKind::Move,
+                    ("delete", "restore") => RecentChangeKind::Restore,
+                    ("delete", _) => RecentChangeKind::Delete,
+                    _ => return Ok(None),
+                };
+                let log_id = change.log_id.filter(|log_id| *log_id != 0).ok_or(
+                    ClientError::InvalidResponse("RecentChanges log row omitted its log ID"),
+                )?;
+                let target_namespace = change
+                    .log_parameters
+                    .get("target_ns")
+                    .and_then(serde_json::Value::as_i64)
+                    .map(i32::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        ClientError::InvalidResponse(
+                            "RecentChanges move target namespace was out of range",
+                        )
+                    })?;
+                let target_title = change
+                    .log_parameters
+                    .get("target_title")
+                    .and_then(serde_json::Value::as_str)
+                    .map(PageTitle::new)
+                    .transpose()
+                    .map_err(|_| {
+                        ClientError::InvalidResponse(
+                            "MediaWiki returned an invalid RecentChanges move target title",
+                        )
+                    })?;
+                (
+                    kind,
+                    Some(RecentChangeLogInfo {
+                        log_id,
+                        log_type,
+                        log_action,
+                        target_namespace,
+                        target_title,
+                        parameters: change.log_parameters,
+                    }),
+                )
+            }
+            _ => {
+                return Err(ClientError::InvalidResponse(
+                    "RecentChanges response contained an unrequested change type",
+                ));
+            }
+        };
+
+        Ok(Some(RecentChange {
+            change_id: change.change_id,
+            kind,
+            namespace: change.ns,
+            page_id,
+            revision_id,
+            old_revision_id,
+            title,
+            timestamp: change.timestamp,
+            user: change.user,
+            user_id: change.user_id.filter(|user_id| *user_id != 0),
+            comment: change.comment,
+            minor: change.minor,
+            bot: change.bot,
+            old_length: change.old_length,
+            new_length: change.new_length,
+            log,
+        }))
+    }
+}
+
+fn optional_page_id(value: Option<u64>) -> Result<Option<PageId>, ClientError> {
+    value
+        .filter(|value| *value != 0)
+        .map(|value| {
+            value.try_into().map_err(|_| {
+                ClientError::InvalidResponse("RecentChanges returned an invalid page ID")
+            })
+        })
+        .transpose()
+}
+
+fn optional_revision_id(value: Option<u64>) -> Result<Option<RevisionId>, ClientError> {
+    value
+        .filter(|value| *value != 0)
+        .map(|value| {
+            value.try_into().map_err(|_| {
+                ClientError::InvalidResponse("RecentChanges returned an invalid revision ID")
+            })
+        })
+        .transpose()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1982,6 +2525,13 @@ where
         deserializer,
         "category members",
     )
+}
+
+fn deserialize_recent_changes<'de, D>(deserializer: D) -> Result<Vec<RecentChangePayload>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec::<_, _, MAX_RECENT_CHANGES_PER_RESPONSE>(deserializer, "recent changes")
 }
 
 fn deserialize_optional_revisions<'de, D>(
@@ -2630,6 +3180,28 @@ mod tests {
             }))
             .is_err()
         );
+
+        let recent_changes = std::iter::repeat_n(
+            serde_json::json!({
+                "type": "edit",
+                "ns": 0,
+                "title": "Bounded",
+                "pageid": 42,
+                "revid": 100,
+                "old_revid": 99,
+                "rcid": 200,
+                "timestamp": "2026-08-29T00:00:00Z"
+            }),
+            MAX_RECENT_CHANGES_PER_RESPONSE + 1,
+        )
+        .collect::<Vec<_>>();
+        assert!(
+            serde_json::from_value::<QueryResponse<RecentChangesQuery>>(serde_json::json!({
+                "curtimestamp": "2026-08-29T00:01:00Z",
+                "query": {"recentchanges": recent_changes}
+            }))
+            .is_err()
+        );
     }
 
     #[cfg(feature = "fuzzing")]
@@ -2655,6 +3227,14 @@ mod tests {
             (
                 ActionApiResponseKind::CategoryMembers,
                 r#"{"query":{"categorymembers":[]}}"#,
+            ),
+            (
+                ActionApiResponseKind::RecentChanges,
+                r#"{"curtimestamp":"2026-08-29T00:01:00Z","query":{"recentchanges":[]}}"#,
+            ),
+            (
+                ActionApiResponseKind::SourceTimestamp,
+                r#"{"curtimestamp":"2026-08-29T00:01:00Z"}"#,
             ),
             (
                 ActionApiResponseKind::RevisionImages,

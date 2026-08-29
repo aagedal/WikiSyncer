@@ -27,13 +27,13 @@ use wikisync_integrity::{
 };
 use wikisync_mediawiki::ClientConfig;
 use wikisync_store::{
-    CollectionSchedule, DumpImportStatus, Library, NetworkTransferPolicy, PurgeJournalState,
-    PurgePreview, ScheduleCadence, StoredCollection, StoredCollectionConfiguration, StoredWiki,
-    SyncCheckpoint, SyncRunState, SyncRunStatus,
+    CollectionSchedule, CollectionStatus, DumpImportStatus, Library, NetworkTransferPolicy,
+    PurgeJournalState, PurgePreview, ScheduleCadence, StoredCollection,
+    StoredCollectionConfiguration, StoredWiki, SyncCheckpoint, SyncRunState, SyncRunStatus,
 };
 use wikisync_sync::{
     CategoryPreviewLimits, CollectionSelectionPreview, bootstrap_collection, parse_title_list,
-    preview_collection_rule, reconcile_collection_heads,
+    preview_collection_rule, reconcile_collection_heads, update_whole_main_namespace,
 };
 use wikisync_web::ReaderHandle;
 use wikisyncd::{
@@ -51,7 +51,7 @@ use dump::{DumpBootstrapForm, DumpBootstrapPreview, INDEPENDENT_ANCHOR_NOTICE};
 const DATABASE_NAME: &str = "library.sqlite3";
 const RECENT_REVISION_LIMIT: u32 = 12;
 const MAX_SIGNING_KEY_BYTES: u64 = 16 * 1024;
-const WHOLE_EDITION_SYNC_AVAILABLE: bool = false;
+const WHOLE_EDITION_SYNC_AVAILABLE: bool = true;
 
 fn main() -> iced::Result {
     iced::application("WikiSyncer", App::update, App::view)
@@ -196,6 +196,7 @@ impl App {
             }
             Message::OnboardingEditionChanged(edition) => {
                 self.onboarding.edition = edition;
+                self.dump_bootstrap_form.expected_database = edition.database_name().to_owned();
             }
             Message::OnboardingImagesChanged(download_images) => {
                 self.onboarding.download_images = download_images;
@@ -225,10 +226,71 @@ impl App {
                 }
             }
             Message::StartEditionSync => {
-                self.notice = Some(Notice::error(
-                    "Whole-edition synchronization is not enabled yet. WikiSyncer will not claim a complete offline edition until dump import and change-window closure are both durable.",
+                if self.is_busy() {
+                    return Task::none();
+                }
+                if !self.privacy_acknowledged {
+                    self.notice = Some(Notice::error(
+                        "Please acknowledge how local data and public editor metadata are stored.",
+                    ));
+                    return Task::none();
+                }
+                let path = PathBuf::from(self.onboarding.storage_path.trim());
+                self.library_path = path.display().to_string();
+                self.dump_bootstrap_form.expected_database =
+                    self.onboarding.edition.database_name().to_owned();
+                self.notice = Some(Notice::success(
+                    "Preparing the offline edition. The reader will open as soon as streaming begins.",
                 ));
+                let key = self.begin_request(path.clone());
+                return edition_prepare_task(
+                    key,
+                    path,
+                    self.onboarding.clone(),
+                    self.dump_bootstrap_form.clone(),
+                );
             }
+            Message::EditionPrepared(completion) => {
+                let completion = *completion;
+                if !self.finish_request(&completion.key) {
+                    return Task::none();
+                }
+                match completion.result {
+                    Ok(prepared) => {
+                        self.network_policy_editor =
+                            NetworkPolicyEditor::from_policy(prepared.snapshot.network_policy);
+                        self.snapshot = Some(prepared.snapshot);
+                        self.screen = Screen::Dashboard;
+                        self.path_status = PathStatus::ExistingLibrary;
+                        self.notice = Some(Notice::success(
+                            "Streaming has started. The reader opens now and gains articles and search results as each dump part commits.",
+                        ));
+                        let path = completion.key.path;
+                        let key = self.begin_request(path.clone());
+                        return Task::batch([
+                            progressive_reader_task(path.clone()),
+                            dump_bootstrap_task(key, path, prepared.preview),
+                        ]);
+                    }
+                    Err(error) => self.notice = Some(Notice::error(error)),
+                }
+            }
+            Message::ProgressiveReaderStarted(result) => match result {
+                Ok(reader) => {
+                    let url = reader.local_url().to_owned();
+                    self.reader = Some(reader);
+                    if let Err(error) = open_system_browser(&url) {
+                        self.notice = Some(Notice::error(format!(
+                            "Streaming continues, but the local reader could not be opened: {error}"
+                        )));
+                    }
+                }
+                Err(error) => {
+                    self.notice = Some(Notice::error(format!(
+                        "Streaming continues, but the local reader could not start: {error}"
+                    )));
+                }
+            },
             Message::Refresh => {
                 if self.is_busy() {
                     return Task::none();
@@ -1486,7 +1548,14 @@ impl App {
         let can_start = WHOLE_EDITION_SYNC_AVAILABLE
             && !self.is_busy()
             && self.path_status == PathStatus::NewLibrary
-            && !self.onboarding.storage_path.trim().is_empty();
+            && !self.onboarding.storage_path.trim().is_empty()
+            && self.privacy_acknowledged
+            && !self.dump_bootstrap_form.trusted_index_url.trim().is_empty()
+            && !self
+                .dump_bootstrap_form
+                .trusted_index_digest
+                .trim()
+                .is_empty();
         let start = button("Start syncing")
             .padding([12, 18])
             .on_press_maybe(can_start.then_some(Message::StartEditionSync));
@@ -1550,16 +1619,29 @@ impl App {
             .padding(11)
             .width(Length::Fill),
             checkbox(
-                "Download article images (uses considerably more storage)",
+                "Capture thumbnails for later article updates (the initial dump streams text first)",
                 self.onboarding.download_images,
             )
             .on_toggle(Message::OnboardingImagesChanged),
             text("Storage location").size(17),
             storage_control,
             text(path_message).size(13),
+            text("Authenticated dump index").size(17),
+            text(INDEPENDENT_ANCHOR_NOTICE).size(13),
+            text_input("Trusted dump index URL", &self.dump_bootstrap_form.trusted_index_url)
+                .on_input(Message::DumpIndexUrlChanged)
+                .padding(10),
+            text_input("Independently retained BLAKE3 digest (64 hex digits)", &self.dump_bootstrap_form.trusted_index_digest)
+                .on_input(Message::DumpIndexDigestChanged)
+                .padding(10),
+            checkbox(
+                "I understand that saved articles may include public editor metadata and that the folder is not encrypted.",
+                self.privacy_acknowledged,
+            )
+            .on_toggle(Message::PrivacyAcknowledged),
             Space::new(Length::Shrink, 6),
             start,
-            text("Whole-edition download is not enabled in this test build yet. The button will become available when durable dump import and change discovery are complete.").size(13),
+            text("Articles become readable and searchable as authenticated dump parts finish; the full edition and its change-window closure continue in the background.").size(13),
             horizontal_rule(1),
             existing_library,
             advanced_create,
@@ -1701,15 +1783,18 @@ impl App {
         };
         let can_start = WHOLE_EDITION_SYNC_AVAILABLE
             && !self.is_busy()
-            && !self.onboarding.storage_path.trim().is_empty();
+            && !self.onboarding.storage_path.trim().is_empty()
+            && self.privacy_acknowledged
+            && !self.dump_bootstrap_form.trusted_index_url.trim().is_empty()
+            && !self
+                .dump_bootstrap_form
+                .trusted_index_digest
+                .trim()
+                .is_empty();
         let start = button("Start syncing")
             .padding([12, 18])
             .on_press_maybe(can_start.then_some(Message::StartEditionSync));
-        let sync_status = if WHOLE_EDITION_SYNC_AVAILABLE {
-            "WikiSyncer will download the selected current language edition and keep it updated."
-        } else {
-            "Whole-edition download is not enabled in this test build yet. The storage layer is ready; durable dump import and change discovery are the remaining backend work."
-        };
+        let sync_status = "The local reader opens when streaming starts. Articles and search results appear as authenticated dump parts commit.";
 
         let content = column![
             text("Set up offline Wikipedia").size(36),
@@ -1724,12 +1809,25 @@ impl App {
             .padding(11)
             .width(Length::Fill),
             checkbox(
-                "Download article images (uses considerably more storage)",
+                "Capture thumbnails for later article updates (the initial dump streams text first)",
                 self.onboarding.download_images,
             )
             .on_toggle(Message::OnboardingImagesChanged),
             text("Storage location").size(17),
             storage_control,
+            text("Authenticated dump index").size(17),
+            text(INDEPENDENT_ANCHOR_NOTICE).size(13),
+            text_input("Trusted dump index URL", &self.dump_bootstrap_form.trusted_index_url)
+                .on_input(Message::DumpIndexUrlChanged)
+                .padding(10),
+            text_input("Independently retained BLAKE3 digest (64 hex digits)", &self.dump_bootstrap_form.trusted_index_digest)
+                .on_input(Message::DumpIndexDigestChanged)
+                .padding(10),
+            checkbox(
+                "I understand that saved articles may include public editor metadata and that the folder is not encrypted.",
+                self.privacy_acknowledged,
+            )
+            .on_toggle(Message::PrivacyAcknowledged),
             Space::new(Length::Shrink, 6),
             start,
             text(sync_status).size(13),
@@ -2455,7 +2553,7 @@ impl App {
         container(
             column![
                 text("Authenticated current-dump bootstrap").size(23),
-                text("Use a current-page dump only for an already resolved current-and-future collection. Previewing is read-only; starting is a separate single-writer action."),
+                text("Use a current-page dump for a current-and-future collection. Selective collections import only resolved members; whole-edition collections progressively admit every main-namespace page. Previewing is read-only; starting is a separate single-writer action."),
                 text(INDEPENDENT_ANCHOR_NOTICE).size(13),
                 row![
                     text_input("Collection ID", &form.collection_id)
@@ -2647,7 +2745,43 @@ impl fmt::Display for WikipediaEdition {
     }
 }
 
-#[derive(Debug)]
+impl WikipediaEdition {
+    const fn language_code(self) -> &'static str {
+        match self {
+            Self::English => "en",
+            Self::NorwegianBokmal => "nb",
+            Self::NorwegianNynorsk => "nn",
+            Self::Swedish => "sv",
+            Self::Danish => "da",
+            Self::German => "de",
+            Self::French => "fr",
+            Self::Spanish => "es",
+        }
+    }
+
+    const fn database_name(self) -> &'static str {
+        match self {
+            Self::English => "enwiki",
+            Self::NorwegianBokmal => "nowiki",
+            Self::NorwegianNynorsk => "nnwiki",
+            Self::Swedish => "svwiki",
+            Self::Danish => "dawiki",
+            Self::German => "dewiki",
+            Self::French => "frwiki",
+            Self::Spanish => "eswiki",
+        }
+    }
+
+    fn api_endpoint(self) -> String {
+        let domain = match self {
+            Self::NorwegianBokmal => "no",
+            _ => self.language_code(),
+        };
+        format!("https://{domain}.wikipedia.org/w/api.php")
+    }
+}
+
+#[derive(Clone, Debug)]
 struct OnboardingForm {
     edition: WikipediaEdition,
     download_images: bool,
@@ -2696,6 +2830,8 @@ enum Message {
     ChooseOnboardingStorage,
     OnboardingStorageChosen(Option<PathBuf>),
     StartEditionSync,
+    EditionPrepared(Box<ScopedResult<EditionPreparation>>),
+    ProgressiveReaderStarted(Result<Arc<ReaderHandle>, String>),
     Refresh,
     ChooseAnotherLibrary,
     CollectionNameChanged(String),
@@ -2842,6 +2978,12 @@ struct DashboardSnapshot {
     recent_unique_object_count: usize,
     storage_usage: Result<StorageUsage, String>,
     schema_version: u32,
+}
+
+#[derive(Clone, Debug)]
+struct EditionPreparation {
+    snapshot: DashboardSnapshot,
+    preview: DumpBootstrapPreview,
 }
 
 impl DashboardSnapshot {
@@ -3570,6 +3712,33 @@ fn dump_preview_task(key: RequestKey, path: PathBuf, form: DumpBootstrapForm) ->
     )
 }
 
+fn edition_prepare_task(
+    key: RequestKey,
+    path: PathBuf,
+    onboarding: OnboardingForm,
+    form: DumpBootstrapForm,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = prepare_whole_edition(&path, onboarding, form).await;
+            ScopedResult { key, result }
+        },
+        |completion| Message::EditionPrepared(Box::new(completion)),
+    )
+}
+
+fn progressive_reader_task(path: PathBuf) -> Task<Message> {
+    Task::perform(
+        async move {
+            wikisync_web::start_loopback(path)
+                .await
+                .map(Arc::new)
+                .map_err(|error| error.to_string())
+        },
+        Message::ProgressiveReaderStarted,
+    )
+}
+
 fn dump_bootstrap_task(
     key: RequestKey,
     path: PathBuf,
@@ -3703,6 +3872,143 @@ fn load_library_snapshot(path: &Path, create: bool) -> Result<DashboardSnapshot,
 
 async fn create_collection(request: CreateCollectionRequest) -> Result<DashboardSnapshot, String> {
     create_collection_and_sync(&request).await
+}
+
+async fn prepare_whole_edition(
+    path: &Path,
+    onboarding: OnboardingForm,
+    mut form: DumpBootstrapForm,
+) -> Result<EditionPreparation, String> {
+    if path.as_os_str().is_empty() {
+        return Err("Choose a library directory.".to_owned());
+    }
+    if !path.join(DATABASE_NAME).is_file() {
+        fs::create_dir_all(path).map_err(|error| error.to_string())?;
+        let _lease = WriterLease::acquire(path).map_err(|error| error.to_string())?;
+        Library::open(path).map_err(|error| error.to_string())?;
+    }
+    let endpoint = onboarding.edition.api_endpoint();
+    let language_code = onboarding.edition.language_code().to_owned();
+    let image_policy = if onboarding.download_images {
+        ImagePolicy::Thumbnails(ThumbnailPolicy::default())
+    } else {
+        ImagePolicy::None
+    };
+    let collection_id = match WriterAccess::discover(path).map_err(|error| error.to_string())? {
+        WriterAccess::Direct(_lease) => {
+            let mut library = Library::open(path).map_err(|error| error.to_string())?;
+            let existing_wiki = library
+                .wikis()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|wiki| wiki.api_endpoint == endpoint && wiki.language_code == language_code)
+                .map(|wiki| wiki.wiki_id);
+            let wiki_id = match existing_wiki {
+                Some(wiki_id) => wiki_id,
+                None => library
+                    .register_wiki(&endpoint, &language_code)
+                    .map_err(|error| error.to_string())?,
+            };
+            if let Some(collection_id) = existing_whole_edition(&library, wiki_id)? {
+                collection_id
+            } else {
+                added_collection_id(
+                    administer_collection_direct(
+                        &mut library,
+                        CollectionAdministration::AddWithImagePolicy {
+                            draft: whole_edition_draft(wiki_id, onboarding.edition),
+                            image_policy,
+                        },
+                    )
+                    .map_err(|error| error.to_string())?,
+                )?
+            }
+        }
+        WriterAccess::Daemon(client) => {
+            let library = Library::open_read_only(path).map_err(|error| error.to_string())?;
+            let existing = library
+                .wikis()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|wiki| wiki.api_endpoint == endpoint && wiki.language_code == language_code)
+                .map(|wiki| wiki.wiki_id);
+            let existing_collection = existing
+                .map(|wiki_id| existing_whole_edition(&library, wiki_id))
+                .transpose()?
+                .flatten();
+            drop(library);
+            if let Some(collection_id) = existing_collection {
+                collection_id
+            } else {
+                let wiki_id = match existing {
+                    Some(wiki_id) => wiki_id,
+                    None => {
+                        added_source(
+                            client
+                                .administer_source(SourceAdministration::Add {
+                                    api_endpoint: endpoint,
+                                    language_code,
+                                })
+                                .map_err(|error| error.to_string())?,
+                        )?
+                        .0
+                    }
+                };
+                added_collection_id(
+                    client
+                        .administer_collection(CollectionAdministration::AddWithImagePolicy {
+                            draft: whole_edition_draft(wiki_id, onboarding.edition),
+                            image_policy,
+                        })
+                        .map_err(|error| error.to_string())?,
+                )?
+            }
+        }
+    };
+    form.collection_id = collection_id.get().to_string();
+    form.expected_database = onboarding.edition.database_name().to_owned();
+    let preview = form.preview(path)?;
+    let library = Library::open_read_only(path).map_err(|error| error.to_string())?;
+    Ok(EditionPreparation {
+        snapshot: snapshot(&library)?,
+        preview,
+    })
+}
+
+fn existing_whole_edition(
+    library: &Library,
+    wiki_id: WikiId,
+) -> Result<Option<CollectionId>, String> {
+    for collection in library.collections().map_err(|error| error.to_string())? {
+        if collection.wiki_id != wiki_id || collection.status != CollectionStatus::Active {
+            continue;
+        }
+        let configuration = library
+            .collection_configuration(collection.collection_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Collection configuration is unavailable.".to_owned())?;
+        if configuration.rule == CollectionRule::WholeMainNamespace {
+            return Ok(Some(collection.collection_id));
+        }
+    }
+    Ok(None)
+}
+
+fn whole_edition_draft(wiki_id: WikiId, edition: WikipediaEdition) -> CollectionDraft {
+    CollectionDraft {
+        wiki_id,
+        name: edition.to_string(),
+        preview: CollectionSelectionPreview {
+            rule: CollectionRule::WholeMainNamespace,
+            members: Vec::new(),
+            missing_titles: Vec::new(),
+            predicted_canonical_bytes: None,
+            category_batches: 0,
+        },
+        history_policy: HistoryPolicy::CurrentAndFuture,
+        budget: CollectionBudget::unlimited(),
+        removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+    }
 }
 
 async fn preview_collection(
@@ -4126,15 +4432,21 @@ async fn update_collection(
         .duration_since(UNIX_EPOCH)
         .map_err(|_| "System clock is before the Unix epoch.".to_owned())?
         .as_secs();
-    reconcile_collection_heads(
-        &client,
-        &mut library,
-        configuration.wiki_id,
-        collection_id,
-        checkpoint,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
+    if configuration.rule == CollectionRule::WholeMainNamespace {
+        update_whole_main_namespace(&client, &mut library, collection_id)
+            .await
+            .map_err(|error| error.to_string())?;
+    } else {
+        reconcile_collection_heads(
+            &client,
+            &mut library,
+            configuration.wiki_id,
+            collection_id,
+            checkpoint,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
     snapshot(&library)
 }
 
@@ -5565,7 +5877,7 @@ mod tests {
     }
 
     #[test]
-    fn forged_whole_edition_start_fails_closed_without_beginning_work() {
+    fn whole_edition_start_requires_privacy_and_trust_inputs() {
         let (mut app, initial_task) = App::new();
         drop(initial_task);
 
@@ -5575,7 +5887,7 @@ mod tests {
         assert!(
             app.notice
                 .as_ref()
-                .is_some_and(|notice| notice.message.contains("not enabled yet"))
+                .is_some_and(|notice| notice.message.contains("Please acknowledge"))
         );
     }
     const NORWEGIAN_UNCHANGED_HEAD: &str = r#"{
@@ -5885,11 +6197,41 @@ mod tests {
 
         let created = load_library_snapshot(&root, true).expect("create library");
         assert_eq!(created.path, root);
-        assert_eq!(created.schema_version, 16);
+        assert_eq!(created.schema_version, 17);
         assert!(root.join(DATABASE_NAME).is_file());
 
         let reopened = load_library_snapshot(&root, false).expect("reopen library");
         assert!(reopened.collections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn whole_edition_onboarding_prepares_metadata_and_authenticated_preview() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = temporary.path().join("whole-edition");
+        let onboarding = OnboardingForm::new(root.display().to_string());
+        let form = DumpBootstrapForm {
+            trusted_index_url: "https://dumps.wikimedia.org/enwiki/fixture/index.json".to_owned(),
+            trusted_index_digest: "ab".repeat(32),
+            ..DumpBootstrapForm::default()
+        };
+
+        let prepared = prepare_whole_edition(&root, onboarding, form)
+            .await
+            .expect("prepare whole edition");
+        assert_eq!(prepared.preview.resolved_pages, 0);
+        let configuration = prepared
+            .snapshot
+            .collection_configurations
+            .iter()
+            .find(|configuration| {
+                configuration.collection_id == prepared.preview.draft.collection_id
+            })
+            .expect("whole-edition configuration");
+        assert_eq!(configuration.rule, CollectionRule::WholeMainNamespace);
+        assert_eq!(
+            configuration.history_policy,
+            HistoryPolicy::CurrentAndFuture
+        );
     }
 
     #[test]

@@ -3,26 +3,37 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use url::Url;
-use wikisync_core::{CollectionId, HistoryPolicy, MAIN_NAMESPACE, PageId, WikiId};
+use wikisync_core::{
+    CollectionId, CollectionRule, HistoryPolicy, MAIN_NAMESPACE, PageId, PageTitle, WikiId,
+};
 use wikisync_mediawiki::{
-    DumpAcquisitionError, DumpError, DumpLimits, DumpPage, DumpReader, DumpSiteInfo,
-    MediaWikiClient, PageHeadResolution, VerifiedDumpSet,
+    ClientError, DumpAcquisitionError, DumpAcquisitionLimits, DumpError, DumpLimits, DumpPage,
+    DumpReader, DumpSiteInfo, MediaWikiClient, PageHeadResolution, RecentChangeKind,
+    RecentChangesContinuation, TrustedDumpIndex, VerifiedDumpInventory, VerifiedDumpSet,
 };
 use wikisync_search::SqliteSearchIndex;
 use wikisync_store::{
     CurrentRevisionCapture, DumpImportRequest, DumpImportState, DumpImportStatus, Library,
-    StoreError, SyncRunKind, SyncRunStatus,
+    StoreError, StoredWholeEditionChange, SyncRunKind, SyncRunStatus, WholeEditionChange,
+    WholeEditionChangeDisposition, WholeEditionChangeKind, WholeEditionDiscoveryKind,
+    WholeEditionDiscoveryRequest, WholeEditionDiscoveryStatus, WholeEditionImportRequest,
+    WholeEditionImportStatus,
 };
 
 use super::{
     CaptureError, CapturedPage, MediaCaptureReport, NeverCancelled, PageReconciliationReport,
-    ReconciliationLimits, capture_resolved_page_head, enforce_collection_byte_budget,
-    index_stored_current_revision, reconcile_page_head, repair_missing_sync_manifests,
-    validate_content,
+    ReconciliationLimits, capture_resolved_page_head, capture_revision_media,
+    enforce_collection_byte_budget, index_stored_current_revision,
+    index_stored_current_revision_with, mediawiki_timestamp_seconds, reconcile_page_head,
+    repair_missing_sync_manifests, revision_capture, validate_content,
 };
+
+const WHOLE_EDITION_CHANGE_PAGE_SIZE: u32 = 500;
+const MAX_SAFE_RECENT_CHANGES_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 /// API work performed after the streaming scan to close its race window.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -64,6 +75,786 @@ pub struct DumpBootstrapReport {
     pub pages_absent_from_dump: usize,
     /// Post-scan Action API race closure.
     pub closure: DumpClosureReport,
+}
+
+/// Completed progressive whole-main-namespace bootstrap.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WholeEditionBootstrapReport {
+    /// Successful bootstrap synchronization boundary.
+    pub status: SyncRunStatus,
+    /// Durable authenticated dump progress and snapshot identity.
+    pub import: WholeEditionImportStatus,
+    /// Durable fixed-window RecentChanges discovery and application state.
+    pub discovery: WholeEditionDiscoveryStatus,
+    /// Whether an interrupted run/import was resumed.
+    pub resumed: bool,
+    /// Current dump pages newly captured by this invocation.
+    pub pages_imported: usize,
+    /// Current dump pages whose canonical revision was already durable.
+    pub pages_reused: usize,
+}
+
+/// Completed overlap-window update for a bootstrapped whole edition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WholeEditionUpdateReport {
+    /// Successful update synchronization boundary.
+    pub status: SyncRunStatus,
+    /// Durable RecentChanges discovery and application state.
+    pub discovery: WholeEditionDiscoveryStatus,
+    /// Whether an interrupted update was resumed.
+    pub resumed: bool,
+}
+
+/// Applies a bounded, durable RecentChanges overlap window to a whole edition.
+pub async fn update_whole_main_namespace(
+    client: &MediaWikiClient,
+    library: &mut Library,
+    collection_id: CollectionId,
+) -> Result<WholeEditionUpdateReport, DumpBootstrapError> {
+    repair_missing_sync_manifests(library)?;
+    let configuration = library
+        .collection_configuration(collection_id)?
+        .ok_or(StoreError::CollectionNotConfigured(collection_id))?;
+    if configuration.rule != CollectionRule::WholeMainNamespace {
+        return Err(DumpBootstrapError::WholeEditionCollectionRequired);
+    }
+    let wiki = library
+        .wiki(configuration.wiki_id)?
+        .ok_or(StoreError::WikiNotFound(configuration.wiki_id))?;
+    let stored_endpoint =
+        Url::parse(&wiki.api_endpoint).map_err(|_| DumpBootstrapError::InvalidSourceUrl)?;
+    if client.endpoint() != &stored_endpoint {
+        return Err(DumpBootstrapError::ClientEndpointMismatch);
+    }
+    let checkpoint = library.sync_checkpoints()?.into_iter().find(|checkpoint| {
+        checkpoint.wiki_id == configuration.wiki_id
+            && checkpoint.collection_id == Some(collection_id)
+            && checkpoint.last_run_id.is_some()
+    });
+    let Some(checkpoint) = checkpoint else {
+        return Err(DumpBootstrapError::WholeEditionBootstrapRequired);
+    };
+    let source_now = client.source_timestamp().await?;
+    let candidate = mediawiki_timestamp_seconds(&source_now)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(DumpBootstrapError::InvalidRaceWindowTimestamp)?;
+    if candidate.saturating_sub(checkpoint.committed_through)
+        > MAX_SAFE_RECENT_CHANGES_WINDOW_SECONDS
+    {
+        library.mark_whole_edition_long_gap(
+            collection_id,
+            checkpoint.committed_through,
+            candidate,
+            "source checkpoint exceeds the safe RecentChanges recovery window",
+        )?;
+        return Err(DumpBootstrapError::WholeEditionLongGap {
+            last_safe_checkpoint: checkpoint.committed_through,
+            source_now: candidate,
+        });
+    }
+    let started = library.start_or_resume_sync_run(
+        configuration.wiki_id,
+        Some(collection_id),
+        SyncRunKind::Update,
+        candidate,
+    )?;
+    let claimed =
+        library.claim_or_resume_whole_edition_discovery(WholeEditionDiscoveryRequest {
+            run_id: started.status.run_id,
+            kind: WholeEditionDiscoveryKind::Incremental,
+            window_start: started.status.window_start,
+            window_end: started.status.checkpoint_candidate,
+            import_id: None,
+            recovery_marker_id: None,
+        })?;
+    let discovery_id = claimed.status.discovery_id;
+    let discovered = discover_whole_edition_changes(
+        client,
+        library,
+        claimed.status,
+        &format_mediawiki_timestamp(started.status.window_start)?,
+        &format_mediawiki_timestamp(started.status.checkpoint_candidate)?,
+    )
+    .await;
+    let discovered = match discovered {
+        Ok(status) => status,
+        Err(error) => {
+            library.fail_whole_edition_discovery(
+                discovery_id,
+                error.code(),
+                &error.to_string(),
+                error.is_retryable(),
+            )?;
+            return Err(error);
+        }
+    };
+    let discovery = match apply_whole_edition_changes(
+        client,
+        library,
+        configuration.wiki_id,
+        collection_id,
+        discovered,
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(error) => {
+            library.fail_whole_edition_discovery(
+                discovery_id,
+                error.code(),
+                &error.to_string(),
+                error.is_retryable(),
+            )?;
+            return Err(error);
+        }
+    };
+    let status = library.complete_sync_run(started.status.run_id, None)?;
+    library.append_sync_manifest(status.run_id)?;
+    Ok(WholeEditionUpdateReport {
+        status,
+        discovery,
+        resumed: started.resumed || claimed.resumed,
+    })
+}
+
+/// Authenticates a dump index, then alternates one artifact download with one
+/// streaming import for a whole-main-namespace collection.
+///
+/// Every page is indexed before its durable import cursor advances, so local readers
+/// and search can use completed pages while later artifacts are still transferring.
+/// A fixed source-clock RecentChanges window is durably discovered before the dump
+/// scan and applied before the synchronization checkpoint and manifest complete.
+#[allow(clippy::too_many_arguments)]
+pub async fn bootstrap_whole_main_namespace_from_trusted_dump(
+    client: &MediaWikiClient,
+    library: &mut Library,
+    collection_id: CollectionId,
+    trust: &TrustedDumpIndex,
+    cache_directory: &Path,
+    acquisition_limits: DumpAcquisitionLimits,
+    limits: DumpLimits,
+) -> Result<WholeEditionBootstrapReport, DumpBootstrapError> {
+    repair_missing_sync_manifests(library)?;
+    let configuration = library
+        .collection_configuration(collection_id)?
+        .ok_or(StoreError::CollectionNotConfigured(collection_id))?;
+    if configuration.rule != CollectionRule::WholeMainNamespace {
+        return Err(DumpBootstrapError::WholeEditionCollectionRequired);
+    }
+    if configuration.history_policy != HistoryPolicy::CurrentAndFuture {
+        return Err(DumpBootstrapError::UnsupportedHistoryPolicy(
+            configuration.history_policy,
+        ));
+    }
+    let wiki = library
+        .wiki(configuration.wiki_id)?
+        .ok_or(StoreError::WikiNotFound(configuration.wiki_id))?;
+    let stored_endpoint =
+        Url::parse(&wiki.api_endpoint).map_err(|_| DumpBootstrapError::InvalidSourceUrl)?;
+    if client.endpoint() != &stored_endpoint {
+        return Err(DumpBootstrapError::ClientEndpointMismatch);
+    }
+
+    // Authenticating the small index first yields the exact ordered transfer plan;
+    // artifact bytes remain deferred until the import loop below.
+    let inventory = client
+        .acquire_current_dump_inventory(trust, acquisition_limits)
+        .await?;
+    if inventory.artifact_count() == 0 {
+        return Err(DumpBootstrapError::EmptyDumpSet);
+    }
+    let compressed_bytes = inventory.total_compressed_bytes()?;
+    if compressed_bytes > limits.max_compressed_bytes {
+        return Err(DumpError::CompressedLimitExceeded {
+            limit: limits.max_compressed_bytes,
+        }
+        .into());
+    }
+    let snapshot_timestamp = mediawiki_timestamp_seconds(inventory.generated_at())
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(DumpBootstrapError::InvalidSnapshotTimestamp)?;
+    let source_now = client.source_timestamp().await?;
+    let candidate = mediawiki_timestamp_seconds(&source_now)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(DumpBootstrapError::InvalidRaceWindowTimestamp)?;
+    if candidate < snapshot_timestamp {
+        return Err(DumpBootstrapError::RaceWindowPrecedesSnapshot);
+    }
+    let started = library.start_or_resume_sync_run(
+        configuration.wiki_id,
+        Some(collection_id),
+        SyncRunKind::Bootstrap,
+        candidate,
+    )?;
+    let race_window_end = started.status.checkpoint_candidate;
+    let recovery_marker = library.whole_edition_recovery_marker(collection_id)?;
+    let snapshot_id = format!("{}@{}", inventory.database_name(), inventory.generated_at());
+    let import = library.claim_or_resume_whole_edition_import(WholeEditionImportRequest {
+        run_id: started.status.run_id,
+        snapshot_id: &snapshot_id,
+        dump_digest: &format!("b3:{}", inventory.index_digest().to_hex()),
+        dump_compressed_bytes: compressed_bytes,
+        collection_generation: configuration.generation,
+        snapshot_timestamp,
+        race_window_end,
+        recovery_marker_id: recovery_marker
+            .as_ref()
+            .map(|marker| marker.recovery_marker_id),
+    })?;
+    let discovery_kind = if recovery_marker.is_some() {
+        WholeEditionDiscoveryKind::LongGapClosure
+    } else {
+        WholeEditionDiscoveryKind::RaceWindow
+    };
+    let discovery =
+        library.claim_or_resume_whole_edition_discovery(WholeEditionDiscoveryRequest {
+            run_id: started.status.run_id,
+            kind: discovery_kind,
+            window_start: snapshot_timestamp,
+            window_end: race_window_end,
+            import_id: Some(import.status.dump.import_id),
+            recovery_marker_id: recovery_marker
+                .as_ref()
+                .map(|marker| marker.recovery_marker_id),
+        })?;
+    let discovery_id = discovery.status.discovery_id;
+    let discovery = discover_whole_edition_changes(
+        client,
+        library,
+        discovery.status,
+        inventory.generated_at(),
+        &format_mediawiki_timestamp(race_window_end)?,
+    )
+    .await;
+    let mut discovery = match discovery {
+        Ok(status) => status,
+        Err(error) => {
+            library.fail_whole_edition_discovery(
+                discovery_id,
+                error.code(),
+                &error.to_string(),
+                error.is_retryable(),
+            )?;
+            return Err(error);
+        }
+    };
+
+    let scan = stream_whole_edition_inventory(
+        client,
+        library,
+        configuration.wiki_id,
+        collection_id,
+        &inventory,
+        cache_directory,
+        acquisition_limits,
+        limits,
+        import.status.dump.import_id,
+        import.status.dump.pages_scanned,
+        &wiki.api_endpoint,
+        &wiki.language_code,
+        &mut discovery,
+    )
+    .await;
+    let (pages_imported, pages_reused, pages_scanned) = match scan {
+        Ok(report) => report,
+        Err(error) => {
+            library.fail_dump_import(
+                import.status.dump.import_id,
+                error.code(),
+                &error.to_string(),
+                error.is_retryable(),
+            )?;
+            return Err(error);
+        }
+    };
+    library.complete_dump_import(import.status.dump.import_id, pages_scanned)?;
+
+    let discovery = apply_whole_edition_changes(
+        client,
+        library,
+        configuration.wiki_id,
+        collection_id,
+        discovery,
+    )
+    .await;
+    let discovery = match discovery {
+        Ok(status) => status,
+        Err(error) => {
+            library.fail_whole_edition_discovery(
+                discovery_id,
+                error.code(),
+                &error.to_string(),
+                error.is_retryable(),
+            )?;
+            return Err(error);
+        }
+    };
+    if let Some(marker) = recovery_marker {
+        library
+            .resolve_whole_edition_long_gap(marker.recovery_marker_id, discovery.discovery_id)?;
+    }
+    let status = library.complete_sync_run(started.status.run_id, None)?;
+    library.append_sync_manifest(status.run_id)?;
+    let import = library
+        .whole_edition_import_status(import.status.dump.import_id)?
+        .ok_or(StoreError::CorruptMetadata(
+            "whole-edition import disappeared after completion",
+        ))?;
+    let resumed = started.resumed || import.dump.attempt_count > 1;
+    Ok(WholeEditionBootstrapReport {
+        status,
+        import,
+        discovery,
+        resumed,
+        pages_imported,
+        pages_reused,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_whole_edition_inventory(
+    client: &MediaWikiClient,
+    library: &mut Library,
+    wiki_id: WikiId,
+    collection_id: CollectionId,
+    inventory: &VerifiedDumpInventory,
+    cache_directory: &Path,
+    acquisition_limits: DumpAcquisitionLimits,
+    limits: DumpLimits,
+    import_id: u64,
+    resume_after_pages: u64,
+    api_endpoint: &str,
+    language_code: &str,
+    discovery: &mut WholeEditionDiscoveryStatus,
+) -> Result<(usize, usize, u64), DumpBootstrapError> {
+    let mut pages_imported = 0_usize;
+    let mut pages_reused = 0_usize;
+    let mut pages_before_artifact = 0_u64;
+    let mut decompressed_before_artifact = 0_u64;
+    let mut search_index = SqliteSearchIndex::open(library)?;
+    for artifact_index in 0..inventory.artifact_count() {
+        // A completed cache entry is re-opened and re-hashed; otherwise only this
+        // one part is transferred before any later part is contacted.
+        let artifact = client
+            .acquire_current_dump_artifact(
+                inventory,
+                artifact_index,
+                cache_directory,
+                acquisition_limits,
+            )
+            .await?;
+        let artifact_limits =
+            remaining_set_limits(limits, pages_before_artifact, decompressed_before_artifact)?;
+        let mut reader = DumpReader::new(artifact.open()?, artifact_limits)?;
+        validate_site_info(
+            reader.site_info(),
+            inventory.database_name(),
+            api_endpoint,
+            language_code,
+        )?;
+        while let Some(page) = reader.next() {
+            let page = page?;
+            let pages_scanned = pages_before_artifact
+                .checked_add(reader.pages_examined())
+                .ok_or(DumpBootstrapError::PageCursorOverflow)?;
+            enforce_global_page_limit(pages_scanned, limits.max_pages)?;
+            if pages_scanned <= resume_after_pages {
+                continue;
+            }
+            let newly_captured = import_dump_page(library, wiki_id, collection_id, &page)?;
+            let stored = library
+                .page(wiki_id, page.page_id)?
+                .ok_or(StoreError::PageNotFound {
+                    wiki_id,
+                    page_id: page.page_id,
+                })?;
+            let revision_id = stored
+                .current_revision_id
+                .ok_or(CaptureError::MissingLocalPageHead(page.page_id))?;
+            index_stored_current_revision_with(
+                library,
+                &mut search_index,
+                wiki_id,
+                stored.page_id,
+                &stored.title,
+                revision_id,
+            )?;
+            // Cursor-after-index is the progressive availability boundary.
+            library.record_whole_edition_imported_member(
+                import_id,
+                pages_scanned,
+                page.page_id,
+                page.revision.metadata.revision_id,
+                page.revision
+                    .source
+                    .as_ref()
+                    .map_or(0, |source| source.len() as u64),
+            )?;
+            if newly_captured {
+                pages_imported += 1;
+            } else {
+                pages_reused += 1;
+            }
+        }
+        pages_before_artifact = pages_before_artifact
+            .checked_add(reader.pages_examined())
+            .ok_or(DumpBootstrapError::PageCursorOverflow)?;
+        enforce_global_page_limit(pages_before_artifact, limits.max_pages)?;
+        decompressed_before_artifact = decompressed_before_artifact
+            .checked_add(reader.decompressed_bytes_read())
+            .ok_or(DumpBootstrapError::DecompressedByteCounterOverflow)?;
+        if decompressed_before_artifact > limits.max_decompressed_bytes {
+            return Err(DumpError::DecompressedLimitExceeded {
+                limit: limits.max_decompressed_bytes,
+            }
+            .into());
+        }
+        library.record_whole_edition_stream_progress(
+            import_id,
+            pages_before_artifact,
+            u64::try_from(artifact_index + 1)
+                .map_err(|_| DumpBootstrapError::ArtifactLengthOverflow)?,
+            0,
+        )?;
+        tail_whole_edition_race_window(client, library, discovery).await?;
+    }
+    if pages_before_artifact < resume_after_pages {
+        return Err(DumpBootstrapError::ResumeCursorBeyondDump {
+            stored: resume_after_pages,
+            actual: pages_before_artifact,
+        });
+    }
+    Ok((pages_imported, pages_reused, pages_before_artifact))
+}
+
+async fn tail_whole_edition_race_window(
+    client: &MediaWikiClient,
+    library: &mut Library,
+    discovery: &mut WholeEditionDiscoveryStatus,
+) -> Result<(), DumpBootstrapError> {
+    let source_now = client.source_timestamp().await?;
+    let new_end = mediawiki_timestamp_seconds(&source_now)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(DumpBootstrapError::InvalidRaceWindowTimestamp)?;
+    if new_end <= discovery.window_end {
+        return Ok(());
+    }
+    let old_end = discovery.window_end;
+    *discovery =
+        library.extend_whole_edition_race_window(discovery.discovery_id, old_end, new_end)?;
+    *discovery = discover_whole_edition_changes(
+        client,
+        library,
+        discovery.clone(),
+        &format_mediawiki_timestamp(old_end)?,
+        &format_mediawiki_timestamp(new_end)?,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn discover_whole_edition_changes(
+    client: &MediaWikiClient,
+    library: &mut Library,
+    mut status: WholeEditionDiscoveryStatus,
+    window_start: &str,
+    window_end: &str,
+) -> Result<WholeEditionDiscoveryStatus, DumpBootstrapError> {
+    while !status.source_exhausted {
+        let continuation = status
+            .continuation
+            .as_deref()
+            .map(decode_recent_changes_continuation)
+            .transpose()?;
+        let batch = client
+            .recent_changes_batch(window_start, Some(window_end), continuation.as_ref())
+            .await?;
+        let mut changes = Vec::with_capacity(batch.changes.len());
+        for change in &batch.changes {
+            let occurred_at = mediawiki_timestamp_seconds(&change.timestamp)
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or(DumpBootstrapError::InvalidRecentChangeTimestamp(
+                    change.change_id,
+                ))?;
+            changes.push(WholeEditionChange {
+                change_id: change.change_id,
+                kind: stored_change_kind(change.kind),
+                occurred_at,
+                page_id: change.page_id,
+                revision_id: change.revision_id,
+                namespace: Some(change.namespace),
+                title: Some(change.title.as_str()),
+            });
+        }
+        let next_cursor = batch
+            .continuation
+            .as_ref()
+            .map(encode_recent_changes_continuation);
+        status = library.record_whole_edition_recent_changes_batch(
+            status.discovery_id,
+            status.batches_recorded,
+            next_cursor.as_deref(),
+            &changes,
+        )?;
+    }
+    Ok(status)
+}
+
+async fn apply_whole_edition_changes(
+    client: &MediaWikiClient,
+    library: &mut Library,
+    wiki_id: WikiId,
+    collection_id: CollectionId,
+    mut status: WholeEditionDiscoveryStatus,
+) -> Result<WholeEditionDiscoveryStatus, DumpBootstrapError> {
+    loop {
+        let changes = library.whole_edition_pending_changes_after(
+            status.discovery_id,
+            None,
+            WHOLE_EDITION_CHANGE_PAGE_SIZE,
+        )?;
+        if changes.is_empty() {
+            break;
+        }
+        for change in changes {
+            let disposition = if change
+                .namespace
+                .is_some_and(|namespace| namespace != MAIN_NAMESPACE)
+            {
+                WholeEditionChangeDisposition::Ignored
+            } else {
+                apply_whole_edition_change(client, library, wiki_id, collection_id, &change).await?
+            };
+            status = library.mark_whole_edition_change_applied(
+                status.discovery_id,
+                change.change_id,
+                disposition,
+            )?;
+        }
+    }
+    library
+        .complete_whole_edition_discovery(status.discovery_id)
+        .map_err(Into::into)
+}
+
+async fn apply_whole_edition_change(
+    client: &MediaWikiClient,
+    library: &mut Library,
+    wiki_id: WikiId,
+    collection_id: CollectionId,
+    change: &StoredWholeEditionChange,
+) -> Result<WholeEditionChangeDisposition, DumpBootstrapError> {
+    match change.kind {
+        WholeEditionChangeKind::Edit | WholeEditionChangeKind::New => {
+            let (Some(page_id), Some(revision_id), Some(title)) =
+                (change.page_id, change.revision_id, change.title.as_deref())
+            else {
+                return Ok(WholeEditionChangeDisposition::Ignored);
+            };
+            let title = PageTitle::new(title)
+                .map_err(|_| DumpBootstrapError::InvalidRecentChangeTitle(change.change_id))?;
+            let content = client.revision_content(page_id, revision_id).await?;
+            validate_content(&content.metadata, &content.source)?;
+            if library.revision(wiki_id, revision_id)?.is_none() {
+                enforce_collection_byte_budget(
+                    library,
+                    collection_id,
+                    content.source.len() as u64,
+                )?;
+                if library.page(wiki_id, page_id)?.is_some() {
+                    library.capture_revision(
+                        wiki_id,
+                        page_id,
+                        &revision_capture(&content.metadata, &content.source),
+                    )?;
+                } else {
+                    library.capture_current_revision(
+                        wiki_id,
+                        collection_id,
+                        &CurrentRevisionCapture {
+                            page_id,
+                            namespace: MAIN_NAMESPACE,
+                            title: &title,
+                            revision_id,
+                            parent_id: content.metadata.parent_id,
+                            timestamp: &content.metadata.timestamp,
+                            author: content.metadata.user.as_deref(),
+                            author_id: content.metadata.user_id,
+                            comment: content.metadata.comment.as_deref(),
+                            minor: content.metadata.minor,
+                            upstream_sha1: content.metadata.sha1.as_deref(),
+                            content_model: content
+                                .metadata
+                                .content_model
+                                .as_deref()
+                                .expect("validated RecentChanges content model"),
+                            source: &content.source,
+                        },
+                    )?;
+                }
+            }
+            library.reconcile_current_revision(
+                wiki_id,
+                collection_id,
+                page_id,
+                MAIN_NAMESPACE,
+                &title,
+                revision_id,
+            )?;
+            index_stored_current_revision(library, wiki_id, page_id, &title, revision_id)?;
+            let image_policy = library
+                .collection_configuration(collection_id)?
+                .ok_or(StoreError::CollectionNotConfigured(collection_id))?
+                .image_policy;
+            capture_revision_media(
+                client,
+                library,
+                wiki_id,
+                collection_id,
+                page_id,
+                revision_id,
+                image_policy,
+            )
+            .await?;
+            Ok(WholeEditionChangeDisposition::Applied)
+        }
+        WholeEditionChangeKind::Delete => {
+            let Some(page_id) = change_page_id(library, wiki_id, change)? else {
+                return Ok(WholeEditionChangeDisposition::Ignored);
+            };
+            if library.page(wiki_id, page_id)?.is_some() {
+                library.mark_page_missing(wiki_id, collection_id, page_id)?;
+                Ok(WholeEditionChangeDisposition::Applied)
+            } else {
+                Ok(WholeEditionChangeDisposition::Ignored)
+            }
+        }
+        WholeEditionChangeKind::Move | WholeEditionChangeKind::Restore => {
+            let Some(page_id) = change_page_id(library, wiki_id, change)? else {
+                return Ok(WholeEditionChangeDisposition::Ignored);
+            };
+            match library.page(wiki_id, page_id)? {
+                Some(stored) => {
+                    reconcile_page_head(
+                        client,
+                        library,
+                        wiki_id,
+                        collection_id,
+                        &stored,
+                        ReconciliationLimits::default(),
+                        &NeverCancelled,
+                    )
+                    .await?;
+                    Ok(WholeEditionChangeDisposition::Applied)
+                }
+                None => match client.resolve_page_head(page_id).await? {
+                    PageHeadResolution::Missing { .. } => {
+                        Ok(WholeEditionChangeDisposition::Ignored)
+                    }
+                    PageHeadResolution::Found(page) => {
+                        let mut search = SqliteSearchIndex::open(library)?;
+                        capture_resolved_page_head(
+                            client,
+                            library,
+                            &mut search,
+                            wiki_id,
+                            collection_id,
+                            *page,
+                        )
+                        .await?;
+                        Ok(WholeEditionChangeDisposition::Applied)
+                    }
+                },
+            }
+        }
+        WholeEditionChangeKind::Other => Ok(WholeEditionChangeDisposition::Ignored),
+    }
+}
+
+fn change_page_id(
+    library: &Library,
+    wiki_id: WikiId,
+    change: &StoredWholeEditionChange,
+) -> Result<Option<PageId>, DumpBootstrapError> {
+    if change.page_id.is_some() {
+        return Ok(change.page_id);
+    }
+    let Some(title) = change.title.as_deref() else {
+        return Ok(None);
+    };
+    let title = PageTitle::new(title)
+        .map_err(|_| DumpBootstrapError::InvalidRecentChangeTitle(change.change_id))?;
+    Ok(library
+        .pages_by_title(&title, Some(wiki_id))?
+        .into_iter()
+        .find(|page| page.title == title)
+        .map(|page| page.page_id))
+}
+
+fn stored_change_kind(kind: RecentChangeKind) -> WholeEditionChangeKind {
+    match kind {
+        RecentChangeKind::Edit => WholeEditionChangeKind::Edit,
+        RecentChangeKind::New => WholeEditionChangeKind::New,
+        RecentChangeKind::Move => WholeEditionChangeKind::Move,
+        RecentChangeKind::Delete => WholeEditionChangeKind::Delete,
+        RecentChangeKind::Restore => WholeEditionChangeKind::Restore,
+    }
+}
+
+fn encode_recent_changes_continuation(continuation: &RecentChangesContinuation) -> String {
+    format!(
+        "{}:{}{}",
+        continuation.generic().len(),
+        continuation.generic(),
+        continuation.recent_changes()
+    )
+}
+
+fn decode_recent_changes_continuation(
+    encoded: &str,
+) -> Result<RecentChangesContinuation, DumpBootstrapError> {
+    let (length, values) = encoded
+        .split_once(':')
+        .ok_or(DumpBootstrapError::InvalidRecentChangesContinuation)?;
+    let length = length
+        .parse::<usize>()
+        .map_err(|_| DumpBootstrapError::InvalidRecentChangesContinuation)?;
+    let generic = values
+        .get(..length)
+        .ok_or(DumpBootstrapError::InvalidRecentChangesContinuation)?;
+    let recent_changes = values
+        .get(length..)
+        .filter(|value| !value.is_empty())
+        .ok_or(DumpBootstrapError::InvalidRecentChangesContinuation)?;
+    RecentChangesContinuation::from_parts(generic, recent_changes)
+        .map_err(DumpBootstrapError::Source)
+}
+
+fn format_mediawiki_timestamp(seconds: u64) -> Result<String, DumpBootstrapError> {
+    let seconds =
+        i64::try_from(seconds).map_err(|_| DumpBootstrapError::InvalidRaceWindowTimestamp)?;
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    if !(0..=9_999).contains(&year) {
+        return Err(DumpBootstrapError::InvalidRaceWindowTimestamp);
+    }
+    let hour = seconds_of_day / 3_600;
+    let minute = seconds_of_day % 3_600 / 60;
+    let second = seconds_of_day % 60;
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
+    ))
 }
 
 /// Streams a current-page dump into one already resolved collection, then queries
@@ -344,6 +1135,16 @@ async fn run_dump_and_closure(
             let revision_id = stored
                 .current_revision_id
                 .ok_or(CaptureError::MissingLocalPageHead(page.page_id))?;
+            index_stored_current_revision(
+                library,
+                wiki_id,
+                stored.page_id,
+                &stored.title,
+                revision_id,
+            )?;
+            // The durable dump cursor advances only after the derived search row is
+            // installed. A crash before this point replays the idempotent capture and
+            // indexing work instead of skipping a page that was never searchable.
             library.record_dump_imported_page(
                 import_id,
                 pages_scanned,
@@ -353,13 +1154,6 @@ async fn run_dump_and_closure(
                     .source
                     .as_ref()
                     .map_or(0, |source| source.len() as u64),
-            )?;
-            index_stored_current_revision(
-                library,
-                wiki_id,
-                stored.page_id,
-                &stored.title,
-                revision_id,
             )?;
             if newly_captured {
                 pages_imported += 1;
@@ -691,6 +1485,8 @@ pub enum DumpBootstrapError {
     Dump(DumpError),
     /// Existing capture or reconciliation behavior failed.
     Capture(CaptureError),
+    /// Bounded RecentChanges or source-clock access failed.
+    Source(ClientError),
     /// Durable import/run bookkeeping failed.
     Store(StoreError),
     /// The authenticated set contained no current-page artifacts.
@@ -703,6 +1499,27 @@ pub enum DumpBootstrapError {
     DecompressedByteCounterOverflow,
     /// Dump bootstrap is intentionally current-only.
     UnsupportedHistoryPolicy(HistoryPolicy),
+    /// Whole-edition streaming was requested for a selective collection.
+    WholeEditionCollectionRequired,
+    /// RecentChanges update was requested before a successful dump bootstrap.
+    WholeEditionBootstrapRequired,
+    /// The committed checkpoint is too old for bounded RecentChanges recovery.
+    WholeEditionLongGap {
+        last_safe_checkpoint: u64,
+        source_now: u64,
+    },
+    /// The authenticated snapshot timestamp was not a valid nonnegative source time.
+    InvalidSnapshotTimestamp,
+    /// The fixed source-clock race boundary was invalid.
+    InvalidRaceWindowTimestamp,
+    /// The fixed race boundary preceded the authenticated snapshot boundary.
+    RaceWindowPrecedesSnapshot,
+    /// A durable RecentChanges cursor could not be reconstructed.
+    InvalidRecentChangesContinuation,
+    /// A RecentChanges row carried an invalid timestamp.
+    InvalidRecentChangeTimestamp(u64),
+    /// A RecentChanges row carried an invalid page title.
+    InvalidRecentChangeTitle(u64),
     /// Authenticated index and dump database identities differ.
     DatabaseMismatch { expected: String, actual: String },
     /// Dump and configured source language identities differ.
@@ -745,6 +1562,7 @@ impl DumpBootstrapError {
         match self {
             Self::Acquisition(_) => false,
             Self::Capture(error) => error.is_retryable(),
+            Self::Source(error) => error.is_retryable(),
             Self::Store(_) => false,
             Self::Dump(_)
             | Self::EmptyDumpSet
@@ -752,6 +1570,15 @@ impl DumpBootstrapError {
             | Self::PageCursorOverflow
             | Self::DecompressedByteCounterOverflow
             | Self::UnsupportedHistoryPolicy(_)
+            | Self::WholeEditionCollectionRequired
+            | Self::WholeEditionBootstrapRequired
+            | Self::WholeEditionLongGap { .. }
+            | Self::InvalidSnapshotTimestamp
+            | Self::InvalidRaceWindowTimestamp
+            | Self::RaceWindowPrecedesSnapshot
+            | Self::InvalidRecentChangesContinuation
+            | Self::InvalidRecentChangeTimestamp(_)
+            | Self::InvalidRecentChangeTitle(_)
             | Self::DatabaseMismatch { .. }
             | Self::LanguageMismatch { .. }
             | Self::MissingMainNamespace
@@ -775,12 +1602,23 @@ impl DumpBootstrapError {
         match self {
             Self::Acquisition(_) => "dump-artifact-changed",
             Self::Capture(error) => error.code(),
+            Self::Source(_) => "dump-recent-changes-source",
             Self::Store(_) => "dump-store",
             Self::Dump(_) => "dump-invalid",
             Self::EmptyDumpSet | Self::ArtifactLengthOverflow => "dump-artifact-set",
             Self::PageCursorOverflow => "dump-page-cursor",
             Self::DecompressedByteCounterOverflow => "dump-decompressed-counter",
             Self::UnsupportedHistoryPolicy(_) => "dump-history-policy",
+            Self::WholeEditionCollectionRequired => "dump-whole-edition-scope",
+            Self::WholeEditionBootstrapRequired => "dump-whole-edition-bootstrap-required",
+            Self::WholeEditionLongGap { .. } => "dump-whole-edition-long-gap",
+            Self::InvalidSnapshotTimestamp | Self::InvalidRaceWindowTimestamp => {
+                "dump-race-window-timestamp"
+            }
+            Self::RaceWindowPrecedesSnapshot => "dump-race-window-order",
+            Self::InvalidRecentChangesContinuation => "dump-recent-changes-cursor",
+            Self::InvalidRecentChangeTimestamp(_) => "dump-recent-changes-timestamp",
+            Self::InvalidRecentChangeTitle(_) => "dump-recent-changes-title",
             Self::DatabaseMismatch { .. } => "dump-database-mismatch",
             Self::LanguageMismatch { .. } => "dump-language-mismatch",
             Self::MissingMainNamespace | Self::InvalidMainNamespace => "dump-namespace-mismatch",
@@ -806,6 +1644,7 @@ impl fmt::Display for DumpBootstrapError {
             Self::Acquisition(error) => error.fmt(formatter),
             Self::Dump(error) => error.fmt(formatter),
             Self::Capture(error) => error.fmt(formatter),
+            Self::Source(error) => error.fmt(formatter),
             Self::Store(error) => error.fmt(formatter),
             Self::EmptyDumpSet => formatter.write_str("authenticated dump set is empty"),
             Self::ArtifactLengthOverflow => {
@@ -820,6 +1659,39 @@ impl fmt::Display for DumpBootstrapError {
             Self::UnsupportedHistoryPolicy(policy) => write!(
                 formatter,
                 "current dump bootstrap requires current-and-future history, not {policy:?}"
+            ),
+            Self::WholeEditionCollectionRequired => formatter.write_str(
+                "whole-edition dump streaming requires a whole-main-namespace collection",
+            ),
+            Self::WholeEditionBootstrapRequired => formatter.write_str(
+                "whole-edition updates require a completed authenticated dump bootstrap",
+            ),
+            Self::WholeEditionLongGap {
+                last_safe_checkpoint,
+                source_now,
+            } => write!(
+                formatter,
+                "whole-edition checkpoint {last_safe_checkpoint} is too old for safe RecentChanges recovery at {source_now}; a fresh authenticated dump is required"
+            ),
+            Self::InvalidSnapshotTimestamp => {
+                formatter.write_str("authenticated dump snapshot timestamp is invalid")
+            }
+            Self::InvalidRaceWindowTimestamp => {
+                formatter.write_str("source race-window timestamp is invalid")
+            }
+            Self::RaceWindowPrecedesSnapshot => {
+                formatter.write_str("source race-window boundary precedes the dump snapshot")
+            }
+            Self::InvalidRecentChangesContinuation => {
+                formatter.write_str("durable RecentChanges continuation is invalid")
+            }
+            Self::InvalidRecentChangeTimestamp(change_id) => write!(
+                formatter,
+                "RecentChanges row {change_id} has an invalid source timestamp"
+            ),
+            Self::InvalidRecentChangeTitle(change_id) => write!(
+                formatter,
+                "RecentChanges row {change_id} has an invalid page title"
             ),
             Self::DatabaseMismatch { expected, actual } => write!(
                 formatter,
@@ -887,6 +1759,7 @@ impl Error for DumpBootstrapError {
             Self::Acquisition(error) => Some(error),
             Self::Dump(error) => Some(error),
             Self::Capture(error) => Some(error),
+            Self::Source(error) => Some(error),
             Self::Store(error) => Some(error),
             _ => None,
         }
@@ -908,6 +1781,12 @@ impl From<DumpAcquisitionError> for DumpBootstrapError {
 impl From<CaptureError> for DumpBootstrapError {
     fn from(error: CaptureError) -> Self {
         Self::Capture(error)
+    }
+}
+
+impl From<ClientError> for DumpBootstrapError {
+    fn from(error: ClientError) -> Self {
+        Self::Source(error)
     }
 }
 

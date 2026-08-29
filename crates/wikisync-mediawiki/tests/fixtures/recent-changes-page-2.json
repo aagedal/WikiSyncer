@@ -1,0 +1,68 @@
+{
+  "batchcomplete": true,
+  "curtimestamp": "2026-08-30T12:06:00Z",
+  "query": {
+    "recentchanges": [
+      {
+        "type": "log",
+        "ns": 0,
+        "title": "Old title",
+        "pageid": 103,
+        "revid": 0,
+        "old_revid": 0,
+        "rcid": 7004,
+        "timestamp": "2026-08-30T12:03:00Z",
+        "user": "Mover",
+        "userid": 61,
+        "comment": "Use the common name",
+        "logid": 8001,
+        "logtype": "move",
+        "logaction": "move",
+        "logparams": {
+          "target_ns": 0,
+          "target_title": "New title",
+          "suppressredirect": false
+        }
+      },
+      {
+        "type": "log",
+        "ns": 0,
+        "title": "Deleted article",
+        "pageid": 0,
+        "revid": 0,
+        "old_revid": 0,
+        "rcid": 7005,
+        "timestamp": "2026-08-30T12:04:00Z",
+        "user": "Administrator",
+        "userid": 7,
+        "comment": "Copyright issue",
+        "logid": 8002,
+        "logtype": "delete",
+        "logaction": "delete",
+        "logparams": {}
+      },
+      {
+        "type": "log",
+        "ns": 0,
+        "title": "Restored article",
+        "pageid": 104,
+        "revid": 0,
+        "old_revid": 0,
+        "rcid": 7006,
+        "timestamp": "2026-08-30T12:05:00Z",
+        "user": "Administrator",
+        "userid": 7,
+        "comment": "Deletion overturned",
+        "logid": 8003,
+        "logtype": "delete",
+        "logaction": "restore",
+        "logparams": {
+          "count": {
+            "revisions": 3,
+            "files": 0
+          }
+        }
+      }
+    ]
+  }
+}

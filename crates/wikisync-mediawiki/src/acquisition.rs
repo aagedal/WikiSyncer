@@ -274,6 +274,92 @@ pub struct VerifiedDumpSet {
     artifacts: Vec<VerifiedDumpArtifact>,
 }
 
+/// Authenticated metadata for an ordered current-page dump set.
+///
+/// Unlike [`VerifiedDumpSet`], an inventory does not imply that every artifact has
+/// already been downloaded. Callers can acquire one artifact at a time and make its
+/// pages available before transferring the remainder of a large edition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedDumpInventory {
+    database_name: String,
+    generated_at: String,
+    source_index_url: String,
+    index_digest: DumpDigest,
+    artifacts: Vec<ValidatedArtifact>,
+}
+
+impl VerifiedDumpInventory {
+    /// Database identity committed by the authenticated index.
+    #[must_use]
+    pub fn database_name(&self) -> &str {
+        &self.database_name
+    }
+
+    /// Source timestamp committed by the authenticated index.
+    #[must_use]
+    pub fn generated_at(&self) -> &str {
+        &self.generated_at
+    }
+
+    /// Exact authenticated index URL.
+    #[must_use]
+    pub fn source_index_url(&self) -> &str {
+        &self.source_index_url
+    }
+
+    /// BLAKE3 identity of the authenticated index bytes.
+    #[must_use]
+    pub const fn index_digest(&self) -> DumpDigest {
+        self.index_digest
+    }
+
+    /// Number of ordered artifacts committed by the index.
+    #[must_use]
+    pub fn artifact_count(&self) -> usize {
+        self.artifacts.len()
+    }
+
+    /// Exact compressed bytes committed across the complete artifact set.
+    pub fn total_compressed_bytes(&self) -> Result<u64, DumpAcquisitionError> {
+        self.artifacts.iter().try_fold(0_u64, |total, artifact| {
+            total
+                .checked_add(artifact.length)
+                .ok_or(DumpAcquisitionError::TotalSizeExceeded { limit: u64::MAX })
+        })
+    }
+
+    /// Exact authenticated compressed length of one ordered artifact.
+    #[must_use]
+    pub fn artifact_length(&self, index: usize) -> Option<u64> {
+        self.artifacts.get(index).map(|artifact| artifact.length)
+    }
+
+    /// Wraps one acquired artifact with the complete authenticated set identity.
+    ///
+    /// This is primarily useful for bounded parsers that consume one dump part at a
+    /// time while retaining the full index provenance.
+    pub fn single_artifact_set(
+        &self,
+        index: usize,
+        artifact: VerifiedDumpArtifact,
+    ) -> Result<VerifiedDumpSet, DumpAcquisitionError> {
+        let expected = self
+            .artifacts
+            .get(index)
+            .ok_or(DumpAcquisitionError::InvalidArtifactIndex)?;
+        if artifact.length != expected.length || artifact.digest != expected.digest {
+            return Err(DumpAcquisitionError::CachedArtifactChanged);
+        }
+        Ok(VerifiedDumpSet {
+            database_name: self.database_name.clone(),
+            generated_at: self.generated_at.clone(),
+            source_index_url: self.source_index_url.clone(),
+            index_digest: self.index_digest,
+            artifacts: vec![artifact],
+        })
+    }
+}
+
 impl VerifiedDumpSet {
     #[must_use]
     pub fn database_name(&self) -> &str {
@@ -321,7 +407,7 @@ struct IndexArtifact {
     blake3: String,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ValidatedArtifact {
     name: String,
     url: Url,
@@ -330,6 +416,70 @@ struct ValidatedArtifact {
 }
 
 impl MediaWikiClient {
+    /// Downloads and authenticates only the bounded dump index.
+    ///
+    /// Artifact bytes are deliberately deferred so a synchronization coordinator can
+    /// alternate one durable download with one streaming import.
+    pub async fn acquire_current_dump_inventory(
+        &self,
+        trust: &TrustedDumpIndex,
+        limits: DumpAcquisitionLimits,
+    ) -> Result<VerifiedDumpInventory, DumpAcquisitionError> {
+        let limits = limits.validate()?;
+        let origins = dump_origins(&self.config.endpoint);
+        if !redirect_destination_allowed(&trust.url, &origins) {
+            return Err(DumpAcquisitionError::OriginRejected);
+        }
+        let http = self.dump_http_client(&origins)?;
+        tokio::time::timeout(limits.max_elapsed, async {
+            let index_bytes = self
+                .download_index(&http, trust.url.clone(), limits.max_index_bytes)
+                .await?;
+            if DumpDigest::hash(&index_bytes) != trust.digest {
+                return Err(DumpAcquisitionError::IndexDigestMismatch);
+            }
+            let index: IndexDocument = serde_json::from_slice(&index_bytes)
+                .map_err(DumpAcquisitionError::InvalidIndexJson)?;
+            let artifacts = validate_index(index, trust, &origins, limits)?;
+            Ok(VerifiedDumpInventory {
+                database_name: trust.expected_database.clone(),
+                generated_at: index_generated_at(&index_bytes)?,
+                source_index_url: trust.url.as_str().to_owned(),
+                index_digest: trust.digest,
+                artifacts,
+            })
+        })
+        .await
+        .map_err(|_| DumpAcquisitionError::ElapsedTimeExceeded)?
+    }
+
+    /// Acquires and authenticates one artifact from a previously verified inventory.
+    pub async fn acquire_current_dump_artifact(
+        &self,
+        inventory: &VerifiedDumpInventory,
+        index: usize,
+        cache_directory: &Path,
+        limits: DumpAcquisitionLimits,
+    ) -> Result<VerifiedDumpArtifact, DumpAcquisitionError> {
+        let limits = limits.validate()?;
+        let artifact = inventory
+            .artifacts
+            .get(index)
+            .ok_or(DumpAcquisitionError::InvalidArtifactIndex)?;
+        let cache_directory = validate_cache_directory(cache_directory)?;
+        let origins = dump_origins(&self.config.endpoint);
+        if !redirect_destination_allowed(&artifact.url, &origins) {
+            return Err(DumpAcquisitionError::OriginRejected);
+        }
+        let http = self.dump_http_client(&origins)?;
+        tokio::time::timeout(
+            limits.max_elapsed,
+            self.acquire_artifact(&http, &cache_directory, artifact),
+        )
+        .await
+        .map_err(|_| DumpAcquisitionError::ElapsedTimeExceeded)?
+    }
+
     /// Acquires and authenticates every ordered part in a current-pages dump index.
     ///
     /// Existing verified final files are reused. Interrupted downloads remain in a
@@ -341,50 +491,19 @@ impl MediaWikiClient {
         cache_directory: &Path,
         limits: DumpAcquisitionLimits,
     ) -> Result<VerifiedDumpSet, DumpAcquisitionError> {
-        let limits = limits.validate()?;
-        let cache_directory = validate_cache_directory(cache_directory)?;
-        let origins = dump_origins(&self.config.endpoint);
-        if !redirect_destination_allowed(&trust.url, &origins) {
-            return Err(DumpAcquisitionError::OriginRejected);
-        }
-        let http = self.dump_http_client(&origins)?;
-        tokio::time::timeout(
-            limits.max_elapsed,
-            self.acquire_current_dump_set_inner(&http, &origins, trust, &cache_directory, limits),
-        )
-        .await
-        .map_err(|_| DumpAcquisitionError::ElapsedTimeExceeded)?
-    }
-
-    async fn acquire_current_dump_set_inner(
-        &self,
-        http: &reqwest::Client,
-        origins: &[AllowedOrigin],
-        trust: &TrustedDumpIndex,
-        cache_directory: &Path,
-        limits: DumpAcquisitionLimits,
-    ) -> Result<VerifiedDumpSet, DumpAcquisitionError> {
-        let index_bytes = self
-            .download_index(http, trust.url.clone(), limits.max_index_bytes)
-            .await?;
-        if DumpDigest::hash(&index_bytes) != trust.digest {
-            return Err(DumpAcquisitionError::IndexDigestMismatch);
-        }
-        let index: IndexDocument =
-            serde_json::from_slice(&index_bytes).map_err(DumpAcquisitionError::InvalidIndexJson)?;
-        let artifacts = validate_index(index, trust, origins, limits)?;
-        let mut verified = Vec::with_capacity(artifacts.len());
-        for artifact in artifacts {
+        let inventory = self.acquire_current_dump_inventory(trust, limits).await?;
+        let mut verified = Vec::with_capacity(inventory.artifact_count());
+        for index in 0..inventory.artifact_count() {
             verified.push(
-                self.acquire_artifact(http, cache_directory, &artifact)
+                self.acquire_current_dump_artifact(&inventory, index, cache_directory, limits)
                     .await?,
             );
         }
         Ok(VerifiedDumpSet {
-            database_name: trust.expected_database.clone(),
-            generated_at: index_generated_at(&index_bytes)?,
-            source_index_url: trust.url.as_str().to_owned(),
-            index_digest: trust.digest,
+            database_name: inventory.database_name,
+            generated_at: inventory.generated_at,
+            source_index_url: inventory.source_index_url,
+            index_digest: inventory.index_digest,
             artifacts: verified,
         })
     }
@@ -873,6 +992,7 @@ pub enum DumpAcquisitionError {
     UnsupportedIndexSchema,
     DatabaseMismatch,
     ArtifactCountExceeded { limit: usize },
+    InvalidArtifactIndex,
     InvalidArtifactKind,
     InvalidArtifactPath,
     DuplicateArtifact,
@@ -934,6 +1054,9 @@ impl fmt::Display for DumpAcquisitionError {
             }
             Self::ArtifactCountExceeded { limit } => {
                 write!(formatter, "dump index exceeded the {limit}-artifact limit")
+            }
+            Self::InvalidArtifactIndex => {
+                formatter.write_str("dump artifact index is outside the authenticated set")
             }
             Self::InvalidArtifactKind => {
                 formatter.write_str("dump index contains a non-current-pages artifact")

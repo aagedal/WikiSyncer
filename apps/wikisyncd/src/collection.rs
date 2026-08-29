@@ -433,9 +433,7 @@ fn encoded_collection_draft_size(
 
 fn encoded_rule_size(rule: &CollectionRule) -> Result<usize, OperationError> {
     match rule {
-        CollectionRule::WholeMainNamespace => Err(OperationError::failed(
-            "whole-edition collections require the dedicated dump bootstrap operation",
-        )),
+        CollectionRule::WholeMainNamespace => Ok(1),
         CollectionRule::ExplicitTitles(titles) | CollectionRule::TitleList(titles) => {
             let mut size = 1_usize + 4;
             for title in titles.iter() {
@@ -613,6 +611,23 @@ fn estimate(draft: &CollectionDraft) -> Result<CollectionDraftEstimate, Operatio
             "collection preview exceeds administration bounds",
         ));
     }
+    if draft.preview.rule == CollectionRule::WholeMainNamespace
+        && (!draft.preview.members.is_empty()
+            || !draft.preview.missing_titles.is_empty()
+            || draft.preview.category_batches != 0
+            || draft.preview.predicted_canonical_bytes.is_some())
+    {
+        return Err(OperationError::failed(
+            "whole-edition setup must use an empty metadata-only preview",
+        ));
+    }
+    if draft.preview.rule == CollectionRule::WholeMainNamespace
+        && draft.history_policy != HistoryPolicy::CurrentAndFuture
+    {
+        return Err(OperationError::failed(
+            "whole-edition setup requires current-and-future history",
+        ));
+    }
     match &draft.preview.rule {
         CollectionRule::ExplicitTitles(_) | CollectionRule::TitleList(_)
             if draft.preview.category_batches != 0 =>
@@ -714,11 +729,7 @@ fn estimate(draft: &CollectionDraft) -> Result<CollectionDraftEstimate, Operatio
 
 fn encode_rule(bytes: &mut Vec<u8>, rule: &CollectionRule) -> Result<(), OperationError> {
     match rule {
-        CollectionRule::WholeMainNamespace => {
-            return Err(OperationError::failed(
-                "whole-edition collections require the dedicated dump bootstrap operation",
-            ));
-        }
+        CollectionRule::WholeMainNamespace => put_u8(bytes, 0),
         CollectionRule::ExplicitTitles(titles) | CollectionRule::TitleList(titles) => {
             put_u8(
                 bytes,
@@ -747,6 +758,7 @@ fn encode_rule(bytes: &mut Vec<u8>, rule: &CollectionRule) -> Result<(), Operati
 
 fn decode_rule(decoder: &mut DraftDecoder<'_>) -> Result<CollectionRule, OperationError> {
     match decoder.u8()? {
+        0 => Ok(CollectionRule::WholeMainNamespace),
         tag @ (1 | 2) => {
             let count = decoder.count(MAX_RULE_TITLES)?;
             if count == 0 {
@@ -1118,6 +1130,30 @@ mod tests {
         put_u32(&mut invalid, 1);
         put_u64(&mut invalid, 1);
         assert!(decode_collection_draft_version(&invalid).is_err());
+    }
+
+    #[test]
+    fn whole_edition_metadata_draft_round_trips_without_materialized_members() {
+        let wiki_id = WikiId::new(7).expect("wiki ID");
+        let draft = CollectionDraft {
+            wiki_id,
+            name: "English Wikipedia".to_owned(),
+            preview: CollectionSelectionPreview {
+                rule: CollectionRule::WholeMainNamespace,
+                members: Vec::new(),
+                missing_titles: Vec::new(),
+                predicted_canonical_bytes: None,
+                category_batches: 0,
+            },
+            history_policy: HistoryPolicy::CurrentAndFuture,
+            budget: CollectionBudget::unlimited(),
+            removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+        };
+        let encoded = encode_collection_draft(&draft).expect("encode whole-edition metadata");
+        assert_eq!(
+            decode_collection_draft(&encoded).expect("decode whole-edition metadata"),
+            draft
+        );
     }
 
     #[test]

@@ -568,7 +568,7 @@ impl Library {
     ) -> Result<u64, StoreError> {
         let manifests = self.validated_manifest_chain()?;
         let (_, protected_manifest_objects) =
-            purge_manifest_binding(&manifests, event.collection_id);
+            purge_manifest_binding(self, &manifests, event.collection_id)?;
         let mut shared = HashSet::new();
         let mut statement = self.connection.prepare(
             "WITH target_pages AS (
@@ -1381,7 +1381,7 @@ impl Library {
         self.validate_authorized_preview(&event)?;
         let manifests = self.validated_manifest_chain()?;
         let (_, protected_manifest_objects) =
-            purge_manifest_binding(&manifests, event.collection_id);
+            purge_manifest_binding(self, &manifests, event.collection_id)?;
         let raw_purge_id = to_sql_integer(purge_id)?;
         self.validate_replacements(purge_id)?;
         self.validate_physical_work_snapshot(purge_id)?;
@@ -1542,7 +1542,7 @@ impl Library {
     fn validate_authorized_preview(&self, event: &PurgeManifest) -> Result<(), StoreError> {
         let manifests = self.validated_manifest_chain()?;
         let (_, protected_manifest_objects) =
-            purge_manifest_binding(&manifests, event.collection_id);
+            purge_manifest_binding(self, &manifests, event.collection_id)?;
         let current = compute_purge_preview(
             &self.connection,
             event.collection_id,
@@ -2488,19 +2488,24 @@ mod tests {
         library
             .connection
             .execute_batch(
-                "DROP TABLE purge_cleanup_accounting;
+                "DROP TABLE whole_edition_discovery_changes;
+                 DROP TABLE whole_edition_changes;
+                 DROP TABLE whole_edition_discoveries;
+                 DROP TABLE whole_edition_imports;
+                 DROP TABLE whole_edition_recovery_markers;
+                 DROP TABLE purge_cleanup_accounting;
                  DROP TABLE purge_replacement_metrics;
                  DROP TABLE purge_file_work;
                  DROP TABLE purge_authorized_absences;
                  ALTER TABLE purge_operations DROP COLUMN catalog_fingerprint;
-                 DELETE FROM schema_migrations WHERE version IN (15, 16);
+                 DELETE FROM schema_migrations WHERE version IN (15, 16, 17);
                  PRAGMA user_version = 14;",
             )
             .expect("restore version-fourteen schema shape");
         drop(library);
 
         let mut upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 16);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 17);
         assert_eq!(
             upgraded
                 .installed_purge_event(receipt.purge_id)

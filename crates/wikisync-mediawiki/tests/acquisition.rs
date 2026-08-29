@@ -35,6 +35,23 @@ fn index(artifact_path: &str, artifact: &[u8]) -> String {
     )
 }
 
+fn multipart_index(parts: &[(&str, &[u8])]) -> String {
+    let artifacts = parts
+        .iter()
+        .map(|(path, bytes)| {
+            format!(
+                "{{\"kind\":\"pages-meta-current-multistream\",\"path\":\"{path}\",\"bytes\":{},\"blake3\":\"{}\"}}",
+                bytes.len(),
+                blake3::hash(bytes).to_hex()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"schema\":\"wikisync-current-dump-index-v1\",\"database\":\"enwiki\",\"generated_at\":\"2026-08-23T12:00:00Z\",\"artifacts\":[{artifacts}]}}"
+    )
+}
+
 fn leaked(value: String) -> &'static str {
     Box::leak(value.into_boxed_str())
 }
@@ -92,6 +109,51 @@ async fn authenticated_index_transitively_verifies_and_caches_artifact() {
         artifact.open(),
         Err(DumpAcquisitionError::CachedArtifactChanged)
     ));
+    fs::remove_dir_all(cache).expect("remove fixture cache");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inventory_defers_later_parts_for_progressive_import() {
+    let first = b"first authenticated dump part";
+    let second = b"second authenticated dump part";
+    let first_name = "enwiki-fixture-pages-meta-current1.xml.bz2";
+    let second_name = "enwiki-fixture-pages-meta-current2.xml.bz2";
+    let index = leaked(multipart_index(&[
+        (first_name, first.as_slice()),
+        (second_name, second.as_slice()),
+    ]));
+    let server = FixtureServer::start(vec![
+        FixtureResponse::json(index),
+        FixtureResponse::json("first authenticated dump part"),
+    ]);
+    let cache = temporary_directory();
+    let client = client(&server);
+    let inventory = client
+        .acquire_current_dump_inventory(
+            &trust(&server, index.as_bytes()),
+            DumpAcquisitionLimits::default(),
+        )
+        .await
+        .expect("authenticated inventory");
+    assert_eq!(inventory.artifact_count(), 2);
+    assert_eq!(
+        inventory.total_compressed_bytes().unwrap(),
+        (first.len() + second.len()) as u64
+    );
+    assert!(!cache.join(first_name).exists());
+    assert!(!cache.join(second_name).exists());
+
+    let artifact = client
+        .acquire_current_dump_artifact(&inventory, 0, &cache, DumpAcquisitionLimits::default())
+        .await
+        .expect("first artifact");
+    let set = inventory
+        .single_artifact_set(0, artifact)
+        .expect("single-part verified set");
+    assert_eq!(set.artifacts().len(), 1);
+    assert_eq!(fs::read(set.artifacts()[0].path()).unwrap(), first);
+    assert!(!cache.join(second_name).exists());
+    assert_eq!(server.finish().len(), 2);
     fs::remove_dir_all(cache).expect("remove fixture cache");
 }
 

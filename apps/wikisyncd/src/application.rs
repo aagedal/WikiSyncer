@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::runtime::{Builder, Runtime};
-use wikisync_core::CollectionId;
+use wikisync_core::{CollectionId, CollectionRule};
 use wikisync_integrity::{VerificationScope, verify_library};
 use wikisync_mediawiki::{ClientConfig, MediaWikiClient};
 use wikisync_store::{Library, NetworkTransferPolicy, ScheduleCadence};
 use wikisync_sync::{
-    BootstrapReport, CategoryPreviewLimits, ReconciliationReport, bootstrap_collection,
-    reconcile_collection_heads_with_cancellation, reconcile_dynamic_collection_membership,
+    BootstrapReport, CategoryPreviewLimits, ReconciliationReport, WholeEditionUpdateReport,
+    bootstrap_collection, reconcile_collection_heads_with_cancellation,
+    reconcile_dynamic_collection_membership, update_whole_main_namespace,
 };
 
 use crate::collection::{DecodedCollectionDraft, decode_collection_draft_version};
@@ -338,6 +339,17 @@ impl ApplicationHandler {
                 "synchronization cancelled by shutdown request",
             ));
         }
+        if configuration.rule == CollectionRule::WholeMainNamespace {
+            if needs_bootstrap {
+                return Err(OperationError::failed(
+                    "whole-edition initial synchronization requires the authenticated dump bootstrap",
+                ));
+            }
+            return runtime
+                .block_on(update_whole_main_namespace(&client, library, collection_id))
+                .map(CollectionSyncReport::WholeEdition)
+                .map_err(|error| OperationError::failed(error.to_string()));
+        }
         runtime
             .block_on(reconcile_dynamic_collection_membership(
                 &client,
@@ -400,7 +412,7 @@ impl ApplicationHandler {
             CollectionSyncReport::Bootstrap(_) => {
                 format!("bootstrapped collection {collection_id}")
             }
-            CollectionSyncReport::Reconciliation(_) => {
+            CollectionSyncReport::Reconciliation(_) | CollectionSyncReport::WholeEdition(_) => {
                 format!("synchronized collection {collection_id}")
             }
         });
@@ -933,6 +945,7 @@ fn cadence_label(cadence: ScheduleCadence) -> &'static str {
 enum CollectionSyncReport {
     Bootstrap(BootstrapReport),
     Reconciliation(ReconciliationReport),
+    WholeEdition(WholeEditionUpdateReport),
 }
 
 #[derive(Debug, Default)]
@@ -961,6 +974,16 @@ impl SynchronizationTotals {
         match report {
             CollectionSyncReport::Bootstrap(report) => self.add_bootstrap(report),
             CollectionSyncReport::Reconciliation(report) => self.add_reconciliation(report),
+            CollectionSyncReport::WholeEdition(report) => {
+                self.reconciled_collections = self.reconciled_collections.saturating_add(1);
+                self.pages_checked = self.pages_checked.saturating_add(
+                    usize::try_from(report.discovery.changes_observed).unwrap_or(usize::MAX),
+                );
+                self.differing_heads = self.differing_heads.saturating_add(
+                    usize::try_from(report.discovery.applied_changes).unwrap_or(usize::MAX),
+                );
+                self.resumed_runs += usize::from(report.resumed);
+            }
         }
     }
 

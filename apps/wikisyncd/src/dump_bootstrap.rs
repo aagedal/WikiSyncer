@@ -7,12 +7,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::runtime::Builder;
-use wikisync_core::{CollectionId, HistoryPolicy, WikiId};
+use wikisync_core::{CollectionId, CollectionRule, HistoryPolicy, WikiId};
 use wikisync_mediawiki::{
     ClientConfig, DumpAcquisitionLimits, DumpDigest, DumpLimits, MediaWikiClient, TrustedDumpIndex,
 };
 use wikisync_store::{DumpImportState, Library};
-use wikisync_sync::{DumpBootstrapReport, bootstrap_collection_from_verified_dump};
+use wikisync_sync::{
+    DumpBootstrapReport, WholeEditionBootstrapReport, bootstrap_collection_from_verified_dump,
+    bootstrap_whole_main_namespace_from_trusted_dump,
+};
 
 use crate::{
     DaemonError, MeteredNetworkState, Mutation, OperationError,
@@ -193,7 +196,7 @@ pub fn preview_current_dump_bootstrap(
             .len(),
     )
     .map_err(|_| OperationError::failed("selected page count exceeds platform limits"))?;
-    if selected_pages == 0 {
+    if selected_pages == 0 && configuration.rule != CollectionRule::WholeMainNamespace {
         return Err(OperationError::failed(
             "current dump bootstrap requires at least one resolved page",
         ));
@@ -289,15 +292,36 @@ pub async fn bootstrap_collection_from_current_dump_direct_async(
         .map(usize::try_from)
         .transpose()
         .map_err(|_| OperationError::failed("network byte-rate policy is too large"))?;
+    let max_run_bytes = usize::try_from(request.acquisition_limits.max_total_artifact_bytes)
+        .map_err(|_| OperationError::failed("dump byte budget exceeds platform limits"))?;
     let client_config = ClientConfig::new(
         &preview.source_api_endpoint,
         crate::application_user_agent().map_err(failed)?,
     )
     .and_then(|config| config.with_max_concurrent_requests(request_slots))
     .and_then(|config| config.with_max_downloaded_response_bytes_per_second(byte_rate))
+    .and_then(|config| config.with_max_downloaded_response_bytes_per_run(max_run_bytes))
     .map_err(failed)?;
     let client = MediaWikiClient::new(client_config).map_err(failed)?;
     let cache = ensure_dump_cache(library.root())?;
+    let configuration = library
+        .collection_configuration(request.collection_id)
+        .map_err(failed)?
+        .ok_or_else(|| OperationError::failed("collection has no committed configuration"))?;
+    if configuration.rule == CollectionRule::WholeMainNamespace {
+        let report = bootstrap_whole_main_namespace_from_trusted_dump(
+            &client,
+            library,
+            request.collection_id,
+            &request.trusted_index,
+            &cache,
+            request.acquisition_limits,
+            request.parser_limits,
+        )
+        .await
+        .map_err(failed)?;
+        return whole_edition_outcome(preview, report);
+    }
     let verified = client
         .acquire_current_dump_set(&request.trusted_index, &cache, request.acquisition_limits)
         .await
@@ -610,6 +634,35 @@ fn outcome(
         closure_differing_heads: report.closure.differing_heads,
         closure_missing_pages: report.closure.missing_pages,
         closure_pages_captured_from_api: report.closure.pages_captured_from_api,
+        checkpoint_committed_through: report.status.checkpoint_candidate,
+    })
+}
+
+fn whole_edition_outcome(
+    preview: CurrentDumpBootstrapPreview,
+    report: WholeEditionBootstrapReport,
+) -> Result<CurrentDumpBootstrapOutcome, OperationError> {
+    if report.import.dump.state != DumpImportState::Succeeded {
+        return Err(OperationError::failed(
+            "whole-edition dump bootstrap returned without a successful durable import",
+        ));
+    }
+    Ok(CurrentDumpBootstrapOutcome {
+        preview,
+        run_id: report.status.run_id,
+        import_id: report.import.dump.import_id,
+        import_state: report.import.dump.state,
+        resumed: report.resumed,
+        pages_scanned: report.import.dump.pages_scanned,
+        pages_imported: report.pages_imported,
+        pages_reused: report.pages_reused,
+        pages_absent_from_dump: 0,
+        closure_pages_checked: usize::try_from(report.discovery.changes_observed)
+            .map_err(|_| OperationError::failed("whole-edition change count overflowed"))?,
+        closure_differing_heads: usize::try_from(report.discovery.applied_changes)
+            .map_err(|_| OperationError::failed("whole-edition applied-change count overflowed"))?,
+        closure_missing_pages: 0,
+        closure_pages_captured_from_api: 0,
         checkpoint_committed_through: report.status.checkpoint_candidate,
     })
 }
@@ -1027,6 +1080,45 @@ mod tests {
             )
             .expect("collection")
             .0
+    }
+
+    #[test]
+    fn whole_edition_preview_accepts_empty_metadata_scope_without_networking() {
+        let temporary = TempLibrary::new();
+        let mut library = Library::open(temporary.path()).expect("library");
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("source");
+        let collection_id = library
+            .create_collection_from_preview(
+                wiki_id,
+                "English Wikipedia",
+                CollectionPreviewCommit {
+                    rule: &CollectionRule::WholeMainNamespace,
+                    history_policy: HistoryPolicy::CurrentAndFuture,
+                    budget: CollectionBudget::unlimited(),
+                    removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+                    members: &[],
+                    missing_titles: &[],
+                    predicted_canonical_bytes: None,
+                },
+            )
+            .expect("whole edition")
+            .0;
+        let request = CurrentDumpBootstrapRequest::new(
+            collection_id,
+            TrustedDumpIndex::new(
+                "https://trusted.example/enwiki/index.json",
+                DumpDigest::from_hex(&"ab".repeat(32)).expect("digest"),
+                "enwiki",
+            )
+            .expect("trust anchor"),
+        )
+        .expect("request");
+
+        let preview = preview_current_dump_bootstrap(&library, &request).expect("preview");
+        assert_eq!(preview.selected_pages, 0);
+        assert_eq!(preview.collection_id, collection_id);
     }
 
     #[test]

@@ -51,16 +51,23 @@ const MIGRATION_13: &str = include_str!("../migrations/0013_dump_imports.sql");
 const MIGRATION_14: &str = include_str!("../migrations/0014_purge_journal.sql");
 const MIGRATION_15: &str = include_str!("../migrations/0015_purge_cleanup.sql");
 const MIGRATION_16: &str = include_str!("../migrations/0016_whole_main_namespace.sql");
+const MIGRATION_17: &str = include_str!("../migrations/0017_whole_edition_streaming.sql");
 const OBJECT_DOMAIN: &[u8] = b"wikisync-object-v1\0";
 const DATABASE_NAME: &str = "library.sqlite3";
 const MANIFEST_DOMAIN: &[u8] = b"wikisync-manifest-v1\0";
+const MANIFEST_SHARD_DOMAIN: &[u8] = b"wikisync-manifest-shard-v1\0";
 const MANIFEST_MEDIA_DOMAIN: &[u8] = b"wikisync-manifest-media-v1\0";
 const MANIFEST_MEDIA_PLACEMENT_DOMAIN: &[u8] = b"wikisync-manifest-media-placement-v1\0";
 const MANIFEST_DIRECTORY: &str = "manifests";
+const MANIFEST_SHARD_DIRECTORY: &str = "manifest-shards";
 const MANIFEST_SCHEMA_VERSION: u32 = 2;
+const SHARDED_MANIFEST_SCHEMA_VERSION: u32 = 4;
+const MANIFEST_SHARD_SCHEMA_VERSION: u32 = 1;
 const MANIFEST_FILENAME_DIGITS: usize = 12;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MANIFEST_ENTRIES: usize = 100_000;
+const DEFAULT_MAX_MANIFEST_SHARD_ENTRIES: u32 = 25_000;
+const MAX_MANIFEST_SHARDS: usize = 100_000;
 const MAX_MANIFEST_TEXT_BYTES: usize = 8 * 1024;
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const PACK_MAGIC: &[u8; 8] = b"WSPACK1\0";
@@ -116,6 +123,9 @@ pub const MAX_MANIFEST_PAGE_SIZE: u32 = 1_000;
 
 /// Maximum metadata-reference records returned by one integrity enumeration call.
 pub const MAX_INTEGRITY_METADATA_PAGE_SIZE: u32 = 1_000;
+
+/// Maximum whole-edition members or RecentChanges events accepted by one call.
+pub const MAX_WHOLE_EDITION_PAGE_SIZE: u32 = 1_000;
 
 /// Maximum number of collection-exclusive canonical objects in one purge operation.
 pub const MAX_PURGE_OBJECTS: u32 = 100_000;
@@ -212,6 +222,7 @@ pub struct StoreConfig {
     compression_level: i32,
     max_pack_objects: u32,
     max_pack_input_bytes: u64,
+    max_manifest_shard_entries: u32,
 }
 
 impl Default for StoreConfig {
@@ -221,6 +232,7 @@ impl Default for StoreConfig {
             compression_level: 3,
             max_pack_objects: DEFAULT_MAX_PACK_OBJECTS,
             max_pack_input_bytes: DEFAULT_MAX_PACK_INPUT_BYTES,
+            max_manifest_shard_entries: DEFAULT_MAX_MANIFEST_SHARD_ENTRIES,
         }
     }
 }
@@ -267,6 +279,20 @@ impl StoreConfig {
             ));
         }
         self.max_pack_input_bytes = bytes;
+        Ok(self)
+    }
+
+    /// Sets the maximum number of records in one schema-v4 manifest shard.
+    ///
+    /// This is primarily useful for keeping memory and file sizes bounded on very
+    /// large editions. Values below the default are also useful in fixture tests.
+    pub fn with_max_manifest_shard_entries(mut self, count: u32) -> Result<Self, StoreError> {
+        if count == 0 || count as usize > MAX_MANIFEST_ENTRIES {
+            return Err(StoreError::InvalidConfig(
+                "maximum manifest shard entry count must be between 1 and 100,000",
+            ));
+        }
+        self.max_manifest_shard_entries = count;
         Ok(self)
     }
 }
@@ -436,6 +462,89 @@ impl fmt::Display for InvalidManifestId {
 
 impl Error for InvalidManifestId {}
 
+/// Content identity of one canonical schema-v4 manifest shard.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ManifestShardId([u8; 32]);
+
+impl ManifestShardId {
+    fn for_body(body: &[u8]) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(MANIFEST_SHARD_DOMAIN);
+        hasher.update(&(body.len() as u64).to_le_bytes());
+        hasher.update(body);
+        Self(*hasher.finalize().as_bytes())
+    }
+}
+
+impl fmt::Debug for ManifestShardId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for ManifestShardId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "b3:{}",
+            blake3::Hash::from_bytes(self.0).to_hex()
+        )
+    }
+}
+
+impl FromStr for ManifestShardId {
+    type Err = InvalidManifestId;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let digest = value.strip_prefix("b3:").ok_or(InvalidManifestId)?;
+        let hash = blake3::Hash::from_hex(digest).map_err(|_| InvalidManifestId)?;
+        Ok(Self(*hash.as_bytes()))
+    }
+}
+
+/// Logical record family stored in one manifest shard.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ManifestShardKind {
+    IntroducedRevisions,
+    PageHeads,
+}
+
+impl ManifestShardKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::IntroducedRevisions => "introduced-revisions",
+            Self::PageHeads => "page-heads",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "introduced-revisions" => Ok(Self::IntroducedRevisions),
+            "page-heads" => Ok(Self::PageHeads),
+            _ => Err(StoreError::InvalidManifest("unknown manifest shard kind")),
+        }
+    }
+}
+
+/// Root-manifest commitment to one independently content-addressed shard.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestShardDescriptor {
+    pub kind: ManifestShardKind,
+    pub ordinal: u32,
+    pub entry_count: u32,
+    pub byte_length: u64,
+    pub first_key: u64,
+    pub last_key: u64,
+    pub id: ManifestShardId,
+}
+
+/// One bounded, identity-verified manifest shard.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ManifestShard {
+    IntroducedRevisions(Vec<ManifestRevision>),
+    PageHeads(Vec<ManifestPageHead>),
+}
+
 /// One durable revision newly represented by this manifest chain entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManifestRevision {
@@ -604,6 +713,8 @@ pub struct StoredManifest {
     pub id: ManifestId,
     /// Validated semantic contents.
     pub manifest: ManifestEntry,
+    /// Ordered schema-v4 shard commitments. Empty for schemas 1 through 3.
+    pub shards: Vec<ManifestShardDescriptor>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -632,6 +743,36 @@ struct ManifestBody {
     media_inventory: Option<Vec<ManifestMediaWire>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     media_placements: Option<Vec<ManifestMediaPlacementWire>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    shards: Vec<ManifestShardDescriptorWire>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ManifestShardDescriptorWire {
+    kind: String,
+    ordinal: u32,
+    entry_count: u32,
+    byte_length: u64,
+    first_key: u64,
+    last_key: u64,
+    shard_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ManifestShardEnvelope {
+    shard_id: String,
+    #[serde(flatten)]
+    body: ManifestShardBody,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ManifestShardBody {
+    schema_version: u32,
+    kind: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    introduced_revisions: Vec<ManifestRevisionWire>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    page_heads: Vec<ManifestPageHeadWire>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1389,6 +1530,8 @@ struct PurgePackSnapshot {
     reclaimable_bytes: u64,
 }
 
+type PurgeManifestBinding = (Option<(u64, ManifestId)>, HashSet<ObjectId>);
+
 /// Persisted logical-object verification state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObjectVerificationState {
@@ -1850,6 +1993,260 @@ pub struct StartedDumpImport {
     pub resumed: bool,
 }
 
+/// Immutable identity required to claim a streaming whole-edition bootstrap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WholeEditionImportRequest<'a> {
+    /// Running collection-scoped bootstrap run whose candidate closes the race window.
+    pub run_id: u64,
+    /// Source-published snapshot name, such as a dump date plus job identity.
+    pub snapshot_id: &'a str,
+    /// BLAKE3 identity of the authenticated dump-set index.
+    pub dump_digest: &'a str,
+    /// Exact total compressed length of the authenticated dump artifacts.
+    pub dump_compressed_bytes: u64,
+    /// Collection generation at which the whole-edition rule was claimed.
+    pub collection_generation: u64,
+    /// Source time represented by the dump snapshot and start of race closure.
+    pub snapshot_timestamp: u64,
+    /// Source time through which RecentChanges must close the dump race window.
+    pub race_window_end: u64,
+    /// Optional unresolved long-gap marker requiring this fresh snapshot.
+    pub recovery_marker_id: Option<u64>,
+}
+
+/// Durable aggregate progress for a streaming whole-edition bootstrap.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WholeEditionImportStatus {
+    /// Underlying authenticated dump-import status and aggregate page counts.
+    pub dump: DumpImportStatus,
+    /// Registered source endpoint captured when the import was first claimed.
+    pub source_endpoint: String,
+    /// Exact source-published snapshot identity.
+    pub snapshot_id: String,
+    /// Source boundary represented by the dump snapshot.
+    pub snapshot_timestamp: u64,
+    /// Required end of the post-snapshot race window.
+    pub race_window_end: u64,
+    /// Zero-based dump artifact currently being streamed.
+    pub artifact_index: u64,
+    /// Compressed byte offset durably consumed within that artifact.
+    pub artifact_offset: u64,
+    /// Long-gap recovery marker bound to this import, when any.
+    pub recovery_marker_id: Option<u64>,
+}
+
+/// Result of claiming or resuming an exact whole-edition import identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartedWholeEditionImport {
+    /// Current durable aggregate status.
+    pub status: WholeEditionImportStatus,
+    /// Whether this exact identity already existed.
+    pub resumed: bool,
+}
+
+/// One bounded page from the durable imported-member ledger.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WholeEditionImportedMember {
+    /// Stable source page identity.
+    pub page_id: PageId,
+    /// Current revision admitted from the snapshot.
+    pub revision_id: RevisionId,
+    /// Latest captured page title.
+    pub title: PageTitle,
+    /// Canonical source bytes attributed to the import.
+    pub canonical_bytes: u64,
+}
+
+/// Kind of a durable RecentChanges discovery pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WholeEditionDiscoveryKind {
+    /// Closes the interval between an imported snapshot and its bootstrap boundary.
+    RaceWindow,
+    /// Normal overlap-window discovery after a committed checkpoint.
+    Incremental,
+    /// Closes the race window after a long gap forced a fresh dump.
+    LongGapClosure,
+}
+
+impl WholeEditionDiscoveryKind {
+    /// Stable SQLite and status representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RaceWindow => "race-window",
+            Self::Incremental => "incremental",
+            Self::LongGapClosure => "long-gap-closure",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "race-window" => Ok(Self::RaceWindow),
+            "incremental" => Ok(Self::Incremental),
+            "long-gap-closure" => Ok(Self::LongGapClosure),
+            _ => Err(StoreError::CorruptMetadata(
+                "unknown whole-edition discovery kind",
+            )),
+        }
+    }
+}
+
+/// Lifecycle of one durable RecentChanges discovery pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WholeEditionDiscoveryState {
+    /// The writer may append the next bounded source batch.
+    Running,
+    /// Source exhaustion and every discovered application were recorded.
+    Succeeded,
+    /// Discovery stopped with retained structured failure details.
+    Failed,
+}
+
+impl WholeEditionDiscoveryState {
+    fn from_database(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            _ => Err(StoreError::CorruptMetadata(
+                "unknown whole-edition discovery state",
+            )),
+        }
+    }
+}
+
+/// Immutable binding used to claim a RecentChanges pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WholeEditionDiscoveryRequest {
+    /// Running sync run that will advance the collection checkpoint.
+    pub run_id: u64,
+    /// Discovery semantics and required import binding.
+    pub kind: WholeEditionDiscoveryKind,
+    /// Inclusive source discovery boundary.
+    pub window_start: u64,
+    /// Source boundary committed only after the pass succeeds.
+    pub window_end: u64,
+    /// Snapshot import for race-window and long-gap closure.
+    pub import_id: Option<u64>,
+    /// Recovery marker for long-gap closure.
+    pub recovery_marker_id: Option<u64>,
+}
+
+/// Durable aggregate progress for a RecentChanges pass.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WholeEditionDiscoveryStatus {
+    pub discovery_id: u64,
+    pub run_id: u64,
+    pub wiki_id: WikiId,
+    pub collection_id: CollectionId,
+    pub kind: WholeEditionDiscoveryKind,
+    pub window_start: u64,
+    pub window_end: u64,
+    pub import_id: Option<u64>,
+    pub recovery_marker_id: Option<u64>,
+    pub state: WholeEditionDiscoveryState,
+    /// Opaque continuation to send with the next source request.
+    pub continuation: Option<String>,
+    /// True only after a committed batch explicitly observed no next continuation.
+    pub source_exhausted: bool,
+    pub batches_recorded: u64,
+    pub changes_observed: u64,
+    pub new_changes: u64,
+    pub applied_changes: u64,
+    pub ignored_changes: u64,
+    pub attempt_count: u32,
+    pub retryable: bool,
+    pub latest_error: Option<SyncFailure>,
+}
+
+/// Result of claiming or resuming durable discovery work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartedWholeEditionDiscovery {
+    pub status: WholeEditionDiscoveryStatus,
+    pub resumed: bool,
+}
+
+/// Stable RecentChanges event category required for discovery and application.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WholeEditionChangeKind {
+    Edit,
+    New,
+    Move,
+    Delete,
+    Restore,
+    Other,
+}
+
+impl WholeEditionChangeKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Edit => "edit",
+            Self::New => "new",
+            Self::Move => "move",
+            Self::Delete => "delete",
+            Self::Restore => "restore",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// One source event in a bounded RecentChanges response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WholeEditionChange<'a> {
+    pub change_id: u64,
+    pub kind: WholeEditionChangeKind,
+    pub occurred_at: u64,
+    pub page_id: Option<PageId>,
+    pub revision_id: Option<RevisionId>,
+    pub namespace: Option<i32>,
+    pub title: Option<&'a str>,
+}
+
+/// Owned durable event returned by bounded pending-application enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredWholeEditionChange {
+    pub change_id: u64,
+    pub kind: WholeEditionChangeKind,
+    pub occurred_at: u64,
+    pub page_id: Option<PageId>,
+    pub revision_id: Option<RevisionId>,
+    pub namespace: Option<i32>,
+    pub title: Option<String>,
+}
+
+/// Terminal local handling of one discovered event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WholeEditionChangeDisposition {
+    /// The source event's required canonical/local mutation is durable.
+    Applied,
+    /// The event was durably classified as irrelevant to this collection.
+    Ignored,
+}
+
+impl WholeEditionChangeDisposition {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Ignored => "ignored",
+        }
+    }
+}
+
+/// Durable marker forcing fresh-snapshot recovery after unsafe checkpoint age.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WholeEditionRecoveryMarker {
+    pub recovery_marker_id: u64,
+    pub wiki_id: WikiId,
+    pub collection_id: CollectionId,
+    pub last_safe_checkpoint: u64,
+    pub detected_at: u64,
+    pub reason: String,
+    pub import_id: Option<u64>,
+    pub discovery_id: Option<u64>,
+    pub resolved: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PackEncoding {
     Full,
@@ -2034,6 +2431,27 @@ struct DumpImportRow {
 }
 
 type DumpImportRunBinding = (i64, Option<i64>, String, String, i64, Option<String>);
+type WholeImportClaimBinding = (String, String, Option<(i64, String)>);
+type WholeImportExtensionRow = (String, String, i64, i64, i64, i64, Option<i64>);
+type WholeDiscoveryIdentityRow = (
+    i64,
+    Option<i64>,
+    Option<i64>,
+    String,
+    i64,
+    i64,
+    String,
+    i64,
+    bool,
+);
+type WholeChangeIdentityRow = (
+    String,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+);
 
 /// One WikiSyncer library and its SQLite connection.
 #[derive(Debug)]
@@ -2052,6 +2470,8 @@ fn prepare_library_directories(root: &Path) -> io::Result<()> {
         root.join("objects/loose/b3"),
         root.join("objects/packs"),
         root.join(MANIFEST_DIRECTORY),
+        root.join(MANIFEST_SHARD_DIRECTORY),
+        root.join(MANIFEST_SHARD_DIRECTORY).join("b3"),
         root.join("tmp"),
     ] {
         create_private_dir_all(&directory)?;
@@ -2530,7 +2950,7 @@ impl Library {
     ) -> Result<PurgePreview, StoreError> {
         let manifests = self.validated_manifest_chain()?;
         let (manifest_head, protected_manifest_objects) =
-            purge_manifest_binding(&manifests, collection_id);
+            purge_manifest_binding(self, &manifests, collection_id)?;
         compute_purge_preview(
             &self.connection,
             collection_id,
@@ -2566,7 +2986,7 @@ impl Library {
 
         let manifests = self.validated_manifest_chain()?;
         let (manifest_head, protected_manifest_objects) =
-            purge_manifest_binding(&manifests, collection_id);
+            purge_manifest_binding(self, &manifests, collection_id)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2700,7 +3120,7 @@ impl Library {
         let mut snapshot = purge_verification_snapshot(&self.connection, purge_id)?;
         let manifests = self.validated_manifest_chain()?;
         let (_, protected_manifest_objects) =
-            purge_manifest_binding(&manifests, snapshot.expected_manifest.collection_id);
+            purge_manifest_binding(self, &manifests, snapshot.expected_manifest.collection_id)?;
         snapshot.shared_object_count = purge_shared_reference_count(
             &self.connection,
             purge_id,
@@ -2760,7 +3180,7 @@ impl Library {
         if current_head != event.pre_purge_head_sequence.zip(event.pre_purge_head_id) {
             return Err(StoreError::StalePurgePreview(event.collection_id));
         }
-        let (_, protected) = purge_manifest_binding(&prior, event.collection_id);
+        let (_, protected) = purge_manifest_binding(self, &prior, event.collection_id)?;
         let current = compute_purge_preview(
             &self.connection,
             event.collection_id,
@@ -4452,6 +4872,1106 @@ impl Library {
             .transpose()
     }
 
+    /// Claims an exact whole-main-namespace snapshot and its race-window boundary.
+    pub fn claim_or_resume_whole_edition_import(
+        &mut self,
+        request: WholeEditionImportRequest<'_>,
+    ) -> Result<StartedWholeEditionImport, StoreError> {
+        validate_sync_text(request.snapshot_id, "whole-edition snapshot identity")?;
+        if request.race_window_end < request.snapshot_timestamp {
+            return Err(StoreError::InvalidWholeEditionState(
+                "race-window end precedes dump snapshot",
+            ));
+        }
+        let binding: Option<WholeImportClaimBinding> = self
+            .connection
+            .query_row(
+                "SELECT wikis.api_endpoint, configuration.rule_kind,
+                        marker.recovery_marker_id, marker.state
+                 FROM sync_runs
+                 JOIN wikis USING (wiki_id)
+                 JOIN collection_configuration AS configuration USING (collection_id)
+                 LEFT JOIN whole_edition_recovery_markers AS marker
+                   ON marker.recovery_marker_id = ?2
+                  AND marker.collection_id = sync_runs.collection_id
+                 WHERE sync_runs.run_id = ?1",
+                params![
+                    to_sql_integer(request.run_id)?,
+                    request.recovery_marker_id.map(to_sql_integer).transpose()?,
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get::<_, Option<i64>>(2)?
+                            .zip(row.get::<_, Option<String>>(3)?),
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((source_endpoint, rule_kind, marker)) = binding else {
+            return Err(StoreError::SyncRunNotRunning(request.run_id));
+        };
+        if rule_kind != "whole-main-namespace" {
+            return Err(StoreError::WholeEditionCollectionRequired);
+        }
+        match (request.recovery_marker_id, marker) {
+            (None, None) => {}
+            (Some(expected), Some((actual, state)))
+                if to_sql_integer(expected)? == actual && state != "resolved" => {}
+            (Some(_), _) => {
+                return Err(StoreError::InvalidWholeEditionState(
+                    "long-gap recovery marker is absent or already resolved",
+                ));
+            }
+            (None, Some(_)) => unreachable!("no marker join without a requested identity"),
+        }
+
+        let existing_identity: Option<(i64, String, String, i64, i64, Option<i64>)> = self
+            .connection
+            .query_row(
+                "SELECT dump.import_id, whole.source_endpoint, whole.snapshot_id,
+                        whole.snapshot_timestamp, whole.race_window_end,
+                        whole.recovery_marker_id
+                 FROM dump_imports AS dump
+                 JOIN whole_edition_imports AS whole USING (import_id)
+                 WHERE dump.run_id = ?1",
+                [to_sql_integer(request.run_id)?],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some(existing) = existing_identity {
+            if existing.1 != source_endpoint
+                || existing.2 != request.snapshot_id
+                || existing.3 != to_sql_integer(request.snapshot_timestamp)?
+                || existing.4 != to_sql_integer(request.race_window_end)?
+                || existing.5 != request.recovery_marker_id.map(to_sql_integer).transpose()?
+            {
+                return Err(StoreError::DumpImportIdentityMismatch {
+                    import_id: sql_u64(existing.0, "invalid dump import ID")?,
+                });
+            }
+        }
+
+        let started = self.claim_or_resume_dump_import(DumpImportRequest {
+            run_id: request.run_id,
+            dump_digest: request.dump_digest,
+            dump_compressed_bytes: request.dump_compressed_bytes,
+            collection_generation: request.collection_generation,
+            bootstrap_started_at: request.race_window_end,
+        })?;
+        let raw_import_id = to_sql_integer(started.status.import_id)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(String, String, i64, i64, Option<i64>)> = transaction
+            .query_row(
+                "SELECT source_endpoint, snapshot_id, snapshot_timestamp,
+                        race_window_end, recovery_marker_id
+                 FROM whole_edition_imports WHERE import_id = ?1",
+                [raw_import_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let raw_marker = request.recovery_marker_id.map(to_sql_integer).transpose()?;
+        if let Some(existing) = existing {
+            if existing
+                != (
+                    source_endpoint.clone(),
+                    request.snapshot_id.to_owned(),
+                    to_sql_integer(request.snapshot_timestamp)?,
+                    to_sql_integer(request.race_window_end)?,
+                    raw_marker,
+                )
+            {
+                return Err(StoreError::DumpImportIdentityMismatch {
+                    import_id: started.status.import_id,
+                });
+            }
+        } else {
+            transaction.execute(
+                "INSERT INTO whole_edition_imports (
+                    import_id, source_endpoint, snapshot_id, snapshot_timestamp,
+                    race_window_end, recovery_marker_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    raw_import_id,
+                    source_endpoint,
+                    request.snapshot_id,
+                    to_sql_integer(request.snapshot_timestamp)?,
+                    to_sql_integer(request.race_window_end)?,
+                    raw_marker,
+                ],
+            )?;
+            if let Some(raw_marker) = raw_marker {
+                let changed = transaction.execute(
+                    "UPDATE whole_edition_recovery_markers
+                     SET state = 'recovering', import_id = ?2
+                     WHERE recovery_marker_id = ?1 AND state = 'required'",
+                    params![raw_marker, raw_import_id],
+                )?;
+                if changed != 1 {
+                    return Err(StoreError::InvalidWholeEditionState(
+                        "long-gap marker was claimed by different recovery work",
+                    ));
+                }
+            }
+        }
+        transaction.commit()?;
+        let status = self
+            .whole_edition_import_status(started.status.import_id)?
+            .ok_or(StoreError::CorruptMetadata(
+                "whole-edition import extension is missing",
+            ))?;
+        Ok(StartedWholeEditionImport {
+            status,
+            resumed: started.resumed,
+        })
+    }
+
+    /// Advances a dump artifact position and page cursor monotonically in one commit.
+    pub fn record_whole_edition_stream_progress(
+        &mut self,
+        import_id: u64,
+        pages_scanned: u64,
+        artifact_index: u64,
+        artifact_offset: u64,
+    ) -> Result<WholeEditionImportStatus, StoreError> {
+        let raw_import_id = to_sql_integer(import_id)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_dump_progress_can_advance(&transaction, import_id, raw_import_id, pages_scanned)?;
+        let current: Option<(i64, i64)> = transaction
+            .query_row(
+                "SELECT artifact_index, artifact_offset FROM whole_edition_imports
+                 WHERE import_id = ?1",
+                [raw_import_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((current_index, current_offset)) = current else {
+            return Err(StoreError::WholeEditionImportNotFound(import_id));
+        };
+        let requested_index = to_sql_integer(artifact_index)?;
+        let requested_offset = to_sql_integer(artifact_offset)?;
+        if requested_index < current_index
+            || (requested_index == current_index && requested_offset < current_offset)
+        {
+            return Err(StoreError::WholeEditionProgressRegression { import_id });
+        }
+        let now = unix_time()?;
+        transaction.execute(
+            "UPDATE dump_imports SET pages_scanned = ?2, updated_at = ?3
+             WHERE import_id = ?1 AND state = 'running'",
+            params![raw_import_id, to_sql_integer(pages_scanned)?, now],
+        )?;
+        transaction.execute(
+            "UPDATE whole_edition_imports
+             SET artifact_index = ?2, artifact_offset = ?3 WHERE import_id = ?1",
+            params![raw_import_id, requested_index, requested_offset],
+        )?;
+        transaction.commit()?;
+        self.whole_edition_import_status(import_id)?
+            .ok_or(StoreError::WholeEditionImportNotFound(import_id))
+    }
+
+    /// Atomically records a captured whole-edition member in the durable import ledger.
+    pub fn record_whole_edition_imported_member(
+        &mut self,
+        import_id: u64,
+        pages_scanned: u64,
+        page_id: PageId,
+        revision_id: RevisionId,
+        canonical_bytes: u64,
+    ) -> Result<WholeEditionImportStatus, StoreError> {
+        if self.whole_edition_import_status(import_id)?.is_none() {
+            return Err(StoreError::WholeEditionImportNotFound(import_id));
+        }
+        self.record_dump_imported_page(
+            import_id,
+            pages_scanned,
+            page_id,
+            revision_id,
+            canonical_bytes,
+        )?;
+        self.whole_edition_import_status(import_id)?
+            .ok_or(StoreError::WholeEditionImportNotFound(import_id))
+    }
+
+    /// Returns aggregate whole-edition status without materializing its members.
+    pub fn whole_edition_import_status(
+        &self,
+        import_id: u64,
+    ) -> Result<Option<WholeEditionImportStatus>, StoreError> {
+        whole_edition_import_status_by_id(&self.connection, to_sql_integer(import_id)?)
+    }
+
+    /// Enumerates the imported-member ledger in stable, bounded page-ID order.
+    pub fn whole_edition_imported_members_after(
+        &self,
+        import_id: u64,
+        after_page_id: Option<PageId>,
+        limit: u32,
+    ) -> Result<Vec<WholeEditionImportedMember>, StoreError> {
+        validate_whole_edition_page_size(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT imported.page_id, imported.revision_id, pages.current_title,
+                    imported.canonical_bytes
+             FROM dump_import_pages AS imported
+             JOIN whole_edition_imports USING (import_id)
+             JOIN pages ON pages.wiki_id = imported.wiki_id
+                       AND pages.page_id = imported.page_id
+             WHERE imported.import_id = ?1 AND imported.page_id > ?2
+             ORDER BY imported.page_id LIMIT ?3",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    to_sql_integer(import_id)?,
+                    after_page_id.map_or(Ok(0), |id| to_sql_integer(id.get()))?,
+                    i64::from(limit),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(WholeEditionImportedMember {
+                    page_id: sql_id(row.0, "invalid imported page ID")?,
+                    revision_id: sql_id(row.1, "invalid imported revision ID")?,
+                    title: PageTitle::new(row.2)
+                        .map_err(|_| StoreError::CorruptMetadata("invalid imported page title"))?,
+                    canonical_bytes: sql_u64(row.3, "invalid imported canonical bytes")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Claims a durable RecentChanges pass with exact run/window/import semantics.
+    pub fn claim_or_resume_whole_edition_discovery(
+        &mut self,
+        request: WholeEditionDiscoveryRequest,
+    ) -> Result<StartedWholeEditionDiscovery, StoreError> {
+        if request.window_end < request.window_start {
+            return Err(StoreError::InvalidWholeEditionState(
+                "RecentChanges window end precedes its start",
+            ));
+        }
+        match request.kind {
+            WholeEditionDiscoveryKind::Incremental
+                if request.import_id.is_some() || request.recovery_marker_id.is_some() =>
+            {
+                return Err(StoreError::InvalidWholeEditionState(
+                    "incremental discovery cannot bind a dump or recovery marker",
+                ));
+            }
+            WholeEditionDiscoveryKind::RaceWindow
+                if request.import_id.is_none() || request.recovery_marker_id.is_some() =>
+            {
+                return Err(StoreError::InvalidWholeEditionState(
+                    "race-window discovery requires only a dump import",
+                ));
+            }
+            WholeEditionDiscoveryKind::LongGapClosure
+                if request.import_id.is_none() || request.recovery_marker_id.is_none() =>
+            {
+                return Err(StoreError::InvalidWholeEditionState(
+                    "long-gap closure requires a dump import and recovery marker",
+                ));
+            }
+            _ => {}
+        }
+        let raw_run_id = to_sql_integer(request.run_id)?;
+        let raw_import_id = request.import_id.map(to_sql_integer).transpose()?;
+        let raw_marker_id = request.recovery_marker_id.map(to_sql_integer).transpose()?;
+        let now = unix_time()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run: Option<(i64, i64, String, i64, String)> = transaction
+            .query_row(
+                "SELECT sync_runs.wiki_id, sync_runs.collection_id, sync_runs.state,
+                        sync_runs.checkpoint_candidate, configuration.rule_kind
+                 FROM sync_runs
+                 JOIN collection_configuration AS configuration USING (collection_id)
+                 WHERE sync_runs.run_id = ?1",
+                [raw_run_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((raw_wiki_id, raw_collection_id, run_state, candidate, rule_kind)) = run else {
+            return Err(StoreError::SyncRunNotRunning(request.run_id));
+        };
+        if run_state != "running" {
+            return Err(StoreError::SyncRunNotRunning(request.run_id));
+        }
+        if rule_kind != "whole-main-namespace" {
+            return Err(StoreError::WholeEditionCollectionRequired);
+        }
+        if candidate != to_sql_integer(request.window_end)? {
+            return Err(StoreError::InvalidWholeEditionState(
+                "discovery end does not match the sync checkpoint candidate",
+            ));
+        }
+        let active_marker: Option<i64> = transaction
+            .query_row(
+                "SELECT recovery_marker_id FROM whole_edition_recovery_markers
+                 WHERE collection_id = ?1 AND state != 'resolved'",
+                [raw_collection_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if request.kind == WholeEditionDiscoveryKind::Incremental && active_marker.is_some() {
+            return Err(StoreError::WholeEditionLongGapRecoveryRequired {
+                collection_id: sql_id(raw_collection_id, "invalid recovery collection ID")?,
+            });
+        }
+        if let Some(raw_import_id) = raw_import_id {
+            let imported: Option<(i64, i64, i64, Option<i64>, String)> = transaction
+                .query_row(
+                    "SELECT dump.wiki_id, dump.collection_id, whole.snapshot_timestamp,
+                            whole.recovery_marker_id, dump.state
+                     FROM whole_edition_imports AS whole
+                     JOIN dump_imports AS dump USING (import_id)
+                     WHERE whole.import_id = ?1",
+                    [raw_import_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((import_wiki, import_collection, snapshot, import_marker, state)) = imported
+            else {
+                return Err(StoreError::WholeEditionImportNotFound(
+                    request.import_id.unwrap(),
+                ));
+            };
+            if import_wiki != raw_wiki_id
+                || import_collection != raw_collection_id
+                || snapshot != to_sql_integer(request.window_start)?
+                || import_marker != raw_marker_id
+                || !matches!(state.as_str(), "running" | "succeeded")
+            {
+                return Err(StoreError::InvalidWholeEditionState(
+                    "discovery does not match an active snapshot import",
+                ));
+            }
+        }
+        if let Some(raw_marker_id) = raw_marker_id {
+            if active_marker != Some(raw_marker_id) {
+                return Err(StoreError::InvalidWholeEditionState(
+                    "long-gap discovery does not match the active recovery marker",
+                ));
+            }
+        }
+
+        let existing: Option<WholeDiscoveryIdentityRow> = transaction
+            .query_row(
+                "SELECT discovery_id, import_id, recovery_marker_id, discovery_kind,
+                            window_start, window_end, state, attempt_count, retryable
+                     FROM whole_edition_discoveries WHERE run_id = ?1",
+                [raw_run_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (raw_discovery_id, resumed) = if let Some(existing) = existing {
+            if existing.1 != raw_import_id
+                || existing.2 != raw_marker_id
+                || existing.3 != request.kind.as_str()
+                || existing.4 != to_sql_integer(request.window_start)?
+                || existing.5 != to_sql_integer(request.window_end)?
+            {
+                return Err(StoreError::WholeEditionDiscoveryIdentityMismatch(sql_u64(
+                    existing.0,
+                    "invalid discovery ID",
+                )?));
+            }
+            match WholeEditionDiscoveryState::from_database(&existing.6)? {
+                WholeEditionDiscoveryState::Succeeded => (existing.0, true),
+                WholeEditionDiscoveryState::Failed if !existing.8 => {
+                    return Err(StoreError::WholeEditionDiscoveryNotRestartable(sql_u64(
+                        existing.0,
+                        "invalid discovery ID",
+                    )?));
+                }
+                WholeEditionDiscoveryState::Running | WholeEditionDiscoveryState::Failed => {
+                    let attempt = existing
+                        .7
+                        .checked_add(1)
+                        .ok_or(StoreError::DumpImportProgressOverflow)?;
+                    transaction.execute(
+                        "UPDATE whole_edition_discoveries
+                         SET state = 'running', attempt_count = ?2, retryable = 1,
+                             error_code = NULL, error_message = NULL, claimed_at = ?3,
+                             updated_at = ?3, finished_at = NULL
+                         WHERE discovery_id = ?1",
+                        params![existing.0, attempt, now],
+                    )?;
+                    (existing.0, true)
+                }
+            }
+        } else {
+            transaction.execute(
+                "INSERT INTO whole_edition_discoveries (
+                    run_id, import_id, recovery_marker_id, wiki_id, collection_id,
+                    discovery_kind, window_start, window_end, state,
+                    created_at, claimed_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', ?9, ?9, ?9)",
+                params![
+                    raw_run_id,
+                    raw_import_id,
+                    raw_marker_id,
+                    raw_wiki_id,
+                    raw_collection_id,
+                    request.kind.as_str(),
+                    to_sql_integer(request.window_start)?,
+                    to_sql_integer(request.window_end)?,
+                    now,
+                ],
+            )?;
+            (transaction.last_insert_rowid(), false)
+        };
+        transaction.commit()?;
+        let status = whole_edition_discovery_status_by_id(&self.connection, raw_discovery_id)?
+            .ok_or(StoreError::CorruptMetadata("new discovery was not found"))?;
+        Ok(StartedWholeEditionDiscovery { status, resumed })
+    }
+
+    /// Commits one bounded source batch and its next continuation atomically.
+    pub fn record_whole_edition_recent_changes_batch(
+        &mut self,
+        discovery_id: u64,
+        expected_batches_recorded: u64,
+        next_continuation: Option<&str>,
+        changes: &[WholeEditionChange<'_>],
+    ) -> Result<WholeEditionDiscoveryStatus, StoreError> {
+        if changes.len() > MAX_WHOLE_EDITION_PAGE_SIZE as usize {
+            return Err(StoreError::WholeEditionPageLimitExceeded);
+        }
+        if let Some(cursor) = next_continuation {
+            validate_sync_text(cursor, "RecentChanges continuation")?;
+        }
+        let raw_discovery_id = to_sql_integer(discovery_id)?;
+        let now = unix_time()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let discovery: Option<(i64, i64, i64, bool)> = transaction
+            .query_row(
+                "SELECT wiki_id, collection_id, batches_recorded, source_exhausted
+                 FROM whole_edition_discoveries
+                 WHERE discovery_id = ?1 AND state = 'running'",
+                [raw_discovery_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((raw_wiki_id, raw_collection_id, batches, exhausted)) = discovery else {
+            return Err(StoreError::WholeEditionDiscoveryNotRunning(discovery_id));
+        };
+        if exhausted || batches != to_sql_integer(expected_batches_recorded)? {
+            return Err(StoreError::WholeEditionDiscoveryCursorConflict {
+                discovery_id,
+                current_batches: sql_u64(batches, "invalid discovery batch count")?,
+            });
+        }
+        let mut new_changes = 0_i64;
+        let mut batch_ids = HashSet::with_capacity(changes.len());
+        for change in changes {
+            if change.change_id == 0 || !batch_ids.insert(change.change_id) {
+                return Err(StoreError::InvalidWholeEditionChange(change.change_id));
+            }
+            if let Some(title) = change.title {
+                validate_sync_text(title, "RecentChanges title")?;
+            }
+            let raw_change_id = to_sql_integer(change.change_id)?;
+            let existing: Option<WholeChangeIdentityRow> = transaction
+                .query_row(
+                    "SELECT change_kind, occurred_at, page_id, revision_id, namespace, title
+                         FROM whole_edition_changes
+                         WHERE collection_id = ?1 AND change_id = ?2",
+                    params![raw_collection_id, raw_change_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let identity = (
+                change.kind.as_str().to_owned(),
+                to_sql_integer(change.occurred_at)?,
+                change
+                    .page_id
+                    .map(|id| to_sql_integer(id.get()))
+                    .transpose()?,
+                change
+                    .revision_id
+                    .map(|id| to_sql_integer(id.get()))
+                    .transpose()?,
+                change.namespace.map(i64::from),
+                change.title.map(str::to_owned),
+            );
+            if let Some(existing) = existing {
+                if existing != identity {
+                    return Err(StoreError::ConflictingWholeEditionChange(change.change_id));
+                }
+                transaction.execute(
+                    "UPDATE whole_edition_changes
+                     SET last_discovery_id = ?3, last_observed_at = ?4
+                     WHERE collection_id = ?1 AND change_id = ?2",
+                    params![raw_collection_id, raw_change_id, raw_discovery_id, now],
+                )?;
+            } else {
+                transaction.execute(
+                    "INSERT INTO whole_edition_changes (
+                        collection_id, change_id, wiki_id, change_kind, occurred_at,
+                        page_id, revision_id, namespace, title, application_state,
+                        first_discovery_id, last_discovery_id,
+                        first_observed_at, last_observed_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                               'pending', ?10, ?10, ?11, ?11)",
+                    params![
+                        raw_collection_id,
+                        raw_change_id,
+                        raw_wiki_id,
+                        identity.0,
+                        identity.1,
+                        identity.2,
+                        identity.3,
+                        identity.4,
+                        identity.5,
+                        raw_discovery_id,
+                        now,
+                    ],
+                )?;
+                new_changes += 1;
+            }
+            transaction.execute(
+                "INSERT OR IGNORE INTO whole_edition_discovery_changes (
+                    discovery_id, collection_id, change_id
+                 ) VALUES (?1, ?2, ?3)",
+                params![raw_discovery_id, raw_collection_id, raw_change_id],
+            )?;
+        }
+        let observed =
+            i64::try_from(changes.len()).map_err(|_| StoreError::DumpImportProgressOverflow)?;
+        transaction.execute(
+            "UPDATE whole_edition_discoveries
+             SET continuation = ?2, source_exhausted = ?3,
+                 batches_recorded = batches_recorded + 1,
+                 changes_observed = changes_observed + ?4,
+                 new_changes = new_changes + ?5, updated_at = ?6
+             WHERE discovery_id = ?1 AND state = 'running'",
+            params![
+                raw_discovery_id,
+                next_continuation,
+                next_continuation.is_none(),
+                observed,
+                new_changes,
+                now,
+            ],
+        )?;
+        let status = whole_edition_discovery_status_by_id(&transaction, raw_discovery_id)?
+            .ok_or(StoreError::WholeEditionDiscoveryNotRunning(discovery_id))?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    /// Marks one discovered event durably applied or intentionally ignored.
+    pub fn mark_whole_edition_change_applied(
+        &mut self,
+        discovery_id: u64,
+        change_id: u64,
+        disposition: WholeEditionChangeDisposition,
+    ) -> Result<WholeEditionDiscoveryStatus, StoreError> {
+        let raw_discovery_id = to_sql_integer(discovery_id)?;
+        let raw_change_id = to_sql_integer(change_id)?;
+        let now = unix_time()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(i64, String)> = transaction
+            .query_row(
+                "SELECT link.collection_id, change.application_state
+                 FROM whole_edition_discovery_changes AS link
+                 JOIN whole_edition_changes AS change
+                   ON change.collection_id = link.collection_id
+                  AND change.change_id = link.change_id
+                 JOIN whole_edition_discoveries AS discovery USING (discovery_id)
+                 WHERE link.discovery_id = ?1 AND link.change_id = ?2
+                   AND discovery.state = 'running'",
+                params![raw_discovery_id, raw_change_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((raw_collection_id, state)) = existing else {
+            return Err(StoreError::InvalidWholeEditionChange(change_id));
+        };
+        if state == "pending" {
+            transaction.execute(
+                "UPDATE whole_edition_changes
+                 SET application_state = ?3, applied_at = ?4
+                 WHERE collection_id = ?1 AND change_id = ?2",
+                params![raw_collection_id, raw_change_id, disposition.as_str(), now],
+            )?;
+            let column = match disposition {
+                WholeEditionChangeDisposition::Applied => "applied_changes",
+                WholeEditionChangeDisposition::Ignored => "ignored_changes",
+            };
+            transaction.execute(
+                &format!(
+                    "UPDATE whole_edition_discoveries SET {column} = {column} + 1,
+                            updated_at = ?2 WHERE discovery_id = ?1"
+                ),
+                params![raw_discovery_id, now],
+            )?;
+        } else if state != disposition.as_str() {
+            return Err(StoreError::ConflictingWholeEditionChange(change_id));
+        }
+        let status = whole_edition_discovery_status_by_id(&transaction, raw_discovery_id)?
+            .ok_or(StoreError::WholeEditionDiscoveryNotRunning(discovery_id))?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    /// Enumerates pending applications for one discovery in bounded change-ID order.
+    pub fn whole_edition_pending_changes_after(
+        &self,
+        discovery_id: u64,
+        after_change_id: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<StoredWholeEditionChange>, StoreError> {
+        validate_whole_edition_page_size(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT change.change_id, change.change_kind, change.occurred_at,
+                    change.page_id, change.revision_id, change.namespace, change.title
+             FROM whole_edition_discovery_changes AS link
+             JOIN whole_edition_changes AS change
+               ON change.collection_id = link.collection_id
+              AND change.change_id = link.change_id
+             WHERE link.discovery_id = ?1 AND change.change_id > ?2
+               AND change.application_state = 'pending'
+             ORDER BY change.change_id LIMIT ?3",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    to_sql_integer(discovery_id)?,
+                    after_change_id.map_or(Ok(0), to_sql_integer)?,
+                    i64::from(limit),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|row| {
+                let kind = match row.1.as_str() {
+                    "edit" => WholeEditionChangeKind::Edit,
+                    "new" => WholeEditionChangeKind::New,
+                    "move" => WholeEditionChangeKind::Move,
+                    "delete" => WholeEditionChangeKind::Delete,
+                    "restore" => WholeEditionChangeKind::Restore,
+                    "other" => WholeEditionChangeKind::Other,
+                    _ => return Err(StoreError::CorruptMetadata("unknown change kind")),
+                };
+                Ok(StoredWholeEditionChange {
+                    change_id: sql_u64(row.0, "invalid change ID")?,
+                    kind,
+                    occurred_at: sql_u64(row.2, "invalid change timestamp")?,
+                    page_id: row
+                        .3
+                        .map(|value| sql_id(value, "invalid change page ID"))
+                        .transpose()?,
+                    revision_id: row
+                        .4
+                        .map(|value| sql_id(value, "invalid change revision ID"))
+                        .transpose()?,
+                    namespace: row
+                        .5
+                        .map(|value| {
+                            i32::try_from(value).map_err(|_| {
+                                StoreError::CorruptMetadata("invalid change namespace")
+                            })
+                        })
+                        .transpose()?,
+                    title: row.6,
+                })
+            })
+            .collect()
+    }
+
+    /// Marks source exhaustion successful only after every associated event is terminal.
+    pub fn complete_whole_edition_discovery(
+        &mut self,
+        discovery_id: u64,
+    ) -> Result<WholeEditionDiscoveryStatus, StoreError> {
+        let raw_discovery_id = to_sql_integer(discovery_id)?;
+        let now = unix_time()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pending: Option<(bool, i64)> = transaction
+            .query_row(
+                "SELECT discovery.source_exhausted, COUNT(change.change_id)
+                 FROM whole_edition_discoveries AS discovery
+                 LEFT JOIN whole_edition_discovery_changes AS link USING (discovery_id)
+                 LEFT JOIN whole_edition_changes AS change
+                   ON change.collection_id = link.collection_id
+                  AND change.change_id = link.change_id
+                  AND change.application_state = 'pending'
+                 WHERE discovery.discovery_id = ?1 AND discovery.state = 'running'
+                 GROUP BY discovery.discovery_id",
+                [raw_discovery_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((exhausted, pending)) = pending else {
+            return Err(StoreError::WholeEditionDiscoveryNotRunning(discovery_id));
+        };
+        if !exhausted || pending != 0 {
+            return Err(StoreError::IncompleteWholeEditionDiscovery {
+                discovery_id,
+                pending_changes: sql_u64(pending, "invalid pending change count")?,
+            });
+        }
+        transaction.execute(
+            "UPDATE whole_edition_discoveries
+             SET state = 'succeeded', retryable = 0, finished_at = ?2, updated_at = ?2
+             WHERE discovery_id = ?1",
+            params![raw_discovery_id, now],
+        )?;
+        let status = whole_edition_discovery_status_by_id(&transaction, raw_discovery_id)?
+            .ok_or(StoreError::WholeEditionDiscoveryNotRunning(discovery_id))?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    /// Retains a structured discovery failure; non-retryable failure cancels its run.
+    pub fn fail_whole_edition_discovery(
+        &mut self,
+        discovery_id: u64,
+        code: &str,
+        message: &str,
+        retryable: bool,
+    ) -> Result<WholeEditionDiscoveryStatus, StoreError> {
+        validate_sync_text(code, "RecentChanges error code")?;
+        validate_sync_text(message, "RecentChanges error message")?;
+        let raw_discovery_id = to_sql_integer(discovery_id)?;
+        let now = unix_time()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run_id: Option<i64> = transaction
+            .query_row(
+                "SELECT run_id FROM whole_edition_discoveries
+                 WHERE discovery_id = ?1 AND state = 'running'",
+                [raw_discovery_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(run_id) = run_id else {
+            return Err(StoreError::WholeEditionDiscoveryNotRunning(discovery_id));
+        };
+        transaction.execute(
+            "UPDATE whole_edition_discoveries
+             SET state = 'failed', retryable = ?2, error_code = ?3,
+                 error_message = ?4, updated_at = ?5, finished_at = ?5
+             WHERE discovery_id = ?1",
+            params![raw_discovery_id, retryable, code, message, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO sync_errors (run_id, job_id, code, message, retryable, occurred_at)
+             VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
+            params![run_id, code, message, retryable, now],
+        )?;
+        if !retryable {
+            transaction.execute(
+                "UPDATE sync_runs SET state = 'cancelled', finished_at = ?2
+                 WHERE run_id = ?1 AND state = 'running'",
+                params![run_id, now],
+            )?;
+        }
+        let status = whole_edition_discovery_status_by_id(&transaction, raw_discovery_id)?
+            .ok_or(StoreError::WholeEditionDiscoveryNotRunning(discovery_id))?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    /// Returns aggregate discovery status without materializing event rows.
+    pub fn whole_edition_discovery_status(
+        &self,
+        discovery_id: u64,
+    ) -> Result<Option<WholeEditionDiscoveryStatus>, StoreError> {
+        whole_edition_discovery_status_by_id(&self.connection, to_sql_integer(discovery_id)?)
+    }
+
+    /// Monotonically extends an active dump race window before more source batches
+    /// are discovered.
+    ///
+    /// This lets a long multipart import periodically tail RecentChanges instead of
+    /// allowing changes from early in the scan to age out. The owning run, import,
+    /// and discovery boundaries advance atomically; already journaled change IDs
+    /// remain deduplicated.
+    pub fn extend_whole_edition_race_window(
+        &mut self,
+        discovery_id: u64,
+        expected_window_end: u64,
+        new_window_end: u64,
+    ) -> Result<WholeEditionDiscoveryStatus, StoreError> {
+        if new_window_end < expected_window_end {
+            return Err(StoreError::InvalidWholeEditionState(
+                "extended race-window end regressed",
+            ));
+        }
+        if new_window_end == expected_window_end {
+            return self
+                .whole_edition_discovery_status(discovery_id)?
+                .ok_or(StoreError::WholeEditionDiscoveryNotRunning(discovery_id));
+        }
+        let raw_discovery_id = to_sql_integer(discovery_id)?;
+        let expected = to_sql_integer(expected_window_end)?;
+        let new_end = to_sql_integer(new_window_end)?;
+        let now = unix_time()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let identity: Option<(i64, i64, String, String, i64)> = transaction
+            .query_row(
+                "SELECT discovery.run_id, discovery.import_id,
+                        discovery.discovery_kind, discovery.state, discovery.window_end
+                 FROM whole_edition_discoveries AS discovery
+                 WHERE discovery.discovery_id = ?1",
+                [raw_discovery_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((run_id, import_id, kind, state, current_end)) = identity else {
+            return Err(StoreError::WholeEditionDiscoveryNotRunning(discovery_id));
+        };
+        if !matches!(kind.as_str(), "race-window" | "long-gap-closure")
+            || state != "running"
+            || current_end != expected
+        {
+            return Err(StoreError::InvalidWholeEditionState(
+                "race-window extension does not match active discovery state",
+            ));
+        }
+        let run_changed = transaction.execute(
+            "UPDATE sync_runs SET checkpoint_candidate = ?2
+             WHERE run_id = ?1 AND state = 'running' AND checkpoint_candidate = ?3",
+            params![run_id, new_end, expected],
+        )?;
+        let import_changed = transaction.execute(
+            "UPDATE whole_edition_imports SET race_window_end = ?2
+             WHERE import_id = ?1 AND race_window_end = ?3",
+            params![import_id, new_end, expected],
+        )?;
+        let discovery_changed = transaction.execute(
+            "UPDATE whole_edition_discoveries
+             SET window_end = ?2, continuation = NULL, source_exhausted = 0,
+                 updated_at = ?4
+             WHERE discovery_id = ?1 AND window_end = ?3 AND state = 'running'",
+            params![raw_discovery_id, new_end, expected, now],
+        )?;
+        if run_changed != 1 || import_changed != 1 || discovery_changed != 1 {
+            return Err(StoreError::InvalidWholeEditionState(
+                "race-window extension lost its durable compare-and-swap",
+            ));
+        }
+        transaction.commit()?;
+        self.whole_edition_discovery_status(discovery_id)?
+            .ok_or(StoreError::WholeEditionDiscoveryNotRunning(discovery_id))
+    }
+
+    /// Creates one durable fail-closed marker when RecentChanges continuity is unsafe.
+    pub fn mark_whole_edition_long_gap(
+        &mut self,
+        collection_id: CollectionId,
+        last_safe_checkpoint: u64,
+        detected_at: u64,
+        reason: &str,
+    ) -> Result<WholeEditionRecoveryMarker, StoreError> {
+        validate_sync_text(reason, "whole-edition long-gap reason")?;
+        if detected_at < last_safe_checkpoint {
+            return Err(StoreError::InvalidWholeEditionState(
+                "long-gap detection precedes the last safe checkpoint",
+            ));
+        }
+        let raw_collection_id = to_sql_integer(collection_id.get())?;
+        let now = unix_time()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let collection: Option<(i64, String, String)> = transaction
+            .query_row(
+                "SELECT collections.wiki_id, collections.status, configuration.rule_kind
+                 FROM collections JOIN collection_configuration AS configuration USING (collection_id)
+                 WHERE collections.collection_id = ?1",
+                [raw_collection_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((raw_wiki_id, status, rule)) = collection else {
+            return Err(StoreError::CollectionNotFound(collection_id));
+        };
+        if status != "active" {
+            return Err(StoreError::CollectionTombstoned(collection_id));
+        }
+        if rule != "whole-main-namespace" {
+            return Err(StoreError::WholeEditionCollectionRequired);
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO whole_edition_recovery_markers (
+                wiki_id, collection_id, last_safe_checkpoint, detected_at,
+                reason, state, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'required', ?6)",
+            params![
+                raw_wiki_id,
+                raw_collection_id,
+                to_sql_integer(last_safe_checkpoint)?,
+                to_sql_integer(detected_at)?,
+                reason,
+                now,
+            ],
+        )?;
+        let marker = whole_edition_recovery_marker_for_collection(&transaction, raw_collection_id)?
+            .ok_or(StoreError::CorruptMetadata(
+                "long-gap marker was not created",
+            ))?;
+        transaction.commit()?;
+        Ok(marker)
+    }
+
+    /// Returns the one unresolved long-gap marker for a collection, when present.
+    pub fn whole_edition_recovery_marker(
+        &self,
+        collection_id: CollectionId,
+    ) -> Result<Option<WholeEditionRecoveryMarker>, StoreError> {
+        whole_edition_recovery_marker_for_collection(
+            &self.connection,
+            to_sql_integer(collection_id.get())?,
+        )
+    }
+
+    /// Resolves a long gap only after its exact dump and closure pass both succeeded.
+    pub fn resolve_whole_edition_long_gap(
+        &mut self,
+        recovery_marker_id: u64,
+        discovery_id: u64,
+    ) -> Result<WholeEditionRecoveryMarker, StoreError> {
+        let raw_marker_id = to_sql_integer(recovery_marker_id)?;
+        let raw_discovery_id = to_sql_integer(discovery_id)?;
+        let now = unix_time()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let valid: bool = transaction.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM whole_edition_recovery_markers AS marker
+                JOIN dump_imports AS dump ON dump.import_id = marker.import_id
+                JOIN whole_edition_discoveries AS discovery
+                  ON discovery.discovery_id = ?2
+                 AND discovery.import_id = marker.import_id
+                 AND discovery.recovery_marker_id = marker.recovery_marker_id
+                 AND discovery.discovery_kind = 'long-gap-closure'
+                WHERE marker.recovery_marker_id = ?1 AND marker.state = 'recovering'
+                  AND dump.state = 'succeeded' AND discovery.state = 'succeeded'
+             )",
+            params![raw_marker_id, raw_discovery_id],
+            |row| row.get(0),
+        )?;
+        if !valid {
+            return Err(StoreError::InvalidWholeEditionState(
+                "long-gap import and closure are not both successful",
+            ));
+        }
+        transaction.execute(
+            "UPDATE whole_edition_recovery_markers
+             SET state = 'resolved', discovery_id = ?2, resolved_at = ?3
+             WHERE recovery_marker_id = ?1 AND state = 'recovering'",
+            params![raw_marker_id, raw_discovery_id, now],
+        )?;
+        let marker = whole_edition_recovery_marker_by_id(&transaction, raw_marker_id)?.ok_or(
+            StoreError::CorruptMetadata("resolved long-gap marker is missing"),
+        )?;
+        transaction.commit()?;
+        Ok(marker)
+    }
+
     /// Adds one idempotent job to a running synchronization operation.
     ///
     /// Repeating the same key and payload returns the original job. Reusing a key
@@ -4642,8 +6162,24 @@ impl Library {
             [raw_run_id],
             |row| row.get(0),
         )?;
+        let incomplete_discoveries: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM whole_edition_discoveries
+             WHERE run_id = ?1 AND state != 'succeeded'",
+            [raw_run_id],
+            |row| row.get(0),
+        )?;
+        let unresolved_recoveries: i64 = transaction.query_row(
+            "SELECT COUNT(*)
+             FROM whole_edition_recovery_markers AS marker
+             JOIN dump_imports AS dump ON dump.import_id = marker.import_id
+             WHERE dump.run_id = ?1 AND marker.state != 'resolved'",
+            [raw_run_id],
+            |row| row.get(0),
+        )?;
         let incomplete = incomplete_jobs
             .checked_add(incomplete_imports)
+            .and_then(|count| count.checked_add(incomplete_discoveries))
+            .and_then(|count| count.checked_add(unresolved_recoveries))
             .ok_or(StoreError::DumpImportProgressOverflow)?;
         if incomplete != 0 {
             return Err(StoreError::IncompleteSyncRun {
@@ -4878,7 +6414,36 @@ impl Library {
                 message: "manifest exceeds the file-size bound",
             });
         }
-        decode_manifest(sequence, &bytes)
+        let stored = decode_manifest(sequence, &bytes)?;
+        for descriptor in &stored.shards {
+            self.read_manifest_shard(descriptor)?;
+        }
+        Ok(stored)
+    }
+
+    /// Reads one root-committed shard, verifying its path, length, identity,
+    /// canonical encoding, kind, range, and record count.
+    pub fn read_manifest_shard(
+        &self,
+        descriptor: &ManifestShardDescriptor,
+    ) -> Result<ManifestShard, StoreError> {
+        let path = self.manifest_shard_path(descriptor.id);
+        let metadata = fs::symlink_metadata(&path).map_err(StoreError::Io)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StoreError::InvalidManifest(
+                "manifest shard path is not a regular file",
+            ));
+        }
+        if metadata.len() != descriptor.byte_length || metadata.len() > MAX_MANIFEST_BYTES {
+            return Err(StoreError::InvalidManifest(
+                "manifest shard length disagrees with root descriptor",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        File::open(path)?
+            .take(MAX_MANIFEST_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        decode_manifest_shard(descriptor, &bytes)
     }
 
     /// Returns a bounded page of manifests in increasing sequence order.
@@ -4956,27 +6521,12 @@ impl Library {
             .clone()
             .ok_or(StoreError::SyncRunConfigurationUnavailable(run_id))?;
         let prior = self.validated_manifest_chain()?;
-        let mut introduced_revisions =
-            self.manifest_catalog_revisions(status.wiki_id, status.collection_id)?;
-        let mut candidate_revision_ids = introduced_revisions
-            .iter()
-            .map(|revision| revision.revision_id)
-            .collect::<HashSet<_>>();
-        for stored in &prior {
-            if let Some(sync) = stored
-                .manifest
-                .sync()
-                .filter(|event| event.wiki_id == status.wiki_id)
-            {
-                for revision in &sync.introduced_revisions {
-                    candidate_revision_ids.remove(&revision.revision_id);
-                }
-            }
-        }
-        introduced_revisions
-            .retain(|revision| candidate_revision_ids.contains(&revision.revision_id));
-        let page_heads = self.manifest_page_heads(status.wiki_id, status.collection_id)?;
         let media_snapshot = self.manifest_media_snapshot(status.wiki_id, status.collection_id)?;
+        let (introduced_revisions, mut shards) =
+            self.build_manifest_revision_evidence(&prior, status.wiki_id, status.collection_id)?;
+        let (page_heads, page_head_shards) =
+            self.build_manifest_page_head_evidence(status.wiki_id, status.collection_id)?;
+        shards.extend(page_head_shards);
         let sequence = prior.last().map_or(Ok(1_u64), |stored| {
             stored
                 .manifest
@@ -5003,7 +6553,8 @@ impl Library {
             predecessor,
             event: ManifestEvent::Sync(manifest),
         };
-        let (id, bytes) = encode_manifest(&entry)?;
+        let (id, bytes) =
+            encode_sync_manifest_with_shards(&entry, entry.sync().expect("sync entry"), &shards)?;
         let path = self.manifest_path(sequence)?;
         let manifest_directory = self.root.join(MANIFEST_DIRECTORY);
         let mut temporary = tempfile::Builder::new()
@@ -5020,7 +6571,7 @@ impl Library {
                 sync_directory(&manifest_directory)?;
                 append_lock.commit()?;
                 let stored = self.read_manifest(sequence)?;
-                if stored.id == id && stored.manifest == entry {
+                if stored.id == id && stored.manifest == entry && stored.shards == shards {
                     return Ok(stored);
                 }
                 return Err(StoreError::ManifestConflict(sequence));
@@ -5202,33 +6753,227 @@ impl Library {
         )))
     }
 
-    fn manifest_catalog_revisions(
+    fn manifest_shard_path(&self, id: ManifestShardId) -> PathBuf {
+        let hex = id.to_string();
+        let digest = &hex[3..];
+        self.root
+            .join(MANIFEST_SHARD_DIRECTORY)
+            .join("b3")
+            .join(&digest[..2])
+            .join(format!("{digest}.json"))
+    }
+
+    fn build_manifest_revision_evidence(
+        &self,
+        manifests: &[StoredManifest],
+        wiki_id: WikiId,
+        collection_id: Option<CollectionId>,
+    ) -> Result<(Vec<ManifestRevision>, Vec<ManifestShardDescriptor>), StoreError> {
+        self.prepare_manifest_revision_claims(manifests, wiki_id)?;
+        let limit = self.config.max_manifest_shard_entries;
+        let mut page = self.manifest_catalog_revisions_page(wiki_id, collection_id, 0, limit)?;
+        if page.len() < limit as usize
+            || self
+                .manifest_catalog_revisions_page(
+                    wiki_id,
+                    collection_id,
+                    page.last().map_or(0, |entry| entry.revision_id.get()),
+                    1,
+                )?
+                .is_empty()
+        {
+            return Ok((page, Vec::new()));
+        }
+        let mut shards = Vec::new();
+        loop {
+            let last = page
+                .last()
+                .expect("nonempty manifest page")
+                .revision_id
+                .get();
+            let ordinal =
+                u32::try_from(shards.len()).map_err(|_| StoreError::ManifestLimitExceeded)?;
+            shards.push(self.install_manifest_shard(
+                &ManifestShard::IntroducedRevisions(page),
+                ManifestShardKind::IntroducedRevisions,
+                ordinal,
+            )?);
+            page = self.manifest_catalog_revisions_page(wiki_id, collection_id, last, limit)?;
+            if page.is_empty() {
+                break;
+            }
+        }
+        Ok((Vec::new(), shards))
+    }
+
+    fn build_manifest_page_head_evidence(
         &self,
         wiki_id: WikiId,
         collection_id: Option<CollectionId>,
-    ) -> Result<Vec<ManifestRevision>, StoreError> {
-        let sql = if collection_id.is_some() {
-            "SELECT revisions.page_id, revisions.revision_id,
-                    revisions.content_object_id
-             FROM revisions
-             JOIN collection_resolved_members members
-               ON members.wiki_id = revisions.wiki_id
-              AND members.page_id = revisions.page_id
-             WHERE revisions.wiki_id = ?1
-               AND members.collection_id = ?2
-             ORDER BY revisions.revision_id"
-        } else {
-            "SELECT page_id, revision_id, content_object_id FROM revisions
-             WHERE wiki_id = ?1 AND ?2 IS NULL
-             ORDER BY revision_id"
+    ) -> Result<(Vec<ManifestPageHead>, Vec<ManifestShardDescriptor>), StoreError> {
+        let limit = self.config.max_manifest_shard_entries;
+        let mut page = self.manifest_page_heads_page(wiki_id, collection_id, 0, limit)?;
+        if page.len() < limit as usize
+            || self
+                .manifest_page_heads_page(
+                    wiki_id,
+                    collection_id,
+                    page.last().map_or(0, |entry| entry.page_id.get()),
+                    1,
+                )?
+                .is_empty()
+        {
+            return Ok((page, Vec::new()));
+        }
+        let mut shards = Vec::new();
+        loop {
+            let last = page.last().expect("nonempty manifest page").page_id.get();
+            let ordinal =
+                u32::try_from(shards.len()).map_err(|_| StoreError::ManifestLimitExceeded)?;
+            shards.push(self.install_manifest_shard(
+                &ManifestShard::PageHeads(page),
+                ManifestShardKind::PageHeads,
+                ordinal,
+            )?);
+            page = self.manifest_page_heads_page(wiki_id, collection_id, last, limit)?;
+            if page.is_empty() {
+                break;
+            }
+        }
+        Ok((Vec::new(), shards))
+    }
+
+    fn install_manifest_shard(
+        &self,
+        shard: &ManifestShard,
+        kind: ManifestShardKind,
+        ordinal: u32,
+    ) -> Result<ManifestShardDescriptor, StoreError> {
+        let (id, bytes, entry_count, first_key, last_key) = encode_manifest_shard(shard)?;
+        let descriptor = ManifestShardDescriptor {
+            kind,
+            ordinal,
+            entry_count,
+            byte_length: bytes.len() as u64,
+            first_key,
+            last_key,
+            id,
         };
-        let mut statement = self.connection.prepare(sql)?;
+        let path = self.manifest_shard_path(id);
+        let parent = path.parent().ok_or(StoreError::InvalidManifest(
+            "manifest shard path has no parent",
+        ))?;
+        create_private_dir_all(parent)?;
+        let mut temporary = tempfile::Builder::new()
+            .prefix("manifest-shard-")
+            .tempfile_in(self.root.join("tmp"))?;
+        temporary.write_all(&bytes)?;
+        temporary.as_file().sync_all()?;
+        #[cfg(unix)]
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o600))?;
+        if let Err(error) = temporary.persist_noclobber(&path) {
+            if error.error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(StoreError::Io(error.error));
+            }
+            self.read_manifest_shard(&descriptor)?;
+        }
+        sync_directory(parent)?;
+        sync_directory(&self.root.join(MANIFEST_SHARD_DIRECTORY).join("b3"))?;
+        Ok(descriptor)
+    }
+
+    fn prepare_manifest_revision_claims(
+        &self,
+        manifests: &[StoredManifest],
+        wiki_id: WikiId,
+    ) -> Result<(), StoreError> {
+        self.connection.execute_batch(
+            "DROP TABLE IF EXISTS temp.manifest_revision_claims;
+             CREATE TEMP TABLE manifest_revision_claims (
+                 revision_id INTEGER PRIMARY KEY NOT NULL
+             ) WITHOUT ROWID;
+             BEGIN",
+        )?;
+        let result =
+            (|| {
+                let mut insert = self.connection.prepare(
+                    "INSERT OR IGNORE INTO temp.manifest_revision_claims (revision_id) VALUES (?1)",
+                )?;
+                for stored in manifests {
+                    let Some(sync) = stored
+                        .manifest
+                        .sync()
+                        .filter(|sync| sync.wiki_id == wiki_id)
+                    else {
+                        continue;
+                    };
+                    for revision in &sync.introduced_revisions {
+                        insert.execute([to_sql_integer(revision.revision_id.get())?])?;
+                    }
+                    for descriptor in stored.shards.iter().filter(|descriptor| {
+                        descriptor.kind == ManifestShardKind::IntroducedRevisions
+                    }) {
+                        let ManifestShard::IntroducedRevisions(revisions) =
+                            self.read_manifest_shard(descriptor)?
+                        else {
+                            unreachable!("descriptor kind verified by shard reader")
+                        };
+                        for revision in revisions {
+                            insert.execute([to_sql_integer(revision.revision_id.get())?])?;
+                        }
+                    }
+                }
+                Ok::<_, StoreError>(())
+            })();
+        match result {
+            Ok(()) => self.connection.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn manifest_catalog_revisions_page(
+        &self,
+        wiki_id: WikiId,
+        collection_id: Option<CollectionId>,
+        after_revision_id: u64,
+        limit: u32,
+    ) -> Result<Vec<ManifestRevision>, StoreError> {
+        let membership = if collection_id.is_some() {
+            "JOIN collection_resolved_members AS members
+               ON members.wiki_id = revisions.wiki_id
+              AND members.page_id = revisions.page_id"
+        } else {
+            ""
+        };
+        let collection_filter = if collection_id.is_some() {
+            "AND members.collection_id = ?2"
+        } else {
+            "AND ?2 IS NULL"
+        };
+        let sql = format!(
+            "SELECT revisions.page_id, revisions.revision_id, revisions.content_object_id
+             FROM revisions
+             {membership}
+             LEFT JOIN temp.manifest_revision_claims AS claimed
+               ON claimed.revision_id = revisions.revision_id
+             WHERE revisions.wiki_id = ?1 {collection_filter}
+               AND revisions.revision_id > ?3
+               AND claimed.revision_id IS NULL
+             ORDER BY revisions.revision_id LIMIT ?4"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
         let rows = statement.query_map(
             params![
                 to_sql_integer(wiki_id.get())?,
                 collection_id
                     .map(|id| to_sql_integer(id.get()))
-                    .transpose()?
+                    .transpose()?,
+                to_sql_integer(after_revision_id)?,
+                limit,
             ],
             |row| {
                 Ok((
@@ -5238,64 +6983,58 @@ impl Library {
                 ))
             },
         )?;
-        let mut revisions = Vec::new();
-        for row in rows {
+        rows.map(|row| {
             let (page_id, revision_id, object_id) = row?;
-            revisions.push(ManifestRevision {
+            Ok(ManifestRevision {
                 page_id: sql_id(page_id, "invalid page ID in manifest input")?,
                 revision_id: sql_id(revision_id, "invalid revision ID in manifest input")?,
                 content_object_id: object_id.parse().map_err(|_| {
                     StoreError::CorruptMetadata("invalid object ID in manifest input")
                 })?,
-            });
-            if revisions.len() > MAX_MANIFEST_ENTRIES {
-                return Err(StoreError::ManifestLimitExceeded);
-            }
-        }
-        Ok(revisions)
+            })
+        })
+        .collect()
     }
 
-    fn manifest_page_heads(
+    fn manifest_page_heads_page(
         &self,
         wiki_id: WikiId,
         collection_id: Option<CollectionId>,
+        after_page_id: u64,
+        limit: u32,
     ) -> Result<Vec<ManifestPageHead>, StoreError> {
-        let (sql, collection_parameter) = if let Some(collection_id) = collection_id {
+        let (sql, scope) = if let Some(collection_id) = collection_id {
             (
                 "SELECT pages.page_id, pages.current_revision_id
-                 FROM collection_resolved_members members
-                 JOIN pages ON pages.wiki_id = members.wiki_id
-                           AND pages.page_id = members.page_id
-                 WHERE members.collection_id = ?1
-                   AND members.membership_state = 'active'
-                 ORDER BY pages.page_id",
+                 FROM collection_resolved_members AS members
+                 JOIN pages ON pages.wiki_id = members.wiki_id AND pages.page_id = members.page_id
+                 WHERE members.collection_id = ?1 AND members.membership_state = 'active'
+                   AND pages.page_id > ?2 ORDER BY pages.page_id LIMIT ?3",
                 to_sql_integer(collection_id.get())?,
             )
         } else {
             (
                 "SELECT page_id, current_revision_id FROM pages
-                 WHERE wiki_id = ?1 ORDER BY page_id",
+                 WHERE wiki_id = ?1 AND page_id > ?2 ORDER BY page_id LIMIT ?3",
                 to_sql_integer(wiki_id.get())?,
             )
         };
         let mut statement = self.connection.prepare(sql)?;
-        let rows = statement.query_map([collection_parameter], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
-        })?;
-        let mut heads = Vec::new();
-        for row in rows {
-            let (page_id, revision_id) = row?;
-            heads.push(ManifestPageHead {
-                page_id: sql_id(page_id, "invalid page ID in manifest head")?,
-                revision_id: revision_id
-                    .map(|value| sql_id(value, "invalid revision ID in manifest head"))
-                    .transpose()?,
-            });
-            if heads.len() > MAX_MANIFEST_ENTRIES {
-                return Err(StoreError::ManifestLimitExceeded);
-            }
-        }
-        Ok(heads)
+        statement
+            .query_map(
+                params![scope, to_sql_integer(after_page_id)?, limit],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )?
+            .map(|row| {
+                let (page_id, revision_id) = row?;
+                Ok(ManifestPageHead {
+                    page_id: sql_id(page_id, "invalid page ID in manifest head")?,
+                    revision_id: revision_id
+                        .map(|value| sql_id(value, "invalid revision ID in manifest head"))
+                        .transpose()?,
+                })
+            })
+            .collect()
     }
 
     /// Returns the complete bounded media inventory represented by a manifest for
@@ -8715,6 +10454,232 @@ fn ensure_dump_progress_can_advance(
     Ok((wiki_id, collection_id, imported_pages, imported_bytes))
 }
 
+fn validate_whole_edition_page_size(limit: u32) -> Result<(), StoreError> {
+    if !(1..=MAX_WHOLE_EDITION_PAGE_SIZE).contains(&limit) {
+        return Err(StoreError::WholeEditionPageLimitExceeded);
+    }
+    Ok(())
+}
+
+fn whole_edition_import_status_by_id(
+    connection: &Connection,
+    raw_import_id: i64,
+) -> Result<Option<WholeEditionImportStatus>, StoreError> {
+    let extension: Option<WholeImportExtensionRow> = connection
+        .query_row(
+            "SELECT source_endpoint, snapshot_id, snapshot_timestamp, race_window_end,
+                    artifact_index, artifact_offset, recovery_marker_id
+             FROM whole_edition_imports WHERE import_id = ?1",
+            [raw_import_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(extension) = extension else {
+        return Ok(None);
+    };
+    Ok(Some(WholeEditionImportStatus {
+        dump: dump_import_status_by_id(connection, raw_import_id)?,
+        source_endpoint: extension.0,
+        snapshot_id: extension.1,
+        snapshot_timestamp: sql_u64(extension.2, "invalid snapshot timestamp")?,
+        race_window_end: sql_u64(extension.3, "invalid race-window end")?,
+        artifact_index: sql_u64(extension.4, "invalid dump artifact index")?,
+        artifact_offset: sql_u64(extension.5, "invalid dump artifact offset")?,
+        recovery_marker_id: extension
+            .6
+            .map(|value| sql_u64(value, "invalid recovery marker ID"))
+            .transpose()?,
+    }))
+}
+
+fn whole_edition_discovery_status_by_id(
+    connection: &Connection,
+    raw_discovery_id: i64,
+) -> Result<Option<WholeEditionDiscoveryStatus>, StoreError> {
+    type Row = (
+        i64,
+        i64,
+        i64,
+        i64,
+        String,
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        String,
+        Option<String>,
+        bool,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        bool,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+    );
+    let row: Option<Row> = connection
+        .query_row(
+            "SELECT discovery_id, run_id, wiki_id, collection_id, discovery_kind,
+                    window_start, window_end, import_id, recovery_marker_id, state,
+                    continuation, source_exhausted, batches_recorded, changes_observed,
+                    new_changes, applied_changes, ignored_changes, attempt_count, retryable,
+                    error_code, error_message, finished_at
+             FROM whole_edition_discoveries WHERE discovery_id = ?1",
+            [raw_discovery_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                    row.get(16)?,
+                    row.get(17)?,
+                    row.get(18)?,
+                    row.get(19)?,
+                    row.get(20)?,
+                    row.get(21)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let state = WholeEditionDiscoveryState::from_database(&row.9)?;
+    let latest_error = match (row.19, row.20, row.21) {
+        (None, None, _) => None,
+        (Some(code), Some(message), Some(at)) if state == WholeEditionDiscoveryState::Failed => {
+            Some(SyncFailure {
+                code,
+                message,
+                retryable: row.18,
+                occurred_at: sql_u64(at, "invalid discovery failure time")?,
+            })
+        }
+        _ => return Err(StoreError::CorruptMetadata("incomplete discovery error")),
+    };
+    Ok(Some(WholeEditionDiscoveryStatus {
+        discovery_id: sql_u64(row.0, "invalid discovery ID")?,
+        run_id: sql_u64(row.1, "invalid discovery run ID")?,
+        wiki_id: sql_id(row.2, "invalid discovery wiki ID")?,
+        collection_id: sql_id(row.3, "invalid discovery collection ID")?,
+        kind: WholeEditionDiscoveryKind::from_database(&row.4)?,
+        window_start: sql_u64(row.5, "invalid discovery window start")?,
+        window_end: sql_u64(row.6, "invalid discovery window end")?,
+        import_id: row
+            .7
+            .map(|value| sql_u64(value, "invalid import ID"))
+            .transpose()?,
+        recovery_marker_id: row
+            .8
+            .map(|value| sql_u64(value, "invalid recovery marker ID"))
+            .transpose()?,
+        state,
+        continuation: row.10,
+        source_exhausted: row.11,
+        batches_recorded: sql_u64(row.12, "invalid discovery batch count")?,
+        changes_observed: sql_u64(row.13, "invalid observed change count")?,
+        new_changes: sql_u64(row.14, "invalid new change count")?,
+        applied_changes: sql_u64(row.15, "invalid applied change count")?,
+        ignored_changes: sql_u64(row.16, "invalid ignored change count")?,
+        attempt_count: u32::try_from(row.17)
+            .map_err(|_| StoreError::CorruptMetadata("invalid discovery attempt count"))?,
+        retryable: row.18,
+        latest_error,
+    }))
+}
+
+fn whole_edition_recovery_marker_by_id(
+    connection: &Connection,
+    raw_marker_id: i64,
+) -> Result<Option<WholeEditionRecoveryMarker>, StoreError> {
+    whole_edition_recovery_marker_query(connection, "recovery_marker_id = ?1", raw_marker_id)
+}
+
+fn whole_edition_recovery_marker_for_collection(
+    connection: &Connection,
+    raw_collection_id: i64,
+) -> Result<Option<WholeEditionRecoveryMarker>, StoreError> {
+    whole_edition_recovery_marker_query(
+        connection,
+        "collection_id = ?1 AND state != 'resolved'",
+        raw_collection_id,
+    )
+}
+
+fn whole_edition_recovery_marker_query(
+    connection: &Connection,
+    predicate: &str,
+    value: i64,
+) -> Result<Option<WholeEditionRecoveryMarker>, StoreError> {
+    let query = format!(
+        "SELECT recovery_marker_id, wiki_id, collection_id, last_safe_checkpoint,
+                detected_at, reason, state, import_id, discovery_id
+         FROM whole_edition_recovery_markers WHERE {predicate}
+         ORDER BY recovery_marker_id DESC LIMIT 1"
+    );
+    let row = connection
+        .query_row(&query, [value], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+            ))
+        })
+        .optional()?;
+    row.map(|row| {
+        Ok(WholeEditionRecoveryMarker {
+            recovery_marker_id: sql_u64(row.0, "invalid recovery marker ID")?,
+            wiki_id: sql_id(row.1, "invalid recovery wiki ID")?,
+            collection_id: sql_id(row.2, "invalid recovery collection ID")?,
+            last_safe_checkpoint: sql_u64(row.3, "invalid recovery checkpoint")?,
+            detected_at: sql_u64(row.4, "invalid long-gap detection time")?,
+            reason: row.5,
+            import_id: row
+                .7
+                .map(|value| sql_u64(value, "invalid import ID"))
+                .transpose()?,
+            discovery_id: row
+                .8
+                .map(|value| sql_u64(value, "invalid discovery ID"))
+                .transpose()?,
+            resolved: row.6 == "resolved",
+        })
+    })
+    .transpose()
+}
+
 fn validate_dump_digest(value: &str) -> Result<(), StoreError> {
     if value.len() != 67
         || !value.starts_with("b3:")
@@ -10382,7 +12347,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
          ) STRICT;",
     )?;
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > 16 {
+    if version > 17 {
         return Err(StoreError::UnsupportedSchemaVersion(version));
     }
     if version == 0 {
@@ -10576,6 +12541,18 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
         transaction.pragma_update(None, "user_version", 16)?;
         transaction.commit()?;
     }
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 16 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(MIGRATION_17)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (17, 'whole-edition-streaming', ?1)",
+            [unix_time()?],
+        )?;
+        transaction.pragma_update(None, "user_version", 17)?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -10630,9 +12607,10 @@ fn ensure_collection_active(
 }
 
 fn purge_manifest_binding(
+    library: &Library,
     manifests: &[StoredManifest],
     collection_id: CollectionId,
-) -> (Option<(u64, ManifestId)>, HashSet<ObjectId>) {
+) -> Result<PurgeManifestBinding, StoreError> {
     let head = manifests
         .last()
         .map(|stored| (stored.manifest.sequence, stored.id));
@@ -10647,6 +12625,23 @@ fn purge_manifest_binding(
                 revision.content_object_id,
             );
         }
+        for descriptor in stored
+            .shards
+            .iter()
+            .filter(|descriptor| descriptor.kind == ManifestShardKind::IntroducedRevisions)
+        {
+            let ManifestShard::IntroducedRevisions(revisions) =
+                library.read_manifest_shard(descriptor)?
+            else {
+                unreachable!("descriptor kind verified by shard reader")
+            };
+            for revision in revisions {
+                revision_objects.insert(
+                    (sync.wiki_id, revision.revision_id),
+                    revision.content_object_id,
+                );
+            }
+        }
     }
     let mut protected = HashSet::new();
     for stored in manifests {
@@ -10659,11 +12654,42 @@ fn purge_manifest_binding(
         for revision in &sync.introduced_revisions {
             protected.insert(revision.content_object_id);
         }
-        for head in &sync.page_heads {
+        for descriptor in stored
+            .shards
+            .iter()
+            .filter(|descriptor| descriptor.kind == ManifestShardKind::IntroducedRevisions)
+        {
+            let ManifestShard::IntroducedRevisions(revisions) =
+                library.read_manifest_shard(descriptor)?
+            else {
+                unreachable!("descriptor kind verified by shard reader")
+            };
+            protected.extend(
+                revisions
+                    .into_iter()
+                    .map(|revision| revision.content_object_id),
+            );
+        }
+        let mut protect_head = |head: &ManifestPageHead| {
             if let Some(revision_id) = head.revision_id
                 && let Some(object_id) = revision_objects.get(&(sync.wiki_id, revision_id))
             {
                 protected.insert(*object_id);
+            }
+        };
+        for head in &sync.page_heads {
+            protect_head(head);
+        }
+        for descriptor in stored
+            .shards
+            .iter()
+            .filter(|descriptor| descriptor.kind == ManifestShardKind::PageHeads)
+        {
+            let ManifestShard::PageHeads(heads) = library.read_manifest_shard(descriptor)? else {
+                unreachable!("descriptor kind verified by shard reader")
+            };
+            for head in &heads {
+                protect_head(head);
             }
         }
         if let Some(snapshot) = &sync.media_snapshot {
@@ -10681,7 +12707,7 @@ fn purge_manifest_binding(
             );
         }
     }
-    (head, protected)
+    Ok((head, protected))
 }
 
 fn compute_purge_preview(
@@ -11862,6 +13888,177 @@ fn unix_time() -> Result<i64, StoreError> {
     to_sql_integer(seconds)
 }
 
+fn encode_manifest_shard(
+    shard: &ManifestShard,
+) -> Result<(ManifestShardId, Vec<u8>, u32, u64, u64), StoreError> {
+    let (kind, introduced_revisions, page_heads, count, first, last) = match shard {
+        ManifestShard::IntroducedRevisions(entries) if !entries.is_empty() => (
+            ManifestShardKind::IntroducedRevisions,
+            entries
+                .iter()
+                .map(|entry| ManifestRevisionWire {
+                    page_id: entry.page_id.get(),
+                    revision_id: entry.revision_id.get(),
+                    content_object_id: entry.content_object_id.to_string(),
+                })
+                .collect(),
+            Vec::new(),
+            entries.len(),
+            entries.first().expect("nonempty").revision_id.get(),
+            entries.last().expect("nonempty").revision_id.get(),
+        ),
+        ManifestShard::PageHeads(entries) if !entries.is_empty() => (
+            ManifestShardKind::PageHeads,
+            Vec::new(),
+            entries
+                .iter()
+                .map(|entry| ManifestPageHeadWire {
+                    page_id: entry.page_id.get(),
+                    revision_id: entry.revision_id.map(RevisionId::get),
+                })
+                .collect(),
+            entries.len(),
+            entries.first().expect("nonempty").page_id.get(),
+            entries.last().expect("nonempty").page_id.get(),
+        ),
+        _ => return Err(StoreError::InvalidManifest("manifest shard is empty")),
+    };
+    if count > MAX_MANIFEST_ENTRIES {
+        return Err(StoreError::ManifestLimitExceeded);
+    }
+    let body = ManifestShardBody {
+        schema_version: MANIFEST_SHARD_SCHEMA_VERSION,
+        kind: kind.as_str().to_owned(),
+        introduced_revisions,
+        page_heads,
+    };
+    let canonical_body = serde_json::to_vec(&body)
+        .map_err(|_| StoreError::InvalidManifest("manifest shard could not be serialized"))?;
+    let id = ManifestShardId::for_body(&canonical_body);
+    let bytes = serde_json::to_vec(&ManifestShardEnvelope {
+        shard_id: id.to_string(),
+        body,
+    })
+    .map_err(|_| StoreError::InvalidManifest("manifest shard could not be serialized"))?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(StoreError::ManifestLimitExceeded);
+    }
+    Ok((id, bytes, count as u32, first, last))
+}
+
+fn decode_manifest_shard(
+    descriptor: &ManifestShardDescriptor,
+    bytes: &[u8],
+) -> Result<ManifestShard, StoreError> {
+    let envelope: ManifestShardEnvelope = serde_json::from_slice(bytes)
+        .map_err(|_| StoreError::InvalidManifest("manifest shard is not valid JSON"))?;
+    if envelope.body.schema_version != MANIFEST_SHARD_SCHEMA_VERSION
+        || envelope.body.kind != descriptor.kind.as_str()
+    {
+        return Err(StoreError::InvalidManifest(
+            "manifest shard schema or kind disagrees with root descriptor",
+        ));
+    }
+    let canonical_body = serde_json::to_vec(&envelope.body)
+        .map_err(|_| StoreError::InvalidManifest("manifest shard cannot be canonicalized"))?;
+    let id = ManifestShardId::for_body(&canonical_body);
+    if id != descriptor.id || envelope.shard_id.parse::<ManifestShardId>().ok() != Some(id) {
+        return Err(StoreError::InvalidManifest(
+            "manifest shard identity mismatch",
+        ));
+    }
+    let canonical = serde_json::to_vec(&envelope)
+        .map_err(|_| StoreError::InvalidManifest("manifest shard cannot be canonicalized"))?;
+    if canonical != bytes {
+        return Err(StoreError::InvalidManifest(
+            "manifest shard is not in canonical JSON form",
+        ));
+    }
+    let shard = match descriptor.kind {
+        ManifestShardKind::IntroducedRevisions => {
+            if !envelope.body.page_heads.is_empty() {
+                return Err(StoreError::InvalidManifest(
+                    "manifest shard mixes record kinds",
+                ));
+            }
+            let entries = envelope
+                .body
+                .introduced_revisions
+                .into_iter()
+                .map(|entry| {
+                    Ok(ManifestRevision {
+                        page_id: PageId::new(entry.page_id)
+                            .map_err(|_| StoreError::InvalidManifest("invalid shard page ID"))?,
+                        revision_id: RevisionId::new(entry.revision_id).map_err(|_| {
+                            StoreError::InvalidManifest("invalid shard revision ID")
+                        })?,
+                        content_object_id: entry
+                            .content_object_id
+                            .parse()
+                            .map_err(|_| StoreError::InvalidManifest("invalid shard object ID"))?,
+                    })
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            if entries
+                .windows(2)
+                .any(|pair| pair[0].revision_id >= pair[1].revision_id)
+            {
+                return Err(StoreError::InvalidManifest("manifest shard is not ordered"));
+            }
+            ManifestShard::IntroducedRevisions(entries)
+        }
+        ManifestShardKind::PageHeads => {
+            if !envelope.body.introduced_revisions.is_empty() {
+                return Err(StoreError::InvalidManifest(
+                    "manifest shard mixes record kinds",
+                ));
+            }
+            let entries = envelope
+                .body
+                .page_heads
+                .into_iter()
+                .map(|entry| {
+                    Ok(ManifestPageHead {
+                        page_id: PageId::new(entry.page_id)
+                            .map_err(|_| StoreError::InvalidManifest("invalid shard page ID"))?,
+                        revision_id: entry.revision_id.map(RevisionId::new).transpose().map_err(
+                            |_| StoreError::InvalidManifest("invalid shard revision ID"),
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            if entries
+                .windows(2)
+                .any(|pair| pair[0].page_id >= pair[1].page_id)
+            {
+                return Err(StoreError::InvalidManifest("manifest shard is not ordered"));
+            }
+            ManifestShard::PageHeads(entries)
+        }
+    };
+    let (count, first, last) = match &shard {
+        ManifestShard::IntroducedRevisions(entries) => (
+            entries.len(),
+            entries.first().map(|entry| entry.revision_id.get()),
+            entries.last().map(|entry| entry.revision_id.get()),
+        ),
+        ManifestShard::PageHeads(entries) => (
+            entries.len(),
+            entries.first().map(|entry| entry.page_id.get()),
+            entries.last().map(|entry| entry.page_id.get()),
+        ),
+    };
+    if count != descriptor.entry_count as usize
+        || first != Some(descriptor.first_key)
+        || last != Some(descriptor.last_key)
+    {
+        return Err(StoreError::InvalidManifest(
+            "manifest shard contents disagree with root descriptor",
+        ));
+    }
+    Ok(shard)
+}
+
 fn to_sql_integer(value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::IntegerOutOfRange(value))
 }
@@ -11876,6 +14073,14 @@ fn encode_manifest(entry: &ManifestEntry) -> Result<(ManifestId, Vec<u8>), Store
 fn encode_sync_manifest(
     entry: &ManifestEntry,
     manifest: &SyncManifest,
+) -> Result<(ManifestId, Vec<u8>), StoreError> {
+    encode_sync_manifest_with_shards(entry, manifest, &[])
+}
+
+fn encode_sync_manifest_with_shards(
+    entry: &ManifestEntry,
+    manifest: &SyncManifest,
+    shards: &[ManifestShardDescriptor],
 ) -> Result<(ManifestId, Vec<u8>), StoreError> {
     validate_manifest(manifest)?;
     validate_manifest_chain_fields(entry.sequence, entry.predecessor)?;
@@ -11914,7 +14119,11 @@ fn encode_sync_manifest(
                 )
             });
     let body = ManifestBody {
-        schema_version: MANIFEST_SCHEMA_VERSION,
+        schema_version: if shards.is_empty() {
+            MANIFEST_SCHEMA_VERSION
+        } else {
+            SHARDED_MANIFEST_SCHEMA_VERSION
+        },
         sequence: entry.sequence,
         predecessor: entry.predecessor.map(|id| id.to_string()),
         run_id: manifest.run_id,
@@ -11944,6 +14153,18 @@ fn encode_sync_manifest(
             .collect(),
         media_inventory,
         media_placements,
+        shards: shards
+            .iter()
+            .map(|descriptor| ManifestShardDescriptorWire {
+                kind: descriptor.kind.as_str().to_owned(),
+                ordinal: descriptor.ordinal,
+                entry_count: descriptor.entry_count,
+                byte_length: descriptor.byte_length,
+                first_key: descriptor.first_key,
+                last_key: descriptor.last_key,
+                shard_id: descriptor.id.to_string(),
+            })
+            .collect(),
     };
     let canonical_body = serde_json::to_vec(&body)
         .map_err(|_| StoreError::InvalidManifest("manifest body could not be serialized"))?;
@@ -11988,6 +14209,74 @@ fn encode_purge_manifest(
     Ok((id, bytes))
 }
 
+fn decode_manifest_shard_descriptors(
+    sequence: u64,
+    wires: &[ManifestShardDescriptorWire],
+) -> Result<Vec<ManifestShardDescriptor>, StoreError> {
+    if wires.len() > MAX_MANIFEST_SHARDS {
+        return Err(StoreError::CorruptManifest {
+            sequence,
+            message: "manifest shard count exceeds bounds",
+        });
+    }
+    let mut descriptors = Vec::with_capacity(wires.len());
+    for wire in wires {
+        let descriptor = ManifestShardDescriptor {
+            kind: ManifestShardKind::parse(&wire.kind).map_err(|_| {
+                StoreError::CorruptManifest {
+                    sequence,
+                    message: "manifest shard kind is invalid",
+                }
+            })?,
+            ordinal: wire.ordinal,
+            entry_count: wire.entry_count,
+            byte_length: wire.byte_length,
+            first_key: wire.first_key,
+            last_key: wire.last_key,
+            id: wire
+                .shard_id
+                .parse()
+                .map_err(|_| StoreError::CorruptManifest {
+                    sequence,
+                    message: "manifest shard identity is invalid",
+                })?,
+        };
+        if descriptor.entry_count == 0
+            || descriptor.entry_count as usize > MAX_MANIFEST_ENTRIES
+            || descriptor.byte_length == 0
+            || descriptor.byte_length > MAX_MANIFEST_BYTES
+            || descriptor.first_key == 0
+            || descriptor.first_key > descriptor.last_key
+        {
+            return Err(StoreError::CorruptManifest {
+                sequence,
+                message: "manifest shard descriptor violates bounds",
+            });
+        }
+        descriptors.push(descriptor);
+    }
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        let expected_ordinal = descriptors[..index]
+            .iter()
+            .filter(|prior| prior.kind == descriptor.kind)
+            .count() as u32;
+        if descriptor.ordinal != expected_ordinal
+            || index > 0 && descriptors[index - 1].kind > descriptor.kind
+            || descriptors[..index]
+                .iter()
+                .rev()
+                .find(|prior| prior.kind == descriptor.kind)
+                .is_some_and(|prior| prior.last_key >= descriptor.first_key)
+        {
+            return Err(StoreError::CorruptManifest {
+                sequence,
+                message: "manifest shard descriptors are not canonically ordered",
+            });
+        }
+    }
+    Ok(descriptors)
+}
+
 fn decode_manifest(sequence: u64, bytes: &[u8]) -> Result<StoredManifest, StoreError> {
     let header: ManifestSchemaHeader =
         serde_json::from_slice(bytes).map_err(|_| StoreError::CorruptManifest {
@@ -12002,7 +14291,10 @@ fn decode_manifest(sequence: u64, bytes: &[u8]) -> Result<StoredManifest, StoreE
             sequence,
             message: "manifest is not valid schema-v1 JSON",
         })?;
-    if !matches!(envelope.body.schema_version, 1 | MANIFEST_SCHEMA_VERSION) {
+    if !matches!(
+        envelope.body.schema_version,
+        1 | MANIFEST_SCHEMA_VERSION | SHARDED_MANIFEST_SCHEMA_VERSION
+    ) {
         return Err(StoreError::CorruptManifest {
             sequence,
             message: "unsupported manifest schema version",
@@ -12115,7 +14407,12 @@ fn decode_manifest(sequence: u64, bytes: &[u8]) -> Result<StoredManifest, StoreE
         envelope.body.media_placements,
     ) {
         (None, None) if envelope.body.schema_version == 1 => None,
-        (Some(inventory), Some(placements)) if envelope.body.schema_version == 2 => {
+        (Some(inventory), Some(placements))
+            if matches!(
+                envelope.body.schema_version,
+                MANIFEST_SCHEMA_VERSION | SHARDED_MANIFEST_SCHEMA_VERSION
+            ) =>
+        {
             let inventory = inventory
                 .into_iter()
                 .map(|media| {
@@ -12177,6 +14474,20 @@ fn decode_manifest(sequence: u64, bytes: &[u8]) -> Result<StoredManifest, StoreE
             });
         }
     };
+    let shards = decode_manifest_shard_descriptors(sequence, &envelope.body.shards)?;
+    if envelope.body.schema_version == SHARDED_MANIFEST_SCHEMA_VERSION {
+        if shards.is_empty() {
+            return Err(StoreError::CorruptManifest {
+                sequence,
+                message: "schema-v4 manifest has no shards",
+            });
+        }
+    } else if !shards.is_empty() {
+        return Err(StoreError::CorruptManifest {
+            sequence,
+            message: "legacy manifest unexpectedly commits shards",
+        });
+    }
     let manifest = SyncManifest {
         run_id: envelope.body.run_id,
         wiki_id: WikiId::new(envelope.body.wiki_id).map_err(|_| StoreError::CorruptManifest {
@@ -12217,6 +14528,7 @@ fn decode_manifest(sequence: u64, bytes: &[u8]) -> Result<StoredManifest, StoreE
             predecessor,
             event: ManifestEvent::Sync(manifest),
         },
+        shards,
     })
 }
 
@@ -12299,6 +14611,7 @@ fn decode_purge_manifest(sequence: u64, bytes: &[u8]) -> Result<StoredManifest, 
     Ok(StoredManifest {
         id: actual_id,
         manifest: entry,
+        shards: Vec::new(),
     })
 }
 
@@ -12888,6 +15201,48 @@ pub enum StoreError {
     },
     /// Durable dump-import counts overflow SQLite's supported range.
     DumpImportProgressOverflow,
+    /// The requested collection is not configured for whole-main-namespace tracking.
+    WholeEditionCollectionRequired,
+    /// No whole-edition extension exists for the requested dump import.
+    WholeEditionImportNotFound(u64),
+    /// Artifact index or byte offset attempted to move backward.
+    WholeEditionProgressRegression {
+        /// Durable import identity.
+        import_id: u64,
+    },
+    /// A bounded whole-edition enumeration or input batch exceeded its hard limit.
+    WholeEditionPageLimitExceeded,
+    /// Whole-edition state bindings were inconsistent or unsafe.
+    InvalidWholeEditionState(&'static str),
+    /// A discovery run was resumed with different immutable identity fields.
+    WholeEditionDiscoveryIdentityMismatch(u64),
+    /// A non-retryable discovery cannot be resumed.
+    WholeEditionDiscoveryNotRestartable(u64),
+    /// Discovery was absent or not in the running state.
+    WholeEditionDiscoveryNotRunning(u64),
+    /// Caller used a stale batch ordinal or tried to append after source exhaustion.
+    WholeEditionDiscoveryCursorConflict {
+        /// Discovery identity.
+        discovery_id: u64,
+        /// Durable number of committed batches.
+        current_batches: u64,
+    },
+    /// An event ID was zero, repeated in one source batch, or absent from the pass.
+    InvalidWholeEditionChange(u64),
+    /// A remote change ID was observed with conflicting immutable metadata/state.
+    ConflictingWholeEditionChange(u64),
+    /// Source exhaustion or event application is incomplete.
+    IncompleteWholeEditionDiscovery {
+        /// Discovery identity.
+        discovery_id: u64,
+        /// Associated events still awaiting terminal application.
+        pending_changes: u64,
+    },
+    /// Normal incremental discovery is blocked by an unresolved long-gap marker.
+    WholeEditionLongGapRecoveryRequired {
+        /// Collection requiring a fresh dump and race-window closure.
+        collection_id: CollectionId,
+    },
     /// A synchronization run was absent or no longer accepts work.
     SyncRunNotRunning(u64),
     /// Another synchronization operation already owns the same checkpoint scope.
@@ -13185,6 +15540,60 @@ impl fmt::Display for StoreError {
             Self::DumpImportProgressOverflow => {
                 formatter.write_str("dump import progress exceeds the supported SQLite range")
             }
+            Self::WholeEditionCollectionRequired => {
+                formatter.write_str("whole-edition work requires a whole-main-namespace collection")
+            }
+            Self::WholeEditionImportNotFound(import_id) => {
+                write!(formatter, "whole-edition import {import_id} was not found")
+            }
+            Self::WholeEditionProgressRegression { import_id } => write!(
+                formatter,
+                "whole-edition import {import_id} artifact cursor cannot move backward"
+            ),
+            Self::WholeEditionPageLimitExceeded => {
+                formatter.write_str("whole-edition page or event batch exceeds the supported bound")
+            }
+            Self::InvalidWholeEditionState(message) => {
+                write!(formatter, "invalid whole-edition state: {message}")
+            }
+            Self::WholeEditionDiscoveryIdentityMismatch(discovery_id) => write!(
+                formatter,
+                "whole-edition discovery {discovery_id} has a different immutable identity"
+            ),
+            Self::WholeEditionDiscoveryNotRestartable(discovery_id) => write!(
+                formatter,
+                "whole-edition discovery {discovery_id} failed permanently"
+            ),
+            Self::WholeEditionDiscoveryNotRunning(discovery_id) => write!(
+                formatter,
+                "whole-edition discovery {discovery_id} is not running"
+            ),
+            Self::WholeEditionDiscoveryCursorConflict {
+                discovery_id,
+                current_batches,
+            } => write!(
+                formatter,
+                "whole-edition discovery {discovery_id} is already at batch {current_batches}"
+            ),
+            Self::InvalidWholeEditionChange(change_id) => write!(
+                formatter,
+                "whole-edition change {change_id} is invalid or not part of this discovery"
+            ),
+            Self::ConflictingWholeEditionChange(change_id) => write!(
+                formatter,
+                "whole-edition change {change_id} conflicts with durable metadata or disposition"
+            ),
+            Self::IncompleteWholeEditionDiscovery {
+                discovery_id,
+                pending_changes,
+            } => write!(
+                formatter,
+                "whole-edition discovery {discovery_id} is incomplete ({pending_changes} pending changes)"
+            ),
+            Self::WholeEditionLongGapRecoveryRequired { collection_id } => write!(
+                formatter,
+                "collection {collection_id} requires a fresh whole-edition dump before incremental discovery"
+            ),
             Self::SyncRunNotRunning(run_id) => {
                 write!(formatter, "sync run {run_id} is not running")
             }
@@ -13536,7 +15945,7 @@ mod tests {
         let before = filesystem_snapshot(directory.path());
 
         let mut library = Library::open_read_only(directory.path()).expect("read-only library");
-        assert_eq!(library.schema_version().expect("schema version"), 16);
+        assert_eq!(library.schema_version().expect("schema version"), 17);
         assert_eq!(library.wikis().expect("wikis")[0].wiki_id, wiki_id);
         assert_eq!(library.logical_object_count().expect("object count"), 1);
         assert_eq!(
@@ -13638,13 +16047,13 @@ mod tests {
     #[test]
     fn migration_is_applied_once_and_keeps_locations_separate() {
         let (directory, library) = test_library();
-        assert_eq!(library.schema_version().expect("schema version"), 16);
-        assert_eq!(migration_count(&library), 16);
+        assert_eq!(library.schema_version().expect("schema version"), 17);
+        assert_eq!(migration_count(&library), 17);
 
         drop(library);
         let reopened = Library::open(directory.path()).expect("reopen library");
-        assert_eq!(reopened.schema_version().expect("schema version"), 16);
-        assert_eq!(migration_count(&reopened), 16);
+        assert_eq!(reopened.schema_version().expect("schema version"), 17);
+        assert_eq!(migration_count(&reopened), 17);
 
         let logical_columns: Vec<String> = reopened
             .connection()
@@ -13687,7 +16096,12 @@ mod tests {
             .expect("foreign keys");
         connection
             .execute_batch(
-                "DROP TABLE purge_cleanup_accounting;
+                "DROP TABLE whole_edition_discovery_changes;
+                 DROP TABLE whole_edition_changes;
+                 DROP TABLE whole_edition_discoveries;
+                 DROP TABLE whole_edition_imports;
+                 DROP TABLE whole_edition_recovery_markers;
+                 DROP TABLE purge_cleanup_accounting;
                  DROP TABLE purge_replacement_metrics;
                  DROP INDEX purge_file_work_by_pack;
                  DROP INDEX purge_file_work_next;
@@ -13702,15 +16116,15 @@ mod tests {
                  DROP TABLE purge_objects;
                  DROP INDEX one_unfinished_purge_per_collection;
                  DROP TABLE purge_operations;
-                 DELETE FROM schema_migrations WHERE version IN (14, 15, 16);
+                 DELETE FROM schema_migrations WHERE version IN (14, 15, 16, 17);
                  PRAGMA user_version = 13;",
             )
             .expect("downgrade purge fixture");
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade v13 library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 16);
-        assert_eq!(migration_count(&upgraded), 16);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 17);
+        assert_eq!(migration_count(&upgraded), 17);
         assert_eq!(table_count(&upgraded, "purge_operations"), 0);
         assert_eq!(table_count(&upgraded, "purge_objects"), 0);
         assert_eq!(table_count(&upgraded, "purge_pack_work"), 0);
@@ -13874,7 +16288,12 @@ mod tests {
             .expect("open database for version-eight fixture");
         connection
             .execute_batch(
-                "DROP TABLE purge_cleanup_accounting;
+                "DROP TABLE whole_edition_discovery_changes;
+                 DROP TABLE whole_edition_changes;
+                 DROP TABLE whole_edition_discoveries;
+                 DROP TABLE whole_edition_imports;
+                 DROP TABLE whole_edition_recovery_markers;
+                 DROP TABLE purge_cleanup_accounting;
                  DROP TABLE purge_replacement_metrics;
                  DROP INDEX purge_file_work_by_pack;
                  DROP INDEX purge_file_work_next;
@@ -13904,15 +16323,15 @@ mod tests {
                  ALTER TABLE collections DROP COLUMN status;
                  ALTER TABLE collections DROP COLUMN generation;
                  ALTER TABLE collections DROP COLUMN tombstoned_at;
-                 DELETE FROM schema_migrations WHERE version IN (9, 10, 11, 12, 13, 14, 15, 16);
+                 DELETE FROM schema_migrations WHERE version IN (9, 10, 11, 12, 13, 14, 15, 16, 17);
                  PRAGMA user_version = 8;",
             )
             .expect("downgrade fixture metadata");
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade version eight library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 16);
-        assert_eq!(migration_count(&upgraded), 16);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 17);
+        assert_eq!(migration_count(&upgraded), 17);
         assert_eq!(
             upgraded
                 .network_transfer_policy()
@@ -13943,7 +16362,12 @@ mod tests {
             .expect("open database for version-nine fixture");
         connection
             .execute_batch(
-                "DROP TABLE purge_cleanup_accounting;
+                "DROP TABLE whole_edition_discovery_changes;
+                 DROP TABLE whole_edition_changes;
+                 DROP TABLE whole_edition_discoveries;
+                 DROP TABLE whole_edition_imports;
+                 DROP TABLE whole_edition_recovery_markers;
+                 DROP TABLE purge_cleanup_accounting;
                  DROP TABLE purge_replacement_metrics;
                  DROP INDEX purge_file_work_by_pack;
                  DROP INDEX purge_file_work_next;
@@ -13972,15 +16396,15 @@ mod tests {
                  ALTER TABLE collections DROP COLUMN status;
                  ALTER TABLE collections DROP COLUMN generation;
                  ALTER TABLE collections DROP COLUMN tombstoned_at;
-                 DELETE FROM schema_migrations WHERE version IN (10, 11, 12, 13, 14, 15, 16);
+                 DELETE FROM schema_migrations WHERE version IN (10, 11, 12, 13, 14, 15, 16, 17);
                  PRAGMA user_version = 9;",
             )
             .expect("downgrade fixture metadata");
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade version nine fixture");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 16);
-        assert_eq!(migration_count(&upgraded), 16);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 17);
+        assert_eq!(migration_count(&upgraded), 17);
         let collection = upgraded
             .collection(collection_id)
             .expect("collection lookup")
@@ -14028,7 +16452,12 @@ mod tests {
             .expect("open database for version-eleven fixture");
         connection
             .execute_batch(
-                "DROP TABLE purge_cleanup_accounting;
+                "DROP TABLE whole_edition_discovery_changes;
+                 DROP TABLE whole_edition_changes;
+                 DROP TABLE whole_edition_discoveries;
+                 DROP TABLE whole_edition_imports;
+                 DROP TABLE whole_edition_recovery_markers;
+                 DROP TABLE purge_cleanup_accounting;
                  DROP TABLE purge_replacement_metrics;
                  DROP INDEX purge_file_work_by_pack;
                  DROP INDEX purge_file_work_next;
@@ -14052,15 +16481,15 @@ mod tests {
                  ALTER TABLE collection_configuration DROP COLUMN thumbnail_max_images_per_revision;
                  ALTER TABLE collection_configuration DROP COLUMN thumbnail_max_edge_pixels;
                  ALTER TABLE collection_configuration DROP COLUMN image_policy;
-                 DELETE FROM schema_migrations WHERE version IN (12, 13, 14, 15, 16);
+                 DELETE FROM schema_migrations WHERE version IN (12, 13, 14, 15, 16, 17);
                  PRAGMA user_version = 11;",
             )
             .expect("downgrade fixture metadata");
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade version eleven library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 16);
-        assert_eq!(migration_count(&upgraded), 16);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 17);
+        assert_eq!(migration_count(&upgraded), 17);
         assert_eq!(
             upgraded
                 .collection_configuration(collection_id)
@@ -14120,8 +16549,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 16);
-        assert_eq!(migration_count(&upgraded), 16);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 17);
+        assert_eq!(migration_count(&upgraded), 17);
         assert_eq!(table_count(&upgraded, "revisions"), 0);
     }
 
@@ -14157,8 +16586,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 16);
-        assert_eq!(migration_count(&upgraded), 16);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 17);
+        assert_eq!(migration_count(&upgraded), 17);
         assert_eq!(table_count(&upgraded, "search_documents"), 0);
         let fts_definition: String = upgraded
             .connection()
@@ -15605,7 +18034,11 @@ mod tests {
 
     #[test]
     fn purge_preview_excludes_source_wide_manifest_text_and_media_claims() {
-        let (_directory, mut library) = test_library();
+        let directory = tempfile::tempdir().expect("temporary library");
+        let config = StoreConfig::default()
+            .with_max_manifest_shard_entries(1)
+            .expect("tiny shards");
+        let mut library = Library::open_with_config(directory.path(), config).expect("library");
         let wiki_id = library
             .register_wiki("https://en.wikipedia.org/w/api.php", "en")
             .expect("register wiki");
@@ -15620,6 +18053,15 @@ mod tests {
             600,
             "Manifest protected page",
             b"manifest protected text",
+        );
+        capture_test_page_source(
+            &mut library,
+            wiki_id,
+            target,
+            61,
+            601,
+            "Second manifest protected page",
+            b"second manifest protected text",
         );
         let file_title = PageTitle::new("File:Manifest-protected.png").expect("file title");
         library
@@ -15664,7 +18106,16 @@ mod tests {
         let manifest = library.append_sync_manifest(run_id).expect("manifest");
         let sync = manifest.manifest.sync().expect("sync event");
         assert_eq!(sync.collection_id, None);
-        assert_eq!(sync.introduced_revisions.len(), 1);
+        assert!(sync.introduced_revisions.is_empty());
+        assert_eq!(
+            manifest
+                .shards
+                .iter()
+                .filter(|descriptor| descriptor.kind == ManifestShardKind::IntroducedRevisions)
+                .map(|descriptor| u64::from(descriptor.entry_count))
+                .sum::<u64>(),
+            2
+        );
         assert_eq!(
             manifest
                 .manifest
@@ -17964,6 +20415,86 @@ mod tests {
     }
 
     #[test]
+    fn schema_v4_manifest_shards_are_bounded_durable_and_verified() {
+        let directory = tempfile::tempdir().expect("temporary library");
+        let config = StoreConfig::default()
+            .with_max_manifest_shard_entries(2)
+            .expect("tiny shard limit");
+        let mut library = Library::open_with_config(directory.path(), config).expect("open");
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "Shard fixture")
+            .expect("collection");
+        for value in 1..=3 {
+            capture_test_page(
+                &mut library,
+                wiki_id,
+                collection_id,
+                value,
+                value * 10,
+                "2026-08-30T10:00:00Z",
+                &format!("Shard page {value}"),
+            );
+        }
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 100)
+            .expect("run")
+            .status
+            .run_id;
+        library.complete_sync_run(run_id, None).expect("complete");
+        let stored = library.append_sync_manifest(run_id).expect("append");
+        assert!(
+            stored
+                .manifest
+                .sync()
+                .expect("sync")
+                .introduced_revisions
+                .is_empty()
+        );
+        assert!(stored.manifest.sync().expect("sync").page_heads.is_empty());
+        assert_eq!(stored.shards.len(), 4);
+        assert!(
+            stored
+                .shards
+                .iter()
+                .all(|descriptor| descriptor.entry_count <= 2)
+        );
+        assert_eq!(
+            library.append_sync_manifest(run_id).expect("idempotent"),
+            stored
+        );
+        drop(library);
+
+        let reopened = Library::open_read_only(directory.path()).expect("reopen");
+        let reread = reopened.read_manifest(1).expect("read and verify shards");
+        assert_eq!(reread, stored);
+        let revision_claims = reread
+            .shards
+            .iter()
+            .filter(|descriptor| descriptor.kind == ManifestShardKind::IntroducedRevisions)
+            .map(
+                |descriptor| match reopened.read_manifest_shard(descriptor).expect("shard") {
+                    ManifestShard::IntroducedRevisions(entries) => entries.len(),
+                    ManifestShard::PageHeads(_) => unreachable!(),
+                },
+            )
+            .sum::<usize>();
+        assert_eq!(revision_claims, 3);
+
+        let descriptor = &reread.shards[0];
+        let path = reopened.manifest_shard_path(descriptor.id);
+        drop(reopened);
+        let mut bytes = fs::read(&path).expect("shard bytes");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        fs::write(path, bytes).expect("tamper fixture");
+        let reopened = Library::open_read_only(directory.path()).expect("reopen tampered");
+        assert!(reopened.read_manifest(1).is_err());
+    }
+
+    #[test]
     fn media_aware_manifest_is_deterministic_and_schema_v1_remains_readable() {
         let (directory, mut library, media_object_id) = integrity_media_fixture();
         let wiki_id = WikiId::new(1).expect("wiki ID");
@@ -18411,6 +20942,306 @@ mod tests {
                 .expect("status")
                 .expect("present"),
             completed
+        );
+    }
+
+    #[test]
+    fn whole_edition_stream_and_recent_changes_resume_without_materializing_members() {
+        let (directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_collection(
+                wiki_id,
+                "Whole edition",
+                &CollectionRule::WholeMainNamespace,
+                HistoryPolicy::CurrentAndFuture,
+                CollectionBudget::unlimited(),
+                CollectionRemovalPolicy::StopTrackingRetainHistory,
+            )
+            .expect("whole collection");
+        let generation = library
+            .collection(collection_id)
+            .expect("collection")
+            .expect("present")
+            .generation;
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 200)
+            .expect("bootstrap run")
+            .status
+            .run_id;
+        let digest = format!("b3:{}", "c".repeat(64));
+        let request = WholeEditionImportRequest {
+            run_id,
+            snapshot_id: "20260830-pages-articles-multistream",
+            dump_digest: &digest,
+            dump_compressed_bytes: 10_000,
+            collection_generation: generation,
+            snapshot_timestamp: 100,
+            race_window_end: 200,
+            recovery_marker_id: None,
+        };
+        let started = library
+            .claim_or_resume_whole_edition_import(request)
+            .expect("claim whole import");
+        let import_id = started.status.dump.import_id;
+        library
+            .record_whole_edition_stream_progress(import_id, 2, 0, 512)
+            .expect("stream progress");
+        let title = PageTitle::new("Readable early").expect("title");
+        let page_id = PageId::new(50).expect("page ID");
+        let revision_id = RevisionId::new(500).expect("revision ID");
+        library
+            .capture_current_revision(
+                wiki_id,
+                collection_id,
+                &CurrentRevisionCapture {
+                    page_id,
+                    namespace: MAIN_NAMESPACE,
+                    title: &title,
+                    revision_id,
+                    parent_id: None,
+                    timestamp: "2026-08-30T10:00:00Z",
+                    author: None,
+                    author_id: None,
+                    comment: None,
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: b"read before the whole dump completes",
+                },
+            )
+            .expect("stream capture");
+        let status = library
+            .record_whole_edition_imported_member(
+                import_id,
+                3,
+                page_id,
+                revision_id,
+                b"read before the whole dump completes".len() as u64,
+            )
+            .expect("record member");
+        assert_eq!(status.dump.imported_pages, 1);
+        assert_eq!(
+            library
+                .whole_edition_imported_members_after(import_id, None, 1)
+                .expect("bounded members")[0]
+                .title,
+            title
+        );
+        assert!(matches!(
+            library.record_whole_edition_stream_progress(import_id, 3, 0, 511),
+            Err(StoreError::WholeEditionProgressRegression { .. })
+        ));
+        library
+            .fail_dump_import(import_id, "interrupted", "fixture restart", true)
+            .expect("fail import retryably");
+        drop(library);
+
+        let mut library = Library::open(directory.path()).expect("reopen");
+        library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 999)
+            .expect("resume same run");
+        let resumed = library
+            .claim_or_resume_whole_edition_import(request)
+            .expect("resume exact import");
+        assert!(resumed.resumed);
+        assert_eq!(resumed.status.artifact_offset, 512);
+        library
+            .complete_dump_import(import_id, 10)
+            .expect("complete dump");
+
+        let discovery = library
+            .claim_or_resume_whole_edition_discovery(WholeEditionDiscoveryRequest {
+                run_id,
+                kind: WholeEditionDiscoveryKind::RaceWindow,
+                window_start: 100,
+                window_end: 200,
+                import_id: Some(import_id),
+                recovery_marker_id: None,
+            })
+            .expect("claim race discovery")
+            .status;
+        let first = WholeEditionChange {
+            change_id: 7,
+            kind: WholeEditionChangeKind::Edit,
+            occurred_at: 150,
+            page_id: Some(page_id),
+            revision_id: Some(RevisionId::new(501).expect("revision ID")),
+            namespace: Some(MAIN_NAMESPACE),
+            title: Some("Readable early"),
+        };
+        let status = library
+            .record_whole_edition_recent_changes_batch(
+                discovery.discovery_id,
+                0,
+                Some("continue=fixture"),
+                &[first],
+            )
+            .expect("first batch");
+        assert_eq!(status.new_changes, 1);
+        assert!(matches!(
+            library.record_whole_edition_recent_changes_batch(discovery.discovery_id, 0, None, &[]),
+            Err(StoreError::WholeEditionDiscoveryCursorConflict { .. })
+        ));
+        let second = WholeEditionChange {
+            change_id: 8,
+            kind: WholeEditionChangeKind::New,
+            occurred_at: 175,
+            page_id: Some(PageId::new(51).expect("page ID")),
+            revision_id: Some(RevisionId::new(600).expect("revision ID")),
+            namespace: Some(MAIN_NAMESPACE),
+            title: Some("New article"),
+        };
+        let status = library
+            .record_whole_edition_recent_changes_batch(
+                discovery.discovery_id,
+                1,
+                None,
+                &[first, second],
+            )
+            .expect("final overlapping batch");
+        assert!(status.source_exhausted);
+        assert_eq!(status.changes_observed, 3);
+        assert_eq!(status.new_changes, 2);
+        let pending = library
+            .whole_edition_pending_changes_after(discovery.discovery_id, None, 1)
+            .expect("bounded pending page");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].change_id, 7);
+        assert!(matches!(
+            library.complete_whole_edition_discovery(discovery.discovery_id),
+            Err(StoreError::IncompleteWholeEditionDiscovery {
+                pending_changes: 2,
+                ..
+            })
+        ));
+        library
+            .mark_whole_edition_change_applied(
+                discovery.discovery_id,
+                7,
+                WholeEditionChangeDisposition::Applied,
+            )
+            .expect("apply edit");
+        library
+            .mark_whole_edition_change_applied(
+                discovery.discovery_id,
+                8,
+                WholeEditionChangeDisposition::Ignored,
+            )
+            .expect("ignore new event");
+        library
+            .complete_whole_edition_discovery(discovery.discovery_id)
+            .expect("complete discovery");
+        let completed = library
+            .complete_sync_run(run_id, None)
+            .expect("advance checkpoint only after dump and discovery");
+        assert_eq!(completed.state, SyncRunState::Succeeded);
+    }
+
+    #[test]
+    fn unresolved_whole_edition_long_gap_blocks_incremental_discovery() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let collection_id = library
+            .create_collection(
+                wiki_id,
+                "Whole edition",
+                &CollectionRule::WholeMainNamespace,
+                HistoryPolicy::CurrentAndFuture,
+                CollectionBudget::unlimited(),
+                CollectionRemovalPolicy::StopTrackingRetainHistory,
+            )
+            .expect("whole collection");
+        let marker = library
+            .mark_whole_edition_long_gap(collection_id, 100, 1_000, "retention exceeded")
+            .expect("mark gap");
+        let repeated = library
+            .mark_whole_edition_long_gap(collection_id, 200, 1_100, "later observation")
+            .expect("preserve first marker");
+        assert_eq!(repeated, marker);
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Update, 1_100)
+            .expect("update run")
+            .status
+            .run_id;
+        assert!(matches!(
+            library.claim_or_resume_whole_edition_discovery(WholeEditionDiscoveryRequest {
+                run_id,
+                kind: WholeEditionDiscoveryKind::Incremental,
+                window_start: 0,
+                window_end: 1_100,
+                import_id: None,
+                recovery_marker_id: None,
+            }),
+            Err(StoreError::WholeEditionLongGapRecoveryRequired { .. })
+        ));
+        library
+            .cancel_sync_run(run_id)
+            .expect("cancel blocked update");
+        let generation = library
+            .collection(collection_id)
+            .expect("collection")
+            .expect("present")
+            .generation;
+        let recovery_run = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 1_200)
+            .expect("fresh dump recovery run")
+            .status
+            .run_id;
+        let digest = format!("b3:{}", "d".repeat(64));
+        let import = library
+            .claim_or_resume_whole_edition_import(WholeEditionImportRequest {
+                run_id: recovery_run,
+                snapshot_id: "fresh-after-gap",
+                dump_digest: &digest,
+                dump_compressed_bytes: 1,
+                collection_generation: generation,
+                snapshot_timestamp: 1_000,
+                race_window_end: 1_200,
+                recovery_marker_id: Some(marker.recovery_marker_id),
+            })
+            .expect("bind fresh dump")
+            .status;
+        library
+            .complete_dump_import(import.dump.import_id, 0)
+            .expect("fresh dump complete");
+        let closure = library
+            .claim_or_resume_whole_edition_discovery(WholeEditionDiscoveryRequest {
+                run_id: recovery_run,
+                kind: WholeEditionDiscoveryKind::LongGapClosure,
+                window_start: 1_000,
+                window_end: 1_200,
+                import_id: Some(import.dump.import_id),
+                recovery_marker_id: Some(marker.recovery_marker_id),
+            })
+            .expect("claim gap closure")
+            .status;
+        library
+            .record_whole_edition_recent_changes_batch(closure.discovery_id, 0, None, &[])
+            .expect("observe closure exhaustion");
+        library
+            .complete_whole_edition_discovery(closure.discovery_id)
+            .expect("complete gap closure");
+        assert!(matches!(
+            library.complete_sync_run(recovery_run, None),
+            Err(StoreError::IncompleteSyncRun { .. })
+        ));
+        let resolved = library
+            .resolve_whole_edition_long_gap(marker.recovery_marker_id, closure.discovery_id)
+            .expect("resolve exact marker");
+        assert!(resolved.resolved);
+        library
+            .complete_sync_run(recovery_run, None)
+            .expect("advance recovered checkpoint");
+        assert!(
+            library
+                .whole_edition_recovery_marker(collection_id)
+                .expect("marker query")
+                .is_none()
         );
     }
 

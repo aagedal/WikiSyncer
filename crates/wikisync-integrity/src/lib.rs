@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 use wikisync_content::{PLAIN_TEXT_TRANSFORMER_VERSION, ThumbnailLimits, validate_thumbnail};
 use wikisync_core::{MAX_THUMBNAIL_BYTES, MAX_THUMBNAIL_EDGE_PIXELS};
 use wikisync_store::{
-    IntegrityMetadataIssue, IntegrityMetadataSubject, Library, ManifestId, ObjectId,
-    ObjectVerificationState, PurgeJournalState, StoreError, StoredManifest, SyncRunState,
+    IntegrityMetadataIssue, IntegrityMetadataSubject, Library, ManifestId, ManifestPageHead,
+    ManifestRevision, ManifestShard, ManifestShardKind, ObjectId, ObjectVerificationState,
+    PurgeJournalState, StoreError, StoredManifest, SyncRunState,
 };
 
 const TRUSTED_HEAD_SCHEMA_VERSION: u32 = 1;
@@ -1936,7 +1937,7 @@ fn verify_manifest_metadata_claims(
     let Some(manifest) = entry.sync() else {
         return Ok(());
     };
-    for claim in &manifest.introduced_revisions {
+    let mut verify_revision_claim = |claim: &ManifestRevision| -> Result<(), VerificationError> {
         report.manifest_revision_claims_examined = report
             .manifest_revision_claims_examined
             .checked_add(1)
@@ -2016,11 +2017,28 @@ fn verify_manifest_metadata_claims(
                 },
             );
         }
+        Ok(())
+    };
+    for claim in &manifest.introduced_revisions {
+        verify_revision_claim(claim)?;
+    }
+    for descriptor in stored
+        .shards
+        .iter()
+        .filter(|descriptor| descriptor.kind == ManifestShardKind::IntroducedRevisions)
+    {
+        let ManifestShard::IntroducedRevisions(claims) = library.read_manifest_shard(descriptor)?
+        else {
+            unreachable!("descriptor kind verified by shard reader")
+        };
+        for claim in &claims {
+            verify_revision_claim(claim)?;
+        }
     }
 
-    for head in &manifest.page_heads {
+    let mut verify_page_head = |head: &ManifestPageHead| -> Result<(), VerificationError> {
         let Some(revision_id) = head.revision_id else {
-            continue;
+            return Ok(());
         };
         report.manifest_page_head_claims_examined = report
             .manifest_page_head_claims_examined
@@ -2077,6 +2095,22 @@ fn verify_manifest_metadata_claims(
                 },
             ),
             Some(_) => {}
+        }
+        Ok(())
+    };
+    for head in &manifest.page_heads {
+        verify_page_head(head)?;
+    }
+    for descriptor in stored
+        .shards
+        .iter()
+        .filter(|descriptor| descriptor.kind == ManifestShardKind::PageHeads)
+    {
+        let ManifestShard::PageHeads(heads) = library.read_manifest_shard(descriptor)? else {
+            unreachable!("descriptor kind verified by shard reader")
+        };
+        for head in &heads {
+            verify_page_head(head)?;
         }
     }
     Ok(())
@@ -2454,7 +2488,7 @@ mod tests {
     use wikisync_core::{CollectionId, MediaId, PageId, PageTitle, RevisionId, ThumbnailPolicy};
     use wikisync_store::{
         CurrentRevisionCapture, Library, MediaPlacementKind, ObjectKind, PurgeAuthorization,
-        RevisionMediaPlacement, SyncRunKind, ThumbnailCapture, ThumbnailMimeType,
+        RevisionMediaPlacement, StoreConfig, SyncRunKind, ThumbnailCapture, ThumbnailMimeType,
     };
 
     use super::*;
@@ -2946,6 +2980,58 @@ mod tests {
         assert_eq!(report.manifests_identity_verified, 3);
         assert_eq!(report.finding_count, 0);
         assert!(report.is_verified_since_capture());
+    }
+
+    #[test]
+    fn full_verification_replays_schema_v4_claim_shards() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config = StoreConfig::default()
+            .with_max_manifest_shard_entries(2)
+            .expect("tiny shards");
+        let mut library = Library::open_with_config(directory.path(), config).expect("library");
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("wiki");
+        let collection_id = library
+            .create_explicit_collection(wiki_id, "sharded claims")
+            .expect("collection");
+        for value in 1..=3_u64 {
+            let title = PageTitle::new(format!("Sharded claim {value}")).expect("title");
+            library
+                .capture_current_revision(
+                    wiki_id,
+                    collection_id,
+                    &CurrentRevisionCapture {
+                        page_id: PageId::new(value).expect("page"),
+                        namespace: 0,
+                        title: &title,
+                        revision_id: RevisionId::new(value * 10).expect("revision"),
+                        parent_id: None,
+                        timestamp: "2026-08-30T10:00:00Z",
+                        author: None,
+                        author_id: None,
+                        comment: None,
+                        minor: false,
+                        upstream_sha1: None,
+                        content_model: "wikitext",
+                        source: title.as_str().as_bytes(),
+                    },
+                )
+                .expect("capture");
+        }
+        let run_id = library
+            .start_or_resume_sync_run(wiki_id, Some(collection_id), SyncRunKind::Bootstrap, 100)
+            .expect("run")
+            .status
+            .run_id;
+        library.complete_sync_run(run_id, None).expect("complete");
+        let stored = library.append_sync_manifest(run_id).expect("manifest");
+        assert_eq!(stored.shards.len(), 4);
+
+        let report = verify_library(&library, VerificationScope::Full).expect("verification");
+        assert_eq!(report.finding_count, 0, "{:?}", report.findings);
+        assert_eq!(report.manifest_revision_claims_examined, 3);
+        assert_eq!(report.manifest_page_head_claims_examined, 3);
     }
 
     #[test]

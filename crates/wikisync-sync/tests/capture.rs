@@ -4,7 +4,7 @@ use bzip2::Compression;
 use bzip2::write::BzEncoder;
 use std::io::Write;
 use std::time::Duration;
-use support::{FixtureResponse, FixtureServer};
+use support::{FixtureGate, FixtureResponse, FixtureServer};
 use wikisync_core::{
     CollectionBudget, CollectionRemovalPolicy, CollectionRule, HistoryPolicy, ImagePolicy,
     InclusionReason, PageId, PageTitle, RevisionId, ThumbnailPolicy, TitleSelection,
@@ -21,11 +21,12 @@ use wikisync_store::{
 use wikisync_sync::{
     CaptureError, CategoryPreviewError, CategoryPreviewLimits, CollectionPreviewError,
     DumpBootstrapError, DynamicMembershipReconciliation, DynamicMembershipReconciliationError,
-    ReconciliationLimits, bootstrap_collection_from_verified_dump, capture_committed_collection,
+    ReconciliationLimits, bootstrap_collection_from_verified_dump,
+    bootstrap_whole_main_namespace_from_trusted_dump, capture_committed_collection,
     capture_explicit_titles, capture_revision_history, commit_collection_preview, parse_title_list,
     preview_category_selection, preview_collection_rule, reconcile_collection_heads,
     reconcile_collection_heads_with_cancellation, reconcile_collection_heads_with_limits,
-    reconcile_dynamic_collection_membership,
+    reconcile_dynamic_collection_membership, update_whole_main_namespace,
 };
 
 const TITLE_RESOLUTION: &str = include_str!("../../../fixtures/mediawiki/title-resolution.json");
@@ -120,6 +121,228 @@ const VALID_PNG: &[u8] = &[
     0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
     0xae, 0x42, 0x60, 0x82,
 ];
+
+#[test]
+fn whole_edition_dump_is_searchable_before_the_last_artifact_arrives() {
+    let gate = FixtureGate::default();
+    let index_digest = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let captured_digest = std::sync::Arc::clone(&index_digest);
+    let blocked = gate.clone();
+    let server = FixtureServer::start_generated(move |endpoint| {
+        let artifact = |title: &str, page_id: u64, revision_id: u64, body: &str| {
+            let xml = format!(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" version="0.11" xml:lang="en">
+  <siteinfo><sitename>Fixture Wikipedia</sitename><dbname>enwiki</dbname>
+    <base>{endpoint}</base><generator>MediaWiki fixture</generator><case>first-letter</case>
+    <namespaces><namespace key="0" case="first-letter" /></namespaces></siteinfo>
+  <page><title>{title}</title><ns>0</ns><id>{page_id}</id><revision>
+    <id>{revision_id}</id><timestamp>2026-08-30T11:00:00Z</timestamp>
+    <contributor><username>Fixture editor</username></contributor>
+    <model>wikitext</model><format>text/x-wiki</format>
+    <text bytes="{}" xml:space="preserve">{body}</text>
+  </revision></page>
+</mediawiki>"#,
+                body.len()
+            );
+            let mut encoder = BzEncoder::new(Vec::new(), Compression::best());
+            encoder.write_all(xml.as_bytes()).expect("compress XML");
+            encoder.finish().expect("finish bzip2 member")
+        };
+        let first = artifact("Alpha", 10, 100, "progressive searchable alpha");
+        let second = artifact("Beta", 20, 200, "later searchable beta");
+        let index = format!(
+            r#"{{"schema":"wikisync-current-dump-index-v1","database":"enwiki","generated_at":"2026-08-30T12:00:00Z","artifacts":[
+{{"kind":"pages-meta-current-multistream","path":"part-1.xml.bz2","bytes":{},"blake3":"{}"}},
+{{"kind":"pages-meta-current-multistream","path":"part-2.xml.bz2","bytes":{},"blake3":"{}"}}]}}"#,
+            first.len(),
+            blake3::hash(&first).to_hex(),
+            second.len(),
+            blake3::hash(&second).to_hex(),
+        );
+        *captured_digest.lock().expect("index digest lock") =
+            Some(blake3::hash(index.as_bytes()).to_hex().to_string());
+        vec![
+            FixtureResponse::json(index),
+            FixtureResponse::json(
+                r#"{"batchcomplete":true,"curtimestamp":"2026-08-30T12:05:00Z"}"#,
+            ),
+            FixtureResponse::json(
+                r#"{"batchcomplete":true,"curtimestamp":"2026-08-30T12:05:00Z","query":{"recentchanges":[]}}"#,
+            ),
+            FixtureResponse::bytes(first, "application/x-bzip2"),
+            FixtureResponse::json(
+                r#"{"batchcomplete":true,"curtimestamp":"2026-08-30T12:05:00Z"}"#,
+            ),
+            FixtureResponse::bytes(second, "application/x-bzip2").blocked(blocked),
+            FixtureResponse::json(
+                r#"{"batchcomplete":true,"curtimestamp":"2026-08-30T12:05:00Z"}"#,
+            ),
+            FixtureResponse::json(
+                r#"{"batchcomplete":true,"curtimestamp":"2026-08-30T12:10:00Z"}"#,
+            ),
+            FixtureResponse::json(
+                r#"{"batchcomplete":true,"curtimestamp":"2026-08-30T12:10:00Z","query":{"recentchanges":[{"type":"edit","ns":0,"title":"Alpha","pageid":10,"revid":101,"old_revid":100,"rcid":7001,"timestamp":"2026-08-30T12:06:00Z"}]}}"#,
+            ),
+            FixtureResponse::json(
+                r#"{"batchcomplete":true,"query":{"pages":[{"pageid":10,"ns":0,"title":"Alpha","revisions":[{"revid":101,"parentid":100,"timestamp":"2026-08-30T12:06:00Z","user":"Fixture editor","userid":42,"size":29,"slots":{"main":{"contentmodel":"wikitext","contentformat":"text/x-wiki","content":"updated searchable alpha text"}}}]}]}}"#,
+            ),
+            FixtureResponse::json(
+                r#"{"batchcomplete":true,"curtimestamp":"2026-09-08T12:10:00Z"}"#,
+            ),
+        ]
+    });
+    let trust = TrustedDumpIndex::new(
+        server.endpoint(),
+        DumpDigest::from_hex(
+            index_digest
+                .lock()
+                .expect("index digest lock")
+                .as_deref()
+                .expect("generated index digest"),
+        )
+        .expect("index digest"),
+        "enwiki",
+    )
+    .expect("trusted index");
+    let directory = tempfile::tempdir().expect("temporary library");
+    let mut library = Library::open(directory.path()).expect("library");
+    let wiki_id = library
+        .register_wiki(server.endpoint(), "en")
+        .expect("wiki");
+    let (collection_id, _) = library
+        .create_collection_from_preview(
+            wiki_id,
+            "English Wikipedia",
+            CollectionPreviewCommit {
+                rule: &CollectionRule::WholeMainNamespace,
+                history_policy: HistoryPolicy::CurrentAndFuture,
+                budget: CollectionBudget::unlimited(),
+                removal_policy: CollectionRemovalPolicy::StopTrackingRetainHistory,
+                members: &[],
+                missing_titles: &[],
+                predicted_canonical_bytes: None,
+            },
+        )
+        .expect("whole-edition collection");
+    drop(library);
+
+    let library_path = directory.path().to_owned();
+    std::fs::create_dir(library_path.join("cache")).expect("dump cache");
+    let endpoint = server.endpoint().to_owned();
+    let worker = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let client = MediaWikiClient::new(
+            ClientConfig::new(&endpoint, "WikiSyncer/0.1 progressive-dump-test")
+                .expect("client configuration"),
+        )
+        .expect("client");
+        let mut library = Library::open(&library_path).expect("writer library");
+        runtime.block_on(bootstrap_whole_main_namespace_from_trusted_dump(
+            &client,
+            &mut library,
+            collection_id,
+            &trust,
+            &library_path.join("cache"),
+            DumpAcquisitionLimits::default(),
+            DumpLimits::default(),
+        ))
+    });
+
+    let second_part_requested = gate.wait_until_requested(Duration::from_secs(10));
+    if !second_part_requested {
+        gate.release();
+        panic!(
+            "second dump part was not requested: {:?}",
+            worker.join().expect("bootstrap worker")
+        );
+    }
+    let reader = Library::open_read_only(directory.path()).expect("concurrent reader");
+    let search = SqliteSearchIndex::open(&reader).expect("search index");
+    let alpha = search
+        .search(SearchQuery::new("progressive searchable"))
+        .expect("search first artifact");
+    let beta_before_release = search
+        .search(SearchQuery::new("later searchable"))
+        .expect("search deferred artifact");
+    gate.release();
+    assert_eq!(alpha.len(), 1, "first artifact must already be searchable");
+    assert!(
+        beta_before_release.is_empty(),
+        "later artifacts must remain unavailable until they arrive"
+    );
+    let report = worker
+        .join()
+        .expect("bootstrap worker")
+        .expect("whole-edition bootstrap");
+    assert_eq!(report.pages_imported, 2);
+    let reader = Library::open_read_only(directory.path()).expect("completed reader");
+    assert_eq!(
+        SqliteSearchIndex::open(&reader)
+            .expect("search index")
+            .search(SearchQuery::new("later searchable"))
+            .expect("search second artifact")
+            .len(),
+        1
+    );
+    drop(reader);
+    let client = MediaWikiClient::new(
+        ClientConfig::new(server.endpoint(), "WikiSyncer/0.1 whole-update-test")
+            .expect("client configuration"),
+    )
+    .expect("client");
+    let mut library = Library::open(directory.path()).expect("update writer");
+    let update = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("update runtime")
+        .block_on(update_whole_main_namespace(
+            &client,
+            &mut library,
+            collection_id,
+        ))
+        .expect("whole-edition update");
+    assert_eq!(update.discovery.applied_changes, 1);
+    assert_eq!(
+        SqliteSearchIndex::open(&library)
+            .expect("updated search index")
+            .search(SearchQuery::new("updated searchable"))
+            .expect("search updated article")
+            .len(),
+        1
+    );
+    assert!(
+        library
+            .revision(wiki_id, RevisionId::new(100).expect("old revision"))
+            .expect("old revision lookup")
+            .is_some(),
+        "the pre-update revision remains readable"
+    );
+    let long_gap = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("long-gap runtime")
+        .block_on(update_whole_main_namespace(
+            &client,
+            &mut library,
+            collection_id,
+        ))
+        .expect_err("long offline interval requires a fresh dump");
+    assert!(matches!(
+        long_gap,
+        DumpBootstrapError::WholeEditionLongGap { .. }
+    ));
+    assert!(
+        library
+            .whole_edition_recovery_marker(collection_id)
+            .expect("recovery marker")
+            .is_some()
+    );
+    assert_eq!(server.finish().len(), 11);
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn authenticated_dump_bootstrap_filters_selection_and_closes_its_race_window() {

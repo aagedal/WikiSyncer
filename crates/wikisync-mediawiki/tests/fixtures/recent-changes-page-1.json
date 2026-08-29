@@ -1,0 +1,61 @@
+{
+  "batchcomplete": true,
+  "continue": {
+    "rccontinue": "20260830120200|7003",
+    "continue": "-||"
+  },
+  "curtimestamp": "2026-08-30T12:05:00Z",
+  "query": {
+    "recentchanges": [
+      {
+        "type": "edit",
+        "ns": 0,
+        "title": "Alpha",
+        "pageid": 101,
+        "revid": 1002,
+        "old_revid": 1001,
+        "rcid": 7001,
+        "timestamp": "2026-08-30T12:01:00Z",
+        "user": "Example editor",
+        "userid": 51,
+        "comment": "Clarify the introduction",
+        "minor": true,
+        "oldlen": 1100,
+        "newlen": 1125
+      },
+      {
+        "type": "new",
+        "ns": 0,
+        "title": "Beta",
+        "pageid": 102,
+        "revid": 2001,
+        "old_revid": 0,
+        "rcid": 7002,
+        "timestamp": "2026-08-30T12:02:00Z",
+        "user": "192.0.2.10",
+        "userid": 0,
+        "comment": "Create article",
+        "newlen": 420
+      },
+      {
+        "type": "log",
+        "ns": 0,
+        "title": "Alpha",
+        "pageid": 101,
+        "revid": 0,
+        "old_revid": 0,
+        "rcid": 7003,
+        "timestamp": "2026-08-30T12:02:30Z",
+        "user": "Administrator",
+        "userid": 7,
+        "comment": "Routine protection",
+        "logid": 8000,
+        "logtype": "protect",
+        "logaction": "protect",
+        "logparams": {
+          "details": []
+        }
+      }
+    ]
+  }
+}
