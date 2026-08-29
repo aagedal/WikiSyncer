@@ -1,6 +1,6 @@
 # WikiSyncer implementation status
 
-Updated: 2026-08-25
+Updated: 2026-08-29
 
 ## Completed backlog items
 
@@ -471,7 +471,13 @@ Beta robustness and migration evidence now also includes:
 
 - maintained bounded fuzz targets and seed corpora for deterministic wikitext/plain-
   text/Markdown rewriting, canonical trusted-head JSON, current-dump parsing, loose-
-  object decompression, pack/index reads, repacking, and delta reconstruction; and
+  object decompression, pack/index reads, repacking, delta reconstruction, and every
+  currently consumed MediaWiki Action API success/error response shape and
+  continuation. The Action API target is feature-gated out of normal application
+  builds but shares the production operation validators, including exact caller
+  identity checks. Typed deserialization caps one response at 50 pages, 500 revisions,
+  500 category members, 4,096 image references, and the single-result image-info
+  contract; and
 - a retained materialized schema-11 whole-library fixture with two canonical loose
   objects. Public read APIs snapshot its source, collection, membership, schedule,
   transfer policy, titles, revisions, and exact bytes before migrating a copy through
@@ -489,14 +495,15 @@ Additional release-acceptance hardening now also includes:
   daemon owner and lookup failures fail closed. This protects the cross-account
   boundary; hostile processes already running as the same account remain explicitly
   inside the trust boundary;
-- maintained named seed corpora for all five fuzz targets, including ordinary empty,
-  short, Unicode, nested, incomplete, and valid compressed samples. Every target
-  compiled and completed a bounded direct smoke run. All five also completed a clean
-  60-second nightly AddressSanitizer/libFuzzer resource-sizing campaign with isolated
-  corpora and no crash, timeout, OOM, or artifact; the exact corpus identity,
-  executions, coverage, peak RSS, toolchain, and symbolizer limitation are recorded
-  in `docs/benchmarks/fuzz-campaign-2026-08-25.md`. Longer sustained campaigns and a
-  direct untrusted Action API JSON fuzz boundary remain outstanding;
+- maintained named seed corpora for all six fuzz targets, including ordinary empty,
+  short, Unicode, nested, incomplete, and valid samples. Every target compiled and
+  completed a bounded direct smoke run. The original five completed clean 60-second
+  nightly AddressSanitizer/libFuzzer resource-sizing campaigns, and the direct
+  untrusted Action API JSON boundary completed 875,058 clean executions in a separate
+  61-second campaign. Exact corpus identities, coverage, peak RSS, toolchains, and the
+  symbolizer limitation are recorded in `docs/benchmarks/fuzz-campaign-2026-08-25.md`
+  and `docs/benchmarks/fuzz-campaign-2026-08-29-action-api-json.md`. Longer sustained
+  native campaigns remain outstanding;
 - the missing written renderer evaluation and fixture-backed Milestone 0 API/disk
   characterization artifacts, which record the conservative offline renderer choice,
   its fidelity boundary, reproducible commands, and non-SLA measurements; and
@@ -575,8 +582,8 @@ a real older-beta whole-library migration fixture, a representative multi-langua
 GUI/daemon lifecycle, a recorded macOS/Ubuntu acceptance matrix, and the historical
 Milestone 0 API/disk and renderer-evaluation artifacts are present. Initial
 instrumented fuzz resource outcomes are now recorded; the next locally actionable
-release-acceptance work is longer sustained campaigns (including a deliberate
-untrusted Action API input boundary), native Ubuntu execution for the current
+release-acceptance work is longer sustained campaigns, including larger Action API
+inputs up to the production response ceiling, native Ubuntu execution for the current
 candidate matrix, and a clean-system macOS/Ubuntu install/service/upgrade assessment
 once candidate artifacts are available.
 

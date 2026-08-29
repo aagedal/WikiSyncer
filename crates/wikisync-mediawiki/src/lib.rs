@@ -26,6 +26,7 @@ pub use media::{
 use std::error::Error;
 use std::fmt;
 use std::io;
+use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -35,7 +36,7 @@ use std::time::{Duration, Instant};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{StatusCode, Url, redirect};
 use serde::Deserialize;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, SeqAccess, Visitor};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use wikisync_core::{PageId, PageTitle, RevisionId};
 
@@ -46,10 +47,21 @@ const DEFAULT_TITLES_PER_OPERATION: usize = 1_000;
 const DEFAULT_TITLES_PER_REQUEST: usize = 50;
 const DEFAULT_REVISIONS_PER_REQUEST: usize = 500;
 const DEFAULT_CATEGORY_MEMBERS_PER_REQUEST: usize = 500;
+const MAX_PAGES_PER_RESPONSE: usize = DEFAULT_TITLES_PER_REQUEST;
+const MAX_REVISIONS_PER_RESPONSE: usize = DEFAULT_REVISIONS_PER_REQUEST;
+const MAX_CATEGORY_MEMBERS_PER_RESPONSE: usize = DEFAULT_CATEGORY_MEMBERS_PER_REQUEST;
 const DEFAULT_RETRY_ATTEMPTS: usize = 4;
 const DEFAULT_CIRCUIT_FAILURE_THRESHOLD: usize = 3;
 const MAX_RESOLVED_DESTINATIONS: usize = 32;
 const WIKIMEDIA_UPLOAD_HOST: &str = "upload.wikimedia.org";
+
+/// Maximum input accepted by the offline Action API response validation harness.
+///
+/// This matches the default production transport ceiling. Individual fuzz campaigns
+/// may choose a smaller `-max_len` while sizing their resource use.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub const MAX_ACTION_API_RESPONSE_BYTES: usize = DEFAULT_RESPONSE_LIMIT;
 const WIKIMEDIA_PROJECT_DOMAINS: [&str; 11] = [
     "mediawiki.org",
     "wikibooks.org",
@@ -1018,9 +1030,7 @@ impl MediaWikiClient {
                 ])
                 .await?;
 
-            for page in response.query.pages {
-                resolved.push(page.try_into()?);
-            }
+            resolved.extend(parse_title_resolution_response(response)?);
         }
         Ok(resolved)
     }
@@ -1044,30 +1054,7 @@ impl MediaWikiClient {
                 ("rvslots", "main"),
             ])
             .await?;
-        let mut pages = response.query.pages.into_iter();
-        let page = pages.next().ok_or(ClientError::InvalidResponse(
-            "page-head response did not contain the requested page",
-        ))?;
-        if pages.next().is_some() {
-            return Err(ClientError::InvalidResponse(
-                "page-head response contained more than one page",
-            ));
-        }
-        if page.missing {
-            return Ok(PageHeadResolution::Missing { page_id });
-        }
-        let resolved = match TitleResolution::try_from(page)? {
-            TitleResolution::Found(page) => page,
-            TitleResolution::Missing { .. } => {
-                return Ok(PageHeadResolution::Missing { page_id });
-            }
-        };
-        if resolved.page_id != page_id {
-            return Err(ClientError::InvalidResponse(
-                "page-head response returned a different page ID",
-            ));
-        }
-        Ok(PageHeadResolution::Found(Box::new(resolved)))
+        parse_page_head_response(response, page_id)
     }
 
     /// Fetches one bounded page of revision metadata.
@@ -1121,29 +1108,7 @@ impl MediaWikiClient {
         }
 
         let response: QueryResponse<PagesQuery> = self.get_json(&params).await?;
-        let page = response
-            .query
-            .pages
-            .into_iter()
-            .find(|page| page.page_id == i64::try_from(page_id.get()).ok())
-            .ok_or(ClientError::InvalidResponse(
-                "revision response did not contain the requested page",
-            ))?;
-
-        let revisions = page
-            .revisions
-            .unwrap_or_default()
-            .into_iter()
-            .map(RevisionMetadata::try_from)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(RevisionBatch {
-            revisions,
-            continuation: response
-                .continuation
-                .map(RevisionContinuation::try_from)
-                .transpose()?,
-        })
+        parse_revision_batch_response(response, page_id)
     }
 
     /// Fetches one bounded page of main-namespace pages and subcategories.
@@ -1171,20 +1136,7 @@ impl MediaWikiClient {
         }
 
         let response: QueryResponse<CategoryMembersQuery> = self.get_json(&params).await?;
-        let members = response
-            .query
-            .category_members
-            .into_iter()
-            .map(CategoryMember::try_from)
-            .collect::<Result<Vec<_>, _>>()?;
-        let continuation = response
-            .continuation
-            .map(CategoryContinuation::try_from)
-            .transpose()?;
-        Ok(CategoryMembersBatch {
-            members,
-            continuation,
-        })
+        parse_category_members_response(response)
     }
 
     /// Fetches the canonical main-slot source for one known page revision.
@@ -1213,39 +1165,7 @@ impl MediaWikiClient {
                 ("rvslots", "main"),
             ])
             .await?;
-        let page = response
-            .query
-            .pages
-            .into_iter()
-            .find(|page| page.page_id == i64::try_from(page_id.get()).ok())
-            .ok_or(ClientError::InvalidResponse(
-                "revision-content response did not contain the requested page",
-            ))?;
-        let revision = page
-            .revisions
-            .and_then(|revisions| revisions.into_iter().next())
-            .ok_or(ClientError::InvalidResponse(
-                "revision-content response did not contain the requested revision",
-            ))?;
-        if revision.revision_id != revision_id.get() {
-            return Err(ClientError::InvalidResponse(
-                "revision-content response returned a different revision",
-            ));
-        }
-        let source = revision
-            .slots
-            .as_ref()
-            .and_then(|slots| slots.main.content.as_deref())
-            .ok_or(ClientError::InvalidResponse(
-                "requested revision has no public main-slot content",
-            ))?
-            .as_bytes()
-            .to_vec();
-
-        Ok(RevisionContent {
-            metadata: revision.try_into()?,
-            source,
-        })
+        parse_revision_content_response(response, page_id, revision_id)
     }
 
     async fn get_json<T>(&self, params: &[(&str, &str)]) -> Result<T, ClientError>
@@ -1354,17 +1274,8 @@ impl MediaWikiClient {
             body.extend_from_slice(&chunk);
         }
 
-        // Probe only the optional top-level error field first. Unknown success fields
-        // are traversed as `IgnoredAny`, so bounded typed deserializers can reject an
-        // oversized collection before a generic JSON value allocates it.
-        let error_envelope: ApiErrorEnvelope =
-            serde_json::from_slice(&body).map_err(ClientError::Decode)?;
-        if let Some(error) = error_envelope.error {
-            return Err(ClientError::Api(ApiError {
-                code: error.code,
-                info: error.info,
-                retry_after,
-            }));
+        if let Some(error) = decode_action_api_error(&body, retry_after)? {
+            return Err(ClientError::Api(error));
         }
         if !status.is_success() {
             return Err(ClientError::HttpStatus {
@@ -1393,6 +1304,235 @@ impl MediaWikiClient {
         let requested = retry_after.unwrap_or_default().min(policy.maximum_delay);
         jittered.max(requested)
     }
+}
+
+fn parse_title_resolution_response(
+    response: QueryResponse<PagesQuery>,
+) -> Result<Vec<TitleResolution>, ClientError> {
+    response
+        .query
+        .pages
+        .into_iter()
+        .map(TitleResolution::try_from)
+        .collect()
+}
+
+fn parse_page_head_response(
+    response: QueryResponse<PagesQuery>,
+    page_id: PageId,
+) -> Result<PageHeadResolution, ClientError> {
+    let mut pages = response.query.pages.into_iter();
+    let page = pages.next().ok_or(ClientError::InvalidResponse(
+        "page-head response did not contain the requested page",
+    ))?;
+    if pages.next().is_some() {
+        return Err(ClientError::InvalidResponse(
+            "page-head response contained more than one page",
+        ));
+    }
+    if page.missing {
+        return Ok(PageHeadResolution::Missing { page_id });
+    }
+    let resolved = match TitleResolution::try_from(page)? {
+        TitleResolution::Found(page) => page,
+        TitleResolution::Missing { .. } => return Ok(PageHeadResolution::Missing { page_id }),
+    };
+    if resolved.page_id != page_id {
+        return Err(ClientError::InvalidResponse(
+            "page-head response returned a different page ID",
+        ));
+    }
+    Ok(PageHeadResolution::Found(Box::new(resolved)))
+}
+
+fn parse_revision_batch_response(
+    response: QueryResponse<PagesQuery>,
+    page_id: PageId,
+) -> Result<RevisionBatch, ClientError> {
+    let page = response
+        .query
+        .pages
+        .into_iter()
+        .find(|page| page.page_id == i64::try_from(page_id.get()).ok())
+        .ok_or(ClientError::InvalidResponse(
+            "revision response did not contain the requested page",
+        ))?;
+    let revisions = page
+        .revisions
+        .unwrap_or_default()
+        .into_iter()
+        .map(RevisionMetadata::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RevisionBatch {
+        revisions,
+        continuation: response
+            .continuation
+            .map(RevisionContinuation::try_from)
+            .transpose()?,
+    })
+}
+
+fn parse_revision_content_response(
+    response: QueryResponse<PagesQuery>,
+    page_id: PageId,
+    revision_id: RevisionId,
+) -> Result<RevisionContent, ClientError> {
+    let page = response
+        .query
+        .pages
+        .into_iter()
+        .find(|page| page.page_id == i64::try_from(page_id.get()).ok())
+        .ok_or(ClientError::InvalidResponse(
+            "revision-content response did not contain the requested page",
+        ))?;
+    let revision = page
+        .revisions
+        .and_then(|revisions| revisions.into_iter().next())
+        .ok_or(ClientError::InvalidResponse(
+            "revision-content response did not contain the requested revision",
+        ))?;
+    if revision.revision_id != revision_id.get() {
+        return Err(ClientError::InvalidResponse(
+            "revision-content response returned a different revision",
+        ));
+    }
+    let source = revision
+        .slots
+        .as_ref()
+        .and_then(|slots| slots.main.content.as_deref())
+        .ok_or(ClientError::InvalidResponse(
+            "requested revision has no public main-slot content",
+        ))?
+        .as_bytes()
+        .to_vec();
+    Ok(RevisionContent {
+        metadata: revision.try_into()?,
+        source,
+    })
+}
+
+fn parse_category_members_response(
+    response: QueryResponse<CategoryMembersQuery>,
+) -> Result<CategoryMembersBatch, ClientError> {
+    let members = response
+        .query
+        .category_members
+        .into_iter()
+        .map(CategoryMember::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let continuation = response
+        .continuation
+        .map(CategoryContinuation::try_from)
+        .transpose()?;
+    Ok(CategoryMembersBatch {
+        members,
+        continuation,
+    })
+}
+
+/// MediaWiki response shape exercised by [`validate_action_api_response`].
+///
+/// The variants cover every Action API success payload currently consumed by the
+/// application. The validation entry point is deliberately offline and intended for
+/// property tests and fuzzers; normal application code should use [`MediaWikiClient`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub enum ActionApiResponseKind {
+    /// Batched title resolution and normalization.
+    TitleResolution,
+    /// Stable-page current-head lookup.
+    PageHead,
+    /// One resumable page of revision metadata.
+    RevisionBatch,
+    /// Exact canonical source for one revision.
+    RevisionContent,
+    /// One resumable page of category members.
+    CategoryMembers,
+    /// Passive raster references for an exact revision.
+    RevisionImages,
+    /// Thumbnail attribution and rendition metadata.
+    ThumbnailMetadata,
+}
+
+/// Parses and semantically validates one bounded, untrusted Action API JSON body.
+///
+/// This exposes the real response-decoding boundary to offline property tests and
+/// fuzzers without constructing an HTTP client or contacting a MediaWiki source.
+/// Operation-specific caller identities are represented by deterministic harness
+/// identities where needed. Both success payloads and structured API errors traverse
+/// the same typed decoder used by [`MediaWikiClient`].
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn validate_action_api_response(
+    data: &[u8],
+    kind: ActionApiResponseKind,
+) -> Result<(), ClientError> {
+    if data.len() > MAX_ACTION_API_RESPONSE_BYTES {
+        return Err(ClientError::ResponseTooLarge {
+            limit: MAX_ACTION_API_RESPONSE_BYTES,
+        });
+    }
+
+    let page_id = PageId::new(42).expect("the fixed Action API fuzz page ID is valid");
+    let revision_id = RevisionId::new(100).expect("the fixed Action API fuzz revision ID is valid");
+
+    match kind {
+        ActionApiResponseKind::TitleResolution => {
+            let response: QueryResponse<PagesQuery> = decode_action_api_json(data, None)?;
+            let _ = parse_title_resolution_response(response)?;
+        }
+        ActionApiResponseKind::PageHead => {
+            let response: QueryResponse<PagesQuery> = decode_action_api_json(data, None)?;
+            let _ = parse_page_head_response(response, page_id)?;
+        }
+        ActionApiResponseKind::RevisionBatch => {
+            let response: QueryResponse<PagesQuery> = decode_action_api_json(data, None)?;
+            let _ = parse_revision_batch_response(response, page_id)?;
+        }
+        ActionApiResponseKind::RevisionContent => {
+            let response: QueryResponse<PagesQuery> = decode_action_api_json(data, None)?;
+            let _ = parse_revision_content_response(response, page_id, revision_id)?;
+        }
+        ActionApiResponseKind::CategoryMembers => {
+            let response: QueryResponse<CategoryMembersQuery> = decode_action_api_json(data, None)?;
+            let _ = parse_category_members_response(response)?;
+        }
+        ActionApiResponseKind::RevisionImages => {
+            media::validate_revision_images_response(data)?;
+        }
+        ActionApiResponseKind::ThumbnailMetadata => {
+            media::validate_thumbnail_metadata_response(data)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "fuzzing")]
+fn decode_action_api_json<T>(body: &[u8], retry_after: Option<Duration>) -> Result<T, ClientError>
+where
+    T: DeserializeOwned,
+{
+    if let Some(error) = decode_action_api_error(body, retry_after)? {
+        return Err(ClientError::Api(error));
+    }
+    serde_json::from_slice(body).map_err(ClientError::Decode)
+}
+
+fn decode_action_api_error(
+    body: &[u8],
+    retry_after: Option<Duration>,
+) -> Result<Option<ApiError>, ClientError> {
+    // Probe only the optional top-level error field first. Unknown success fields
+    // are traversed as `IgnoredAny`, so bounded typed deserializers can reject an
+    // oversized collection before a generic JSON value allocates it.
+    let error_envelope: ApiErrorEnvelope =
+        serde_json::from_slice(body).map_err(ClientError::Decode)?;
+    Ok(error_envelope.error.map(|error| ApiError {
+        code: error.code,
+        info: error.info,
+        retry_after,
+    }))
 }
 
 /// Direction in which MediaWiki enumerates a page's revisions.
@@ -1764,12 +1904,16 @@ impl TryFrom<ContinuationPayload> for CategoryContinuation {
 
 #[derive(Debug, Deserialize)]
 struct PagesQuery {
+    #[serde(deserialize_with = "deserialize_pages")]
     pages: Vec<PagePayload>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CategoryMembersQuery {
-    #[serde(rename = "categorymembers")]
+    #[serde(
+        rename = "categorymembers",
+        deserialize_with = "deserialize_category_members"
+    )]
     category_members: Vec<CategoryMemberPayload>,
 }
 
@@ -1817,7 +1961,116 @@ struct PagePayload {
     title: String,
     #[serde(default)]
     missing: bool,
+    #[serde(default, deserialize_with = "deserialize_optional_revisions")]
     revisions: Option<Vec<RevisionPayload>>,
+}
+
+fn deserialize_pages<'de, D>(deserializer: D) -> Result<Vec<PagePayload>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec::<_, _, MAX_PAGES_PER_RESPONSE>(deserializer, "pages")
+}
+
+fn deserialize_category_members<'de, D>(
+    deserializer: D,
+) -> Result<Vec<CategoryMemberPayload>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec::<_, _, MAX_CATEGORY_MEMBERS_PER_RESPONSE>(
+        deserializer,
+        "category members",
+    )
+}
+
+fn deserialize_optional_revisions<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<RevisionPayload>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptionalRevisions;
+
+    impl<'de> Visitor<'de> for OptionalRevisions {
+        type Value = Option<Vec<RevisionPayload>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a null value or a bounded revision array")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserialize_bounded_vec::<_, _, MAX_REVISIONS_PER_RESPONSE>(deserializer, "revisions")
+                .map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(OptionalRevisions)
+}
+
+pub(crate) fn deserialize_bounded_vec<'de, D, T, const MAXIMUM: usize>(
+    deserializer: D,
+    label: &'static str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedVec<T, const MAXIMUM: usize> {
+        label: &'static str,
+        marker: PhantomData<T>,
+    }
+
+    impl<'de, T, const MAXIMUM: usize> Visitor<'de> for BoundedVec<T, MAXIMUM>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "at most {MAXIMUM} {}", self.label)
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let capacity = sequence.size_hint().unwrap_or_default().min(MAXIMUM);
+            let mut values = Vec::with_capacity(capacity);
+            while let Some(value) = sequence.next_element::<T>()? {
+                if values.len() == MAXIMUM {
+                    return Err(serde::de::Error::invalid_length(
+                        values.len().saturating_add(1),
+                        &self,
+                    ));
+                }
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVec::<T, MAXIMUM> {
+        label,
+        marker: PhantomData,
+    })
 }
 
 impl TryFrom<PagePayload> for TitleResolution {
@@ -2333,5 +2586,116 @@ mod tests {
             configured.max_downloaded_response_bytes_per_second(),
             Some(1_024)
         );
+    }
+
+    #[test]
+    fn action_api_collections_reject_cardinality_amplification() {
+        let pages = std::iter::repeat_n(
+            serde_json::json!({"pageid": 1, "ns": 0, "title": "Bounded"}),
+            MAX_PAGES_PER_RESPONSE + 1,
+        )
+        .collect::<Vec<_>>();
+        assert!(
+            serde_json::from_value::<QueryResponse<PagesQuery>>(
+                serde_json::json!({"query": {"pages": pages}})
+            )
+            .is_err()
+        );
+
+        let revisions = std::iter::repeat_n(
+            serde_json::json!({"revid": 1, "timestamp": "2026-08-29T00:00:00Z"}),
+            MAX_REVISIONS_PER_RESPONSE + 1,
+        )
+        .collect::<Vec<_>>();
+        assert!(
+            serde_json::from_value::<QueryResponse<PagesQuery>>(serde_json::json!({
+                "query": {"pages": [{
+                    "pageid": 1,
+                    "ns": 0,
+                    "title": "Bounded",
+                    "revisions": revisions
+                }]}
+            }))
+            .is_err()
+        );
+
+        let members = std::iter::repeat_n(
+            serde_json::json!({"pageid": 1, "ns": 0, "title": "Bounded"}),
+            MAX_CATEGORY_MEMBERS_PER_RESPONSE + 1,
+        )
+        .collect::<Vec<_>>();
+        assert!(
+            serde_json::from_value::<QueryResponse<CategoryMembersQuery>>(serde_json::json!({
+                "query": {"categorymembers": members}
+            }))
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "fuzzing")]
+    #[test]
+    fn offline_action_api_harness_covers_every_production_shape_and_api_errors() {
+        let fixtures = [
+            (
+                ActionApiResponseKind::TitleResolution,
+                r#"{"query":{"pages":[]}}"#,
+            ),
+            (
+                ActionApiResponseKind::PageHead,
+                r#"{"query":{"pages":[{"pageid":42,"ns":0,"title":"Bounded"}]}}"#,
+            ),
+            (
+                ActionApiResponseKind::RevisionBatch,
+                r#"{"query":{"pages":[{"pageid":42,"ns":0,"title":"Bounded","revisions":[]}]}}"#,
+            ),
+            (
+                ActionApiResponseKind::RevisionContent,
+                r#"{"query":{"pages":[{"pageid":42,"ns":0,"title":"Bounded","revisions":[{"revid":100,"timestamp":"2026-08-29T00:00:00Z","slots":{"main":{"content":"source"}}}]}]}}"#,
+            ),
+            (
+                ActionApiResponseKind::CategoryMembers,
+                r#"{"query":{"categorymembers":[]}}"#,
+            ),
+            (
+                ActionApiResponseKind::RevisionImages,
+                r#"{"parse":{"pageid":42,"revid":100,"images":["Ferris.png"]}}"#,
+            ),
+            (
+                ActionApiResponseKind::ThumbnailMetadata,
+                r#"{"query":{"pages":[{"ns":6,"title":"File:Ferris.png","missing":true}]}}"#,
+            ),
+        ];
+        for (kind, fixture) in fixtures {
+            validate_action_api_response(fixture.as_bytes(), kind)
+                .expect("matching bounded response shape");
+            assert!(matches!(
+                validate_action_api_response(
+                    br#"{"error":{"code":"maxlag","info":"retry later"}}"#,
+                    kind
+                ),
+                Err(ClientError::Api(_))
+            ));
+        }
+    }
+
+    #[cfg(feature = "fuzzing")]
+    #[test]
+    fn offline_action_api_harness_enforces_identity_and_body_bounds() {
+        assert!(matches!(
+            validate_action_api_response(
+                br#"{"query":{"pages":[{"pageid":7,"ns":0,"title":"Wrong"}]}}"#,
+                ActionApiResponseKind::PageHead
+            ),
+            Err(ClientError::InvalidResponse(
+                "page-head response returned a different page ID"
+            ))
+        ));
+        let oversized = vec![b' '; MAX_ACTION_API_RESPONSE_BYTES + 1];
+        assert!(matches!(
+            validate_action_api_response(&oversized, ActionApiResponseKind::TitleResolution),
+            Err(ClientError::ResponseTooLarge {
+                limit: MAX_ACTION_API_RESPONSE_BYTES
+            })
+        ));
     }
 }

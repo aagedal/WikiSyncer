@@ -294,7 +294,10 @@ responses, decompression bombs, or pathological continuation tokens.
 **Present resistance.** Transport timeouts, response/batch/operation limits, limited
 redirects, explicit continuations, schema decoding, identity checks, UTF-8/content
 model/size/SHA-1 validation, durable job state, history budgets, and long-gap limits
-fail closed for the implemented paths.
+fail closed for the implemented paths. The Action API success and structured-error
+schemas now share a feature-gated offline fuzz boundary with the production semantic
+validators. Pages, revisions, category members, image references, and image-info
+collections have explicit deserialization cardinality ceilings.
 
 **Residual risk and action.** The configured origin, direct-IP validation, bounded DNS
 answer, new-connection DNS revalidation, proxy exclusion, and every redirect now fail
@@ -305,9 +308,9 @@ without asking DNS again, which cannot retarget that established socket but shou
 re-reviewed if connector or proxy behavior changes. Add explicit compressed-byte and
 decompression-ratio tests if content encoding is enabled. Add total operation,
 parser-output, allocation, and disk-growth budgets independent of server metadata.
-Fuzz JSON/schema adapters, continuation handling, the wikitext transformer, pack
-decoding, and delta reconstruction. Exercise slow-loris, truncation, redirect, and
-retry storms in offline fixtures.
+Continue longer native fuzz campaigns across JSON/schema adapters, continuation
+handling, the wikitext transformer, pack decoding, and delta reconstruction. Exercise
+slow-loris, truncation, redirect, and retry storms in offline fixtures.
 
 ### Hostile HTML, links, and media
 
@@ -496,7 +499,7 @@ separate retention/media-destruction controls remain external responsibilities.
 | Explicit source allowlist | **Present for configured source and bounded Wikimedia CDN origins** | Each client derives exact normalized origins from its selected endpoint, plus only `https://upload.wikimedia.org:443` for recognized standard-port Wikimedia project sources; third-party/nonstandard/loopback sources remain exact-origin. Ambient proxies are disabled, unsafe literal and whole DNS answers are rejected, new connections revalidate DNS, and redirects must remain on an approved exact origin. Loopback HTTP enables a loopback-only fixture exception |
 | HTTPS through Rustls | **Present** | `wikisync-mediawiki` disables reqwest defaults and enables `rustls-tls`; loopback HTTP is fixture-only by validation |
 | Application User-Agent and operator contact | **Present with a bounded environment contract** | All production MediaWiki and dump clients use one `WikiSyncer/<version> (<contact>)` policy. `WIKISYNC_OPERATOR_CONTACT` accepts a bounded visible-ASCII public contact, rejects malformed values before contact without echoing them, and defaults to the public repository URL. Service-manager configuration is documented; there is no separate GUI settings control |
-| Response, timeout, parser, redirect, and decompression bounds | **Partial** | Request/connect timeout, per-response and aggregate run-byte limits, clone-shared concurrency and byte-rate shaping, redirect count/origin policy, object/pack and inline-depth limits exist. Maintained bounded fuzz targets now cover content rewriting, trusted-head JSON, dump parsing, loose decompression, pack/index reads, repacking, and delta reconstruction; broader adversarial corpora, sustained runs, decompression-ratio coverage, and parser/allocation budgets remain |
+| Response, timeout, parser, redirect, and decompression bounds | **Partial** | Request/connect timeout, per-response and aggregate run-byte limits, clone-shared concurrency and byte-rate shaping, redirect count/origin policy, object/pack and inline-depth limits exist. Maintained bounded fuzz targets now cover Action API success/error schemas and continuations, content rewriting, trusted-head JSON, dump parsing, loose decompression, pack/index reads, repacking, and delta reconstruction. Action API collection cardinalities fail during typed deserialization; broader adversarial corpora, sustained native runs, decompression-ratio coverage, and non-JSON parser/allocation budgets remain |
 | Sanitized HTML and restrictive CSP | **Present for the tested reader path** | Raw HTML events become text, links are rewritten, passive local media is revalidated before serving, and headers are tested; continue adversarial corpus testing |
 | User-restricted data-directory permissions | **Present on Unix core paths** | Directories including manifests/exports are `0700`; SQLite/WAL/SHM and created manifest/export files are `0600`; extend release auditing to logs, IPC, and backups |
 | BLAKE3 identities for canonical text/media | **Present** | Domain-separated text/media object kinds, bounded validated ingestion, and verified reader/export reads are implemented |
@@ -532,8 +535,9 @@ result on macOS and Ubuntu. Deferred items must be disabled and accurately docum
    compressed-body limits where applicable, and cancellation. Failures do not advance
    checkpoints beyond durable canonical content.
 5. **Parser and storage robustness:** fuzz/property suites exercise wikitext, Markdown
-   event rewriting, JSON adapters, loose decompression, pack/index decoding, and delta
-   reconstruction under explicit CPU/memory/output/depth/ratio limits.
+   event rewriting, Action API success/error schemas and continuations, trusted-head
+   JSON, loose decompression, pack/index decoding, and delta reconstruction under
+   explicit CPU/memory/output/depth/ratio limits.
 6. **Hostile presentation:** a security corpus proves scripts, raw HTML, unsafe URL
    schemes, attributes, images, SVG, CSS tricks, and remote loads cannot execute or
    load automatically. CSP and response headers are asserted for success and error

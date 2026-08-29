@@ -1,0 +1,1 @@
+B{"query":{"pages":[{"pageid":42,"ns":0,"title":"Nested","revisions":[{"revid":100,"parentid":99,"timestamp":"2026-08-29T12:00:00Z","slots":{"main":{"contentmodel":"wikitext","unexpected":{"arrays":[[[{"leaf":true}]]]}}}}],"unexpected":{"object":{"inside":{"another":[1,2,3]}}}}]}}

@@ -8,7 +8,9 @@ use serde::Deserialize;
 use serde::de::{SeqAccess, Visitor};
 use wikisync_core::{MediaId, PageId, PageTitle, RevisionId, ThumbnailPolicy};
 
-use super::{ClientError, MediaWikiClient, redirect_destination_allowed};
+#[cfg(feature = "fuzzing")]
+use super::decode_action_api_json;
+use super::{ClientError, MediaWikiClient, deserialize_bounded_vec, redirect_destination_allowed};
 
 const FILE_NAMESPACE: i32 = 6;
 const MAX_METADATA_TEXT_BYTES: usize = 16 * 1024;
@@ -234,33 +236,7 @@ impl MediaWikiClient {
                 ("disablelimitreport", "1"),
             ])
             .await?;
-        if response.parse.page_id != page_id.get()
-            || response.parse.revision_id != requested_revision_id.get()
-        {
-            return Err(ClientError::InvalidResponse(
-                "revision-image response returned a different page or revision",
-            ));
-        }
-
-        let maximum = usize::try_from(policy.maximum_images_per_revision().get())
-            .expect("u32 always fits usize on supported targets");
-        let mut placements = Vec::with_capacity(maximum.min(response.parse.images.len()));
-        for image in response.parse.images {
-            if placements.len() == maximum {
-                break;
-            }
-            let Some(file_title) = passive_file_title(&image)? else {
-                continue;
-            };
-            placements.push(RevisionImagePlacement {
-                index: u32::try_from(placements.len())
-                    .expect("thumbnail policy count is bounded to u32"),
-                file_title,
-                caption: None,
-                alt_text: None,
-            });
-        }
-        Ok(placements)
+        revision_image_placements_from_response(response, page_id, requested_revision_id, policy)
     }
 
     /// Resolves one passive file reference to current thumbnail and attribution metadata.
@@ -443,6 +419,39 @@ fn passive_file_title(image: &str) -> Result<Option<PageTitle>, ClientError> {
         .map_err(|_| ClientError::InvalidResponse("MediaWiki returned an invalid image title"))
 }
 
+fn revision_image_placements_from_response(
+    response: ParseResponse,
+    page_id: PageId,
+    revision_id: RevisionId,
+    policy: ThumbnailPolicy,
+) -> Result<Vec<RevisionImagePlacement>, ClientError> {
+    if response.parse.page_id != page_id.get() || response.parse.revision_id != revision_id.get() {
+        return Err(ClientError::InvalidResponse(
+            "revision-image response returned a different page or revision",
+        ));
+    }
+
+    let maximum = usize::try_from(policy.maximum_images_per_revision().get())
+        .expect("u32 always fits usize on supported targets");
+    let mut placements = Vec::with_capacity(maximum.min(response.parse.images.len()));
+    for image in response.parse.images {
+        if placements.len() == maximum {
+            break;
+        }
+        let Some(file_title) = passive_file_title(&image)? else {
+            continue;
+        };
+        placements.push(RevisionImagePlacement {
+            index: u32::try_from(placements.len())
+                .expect("thumbnail policy count is bounded to u32"),
+            file_title,
+            caption: None,
+            alt_text: None,
+        });
+    }
+    Ok(placements)
+}
+
 fn resolve_imageinfo(
     response: ImageInfoResponse,
     requested_title: &PageTitle,
@@ -605,6 +614,28 @@ fn safe_absolute_url(value: &str) -> bool {
     })
 }
 
+#[cfg(feature = "fuzzing")]
+pub(super) fn validate_revision_images_response(data: &[u8]) -> Result<(), ClientError> {
+    let response: ParseResponse = decode_action_api_json(data, None)?;
+    let page_id = PageId::new(42).expect("the fixed Action API fuzz page ID is valid");
+    let revision_id = RevisionId::new(100).expect("the fixed Action API fuzz revision ID is valid");
+    let policy = ThumbnailPolicy::new(640, 32, 1024 * 1024)
+        .expect("the fixed Action API fuzz thumbnail policy is valid");
+    let _ = revision_image_placements_from_response(response, page_id, revision_id, policy)?;
+    Ok(())
+}
+
+#[cfg(feature = "fuzzing")]
+pub(super) fn validate_thumbnail_metadata_response(data: &[u8]) -> Result<(), ClientError> {
+    let response: ImageInfoResponse = decode_action_api_json(data, None)?;
+    let requested_title =
+        PageTitle::new("File:Ferris.png").expect("the fixed Action API fuzz title is valid");
+    let policy = ThumbnailPolicy::new(640, 32, 1024 * 1024)
+        .expect("the fixed Action API fuzz thumbnail policy is valid");
+    let _ = resolve_imageinfo(response, &requested_title, policy)?;
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct ParseResponse {
     parse: ParsePayload,
@@ -668,10 +699,11 @@ struct ImageInfoResponse {
 
 #[derive(Debug, Deserialize)]
 struct ImageInfoQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_title_mappings")]
     normalized: Vec<TitleMapping>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_title_mappings")]
     redirects: Vec<TitleMapping>,
+    #[serde(deserialize_with = "deserialize_imageinfo_pages")]
     pages: Vec<ImageInfoPage>,
 }
 
@@ -690,8 +722,66 @@ struct ImageInfoPage {
     title: String,
     #[serde(default)]
     missing: bool,
-    #[serde(rename = "imageinfo")]
+    #[serde(
+        rename = "imageinfo",
+        default,
+        deserialize_with = "deserialize_optional_imageinfo"
+    )]
     image_info: Option<Vec<ImageInfoPayload>>,
+}
+
+fn deserialize_title_mappings<'de, D>(deserializer: D) -> Result<Vec<TitleMapping>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec::<_, _, 1>(deserializer, "title mappings")
+}
+
+fn deserialize_imageinfo_pages<'de, D>(deserializer: D) -> Result<Vec<ImageInfoPage>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec::<_, _, 1>(deserializer, "imageinfo pages")
+}
+
+fn deserialize_optional_imageinfo<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<ImageInfoPayload>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptionalImageInfo;
+
+    impl<'de> Visitor<'de> for OptionalImageInfo {
+        type Value = Option<Vec<ImageInfoPayload>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a null value or one imageinfo record")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserialize_bounded_vec::<_, _, 1>(deserializer, "imageinfo records").map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(OptionalImageInfo)
 }
 
 #[derive(Debug, Deserialize)]
@@ -758,5 +848,40 @@ mod tests {
         let error = ThumbnailDownloadError::UrlRejected;
         assert!(!error.to_string().contains("https://"));
         assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn imageinfo_collections_reject_cardinality_amplification() {
+        let mapping = serde_json::json!({"from": "File:Fuzz.jpg", "to": "File:Fuzz.jpg"});
+        assert!(
+            serde_json::from_value::<ImageInfoResponse>(serde_json::json!({
+                "query": {
+                    "normalized": [mapping.clone(), mapping],
+                    "pages": []
+                }
+            }))
+            .is_err()
+        );
+
+        let page = serde_json::json!({"pageid": 1, "ns": 6, "title": "File:Fuzz.jpg"});
+        assert!(
+            serde_json::from_value::<ImageInfoResponse>(serde_json::json!({
+                "query": {"pages": [page.clone(), page]}
+            }))
+            .is_err()
+        );
+
+        let info = serde_json::json!({"mime": "image/png"});
+        assert!(
+            serde_json::from_value::<ImageInfoResponse>(serde_json::json!({
+                "query": {"pages": [{
+                    "pageid": 1,
+                    "ns": 6,
+                    "title": "File:Fuzz.jpg",
+                    "imageinfo": [info.clone(), info]
+                }]}
+            }))
+            .is_err()
+        );
     }
 }

@@ -1,9 +1,10 @@
 # Instrumented fuzz campaign: 2026-08-25
 
 This is a bounded local sanitizer campaign, not the sustained multi-hour evidence
-required for a stable release. It proves that every maintained target builds and ran
-cleanly under libFuzzer/AddressSanitizer on the current macOS candidate, while recording
-enough resource data to size later native campaigns.
+required for a stable release. It proves that all five targets maintained on this
+candidate built and ran cleanly under libFuzzer/AddressSanitizer, while recording
+enough resource data to size later native campaigns. The subsequently added Action
+API JSON boundary has its own [2026-08-29 follow-up](fuzz-campaign-2026-08-29-action-api-json.md).
 
 ## Candidate and environment
 

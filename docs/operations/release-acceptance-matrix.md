@@ -6,18 +6,18 @@ native environment, command or CI run, and outcome. Credential-free checks canno
 used as evidence for Developer ID, notarization, repository signing, clean-system
 installation, or publication.
 
-Candidate under review: working tree based on `69389a1` (2026-08-25).
+Candidate under review: working tree based on `03e14aa` (2026-08-29).
 
 | Evidence | macOS arm64 | Ubuntu x86_64 | Stable-v1 requirement |
 | --- | --- | --- | --- |
-| Format, warning-denied Clippy, workspace tests | Pass: local macOS 27.0 arm64 integrated run, 2026-08-25 | Pending native CI result for this candidate | Required |
+| Format, warning-denied Clippy, workspace tests | Pass: local macOS 27.0 arm64 integrated run, 2026-08-29 | Pending native CI result for this candidate | Required |
 | Representative multi-language GUI/daemon lifecycle | Pass: `en` direct writer plus `nb` daemon writer in full workspace run | Pending native CI result | Required |
 | Older beta schema-11 whole-library migration fixture | Pass in full workspace run | Pending native CI result | Required |
 | Release-candidate archive and layout verification | Pass: 26 credential-free packaging/service-policy tests executed; native-Linux systemd test skipped as designed | Pending native CI result; the release job verifies ELF architecture, systemd units, checksum, and layout | Required |
 | Release-mode CLI, daemon, and reader outbound audit | Pass: CLI, idle daemon/IPC, and six reader routes; zero outbound attempts | Pending native CI result | Required |
 | Packaged GUI default-launch outbound audit | Pass: bounded no-action launch in an Aqua session; zero outbound attempts | Pending native graphical Ubuntu result; a headless pass must remain explicitly incomplete | Required |
-| Maintained fuzz targets build and bounded smoke corpus | Pass: five bins compile and each corpus completed a short direct smoke run | Pending native Ubuntu result | Required before release |
-| Sustained instrumented fuzz campaigns | Partial: five clean 60-second AddressSanitizer/libFuzzer runs with resource outcomes are [recorded](../benchmarks/fuzz-campaign-2026-08-25.md); longer campaigns remain | Not recorded | Required before release; bounded runs do not close this row |
+| Maintained fuzz targets build and bounded smoke corpus | Pass: six bins compile; all six maintained corpora completed bounded direct smoke runs, with the new Action API target rechecked after integration | Pending native Ubuntu result | Required before release |
+| Sustained instrumented fuzz campaigns | Partial: five clean 60-second target runs are [recorded](../benchmarks/fuzz-campaign-2026-08-25.md), and the sixth Action API target has a clean [61-second follow-up](../benchmarks/fuzz-campaign-2026-08-29-action-api-json.md); longer campaigns remain | Not recorded | Required before release; bounded runs do not close this row |
 | Signed artifact verification with production identity | Not authorized/provisioned | Not authorized/provisioned | Required for a signed beta |
 | Native install/service/upgrade on a clean supported host | Not recorded | Not recorded | Required |
 | Gatekeeper/notarization assessment | Not authorized/provisioned | Not applicable | Required on macOS |
