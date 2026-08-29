@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 iced = { version = "0.13", default-features = false, features = ["wgpu", "tokio"] }
+rfd = { version = "0.17.2", default-features = false, features = ["wayland", "xdg-portal"] }
 wikisync-core = { version = "=0.1.0", path = "../../crates/wikisync-core" }
 wikisync-integrity = { version = "=0.1.0", path = "../../crates/wikisync-integrity" }
 wikisync-mediawiki = { version = "=0.1.0", path = "../../crates/wikisync-mediawiki" }

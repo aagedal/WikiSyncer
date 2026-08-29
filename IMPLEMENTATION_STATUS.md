@@ -1,6 +1,6 @@
 # WikiSyncer implementation status
 
-Updated: 2026-08-29
+Updated: 2026-08-30
 
 ## Completed backlog items
 
@@ -584,9 +584,17 @@ complete yet:
   rejects non-main namespaces and tombstones, and checks page/canonical-byte budgets
   before persisting new object bytes; and
 - the Iced GUI now adapts its header, navigation, metrics, and source fields at compact
-  widths, provides a first-use offline-library action, collapses advanced collection
-  policy by default, and uses the hardware-accelerated `wgpu` renderer instead of the
-  `tiny-skia` software renderer. A release GUI binary builds successfully.
+  widths, collapses advanced collection policy by default, and uses the hardware-
+  accelerated `wgpu` renderer instead of the `tiny-skia` software renderer;
+- the actual first-launch view is now a centered, bounded-width onboarding form with
+  a Wikipedia-edition picker, an optional-images checkbox, a native storage-directory
+  chooser, and a clearly labeled `Start syncing` action. The existing selective-page
+  workflow is retained behind a collapsed advanced action, while an existing library
+  at the chosen location remains directly openable; and
+- the whole-edition start action is disabled and also fails closed if invoked
+  programmatically. It does not create a selective collection or imply that a complete
+  edition has been downloaded. The release GUI binary builds successfully and the
+  first-launch form was inspected in a real macOS window at release optimization.
 
 Whole-edition synchronization remains partial. The existing dump bootstrap still
 filters an already resolved selective collection, ordinary updates still poll known
@@ -597,6 +605,13 @@ dump race-window boundary and RecentChanges closure, long-gap fresh-dump recover
 bounded member access and progress reporting, and sharded integrity evidence beyond
 the current 100,000-entry manifest ceiling. The GUI currently fails visibly instead
 of routing this rule through the selective preview/draft path.
+
+The native folder chooser adds `rfd 0.17.2` with its Wayland/XDG portal backend and
+locked macOS support dependencies. Workspace formatting, warning-denied Clippy, and
+all workspace tests pass. A current `cargo deny check` rerun passes bans, licenses,
+and sources but reports the upstream unmaintained `paste 1.0.15` advisory through the
+pre-existing `metal`/`wgpu` renderer dependency; this is not introduced by the folder
+chooser and is not recorded as a clean advisory pass.
 
 ## Plan audit notes
 

@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::env;
+use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -11,8 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod dump;
 
 use iced::widget::{
-    Space, button, checkbox, column, container, horizontal_rule, progress_bar, row, scrollable,
-    text, text_input,
+    Space, button, checkbox, column, container, horizontal_rule, pick_list, progress_bar, row,
+    scrollable, text, text_input,
 };
 use iced::{Alignment, Element, Length, Size, Subscription, Task, Theme, window};
 use wikisync_core::{
@@ -50,6 +51,7 @@ use dump::{DumpBootstrapForm, DumpBootstrapPreview, INDEPENDENT_ANCHOR_NOTICE};
 const DATABASE_NAME: &str = "library.sqlite3";
 const RECENT_REVISION_LIMIT: u32 = 12;
 const MAX_SIGNING_KEY_BYTES: u64 = 16 * 1024;
+const WHOLE_EDITION_SYNC_AVAILABLE: bool = false;
 
 fn main() -> iced::Result {
     iced::application("WikiSyncer", App::update, App::view)
@@ -86,11 +88,14 @@ struct App {
     reader: Option<Arc<ReaderHandle>>,
     window_size: Size,
     collection_options_expanded: bool,
+    setup_advanced_expanded: bool,
+    onboarding: OnboardingForm,
 }
 
 impl App {
     fn new() -> (Self, Task<Message>) {
         let library_path = suggested_library_path();
+        let onboarding = OnboardingForm::new(library_path.clone());
         let probe_key = RequestKey {
             id: 1,
             path: PathBuf::from(&library_path),
@@ -121,22 +126,14 @@ impl App {
             reader: None,
             window_size: Size::new(1120.0, 760.0),
             collection_options_expanded: false,
+            setup_advanced_expanded: false,
+            onboarding,
         };
         (app, probe_task(probe_key))
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::LibraryPathChanged(value) => {
-                if self.is_busy() {
-                    return Task::none();
-                }
-                self.library_path = value;
-                self.path_status = PathStatus::Checking;
-                let key = self.next_key(PathBuf::from(self.library_path.trim()));
-                self.latest_probe_id = key.id;
-                return probe_task(key);
-            }
             Message::PathProbed(completion) => {
                 if completion.key.id != self.latest_probe_id
                     || completion.key.path.as_path() != Path::new(self.library_path.trim())
@@ -180,6 +177,7 @@ impl App {
                         self.network_policy_editor =
                             NetworkPolicyEditor::from_policy(snapshot.network_policy);
                         self.library_path = snapshot.path.display().to_string();
+                        self.onboarding.storage_path = self.library_path.clone();
                         self.snapshot = Some(snapshot);
                         self.screen = Screen::Dashboard;
                         self.path_status = PathStatus::ExistingLibrary;
@@ -192,6 +190,44 @@ impl App {
             Message::WindowResized(size) => self.window_size = size,
             Message::ToggleCollectionOptions => {
                 self.collection_options_expanded = !self.collection_options_expanded;
+            }
+            Message::ToggleSetupAdvanced => {
+                self.setup_advanced_expanded = !self.setup_advanced_expanded;
+            }
+            Message::OnboardingEditionChanged(edition) => {
+                self.onboarding.edition = edition;
+            }
+            Message::OnboardingImagesChanged(download_images) => {
+                self.onboarding.download_images = download_images;
+            }
+            Message::ChooseOnboardingStorage => {
+                if self.is_busy() || self.onboarding.storage_dialog_open {
+                    return Task::none();
+                }
+                self.onboarding.storage_dialog_open = true;
+                return Task::perform(
+                    choose_storage_location(PathBuf::from(&self.onboarding.storage_path)),
+                    Message::OnboardingStorageChosen,
+                );
+            }
+            Message::OnboardingStorageChosen(path) => {
+                self.onboarding.storage_dialog_open = false;
+                if let Some(path) = path {
+                    let selected = path.display().to_string();
+                    self.onboarding.storage_path = selected.clone();
+                    if self.screen == Screen::Setup {
+                        self.library_path = selected;
+                        self.path_status = PathStatus::Checking;
+                        let key = self.next_key(path);
+                        self.latest_probe_id = key.id;
+                        return probe_task(key);
+                    }
+                }
+            }
+            Message::StartEditionSync => {
+                self.notice = Some(Notice::error(
+                    "Whole-edition synchronization is not enabled yet. WikiSyncer will not claim a complete offline edition until dump import and change-window closure are both durable.",
+                ));
             }
             Message::Refresh => {
                 if self.is_busy() {
@@ -1415,66 +1451,140 @@ impl App {
     }
 
     fn setup_view(&self) -> Element<'_, Message> {
-        let primary = if self.path_status == PathStatus::ExistingLibrary {
-            button("Open library").on_press_maybe((!self.is_busy()).then_some(Message::OpenLibrary))
-        } else if self.path_status == PathStatus::NewLibrary {
-            button("Create local library").on_press_maybe(
-                (!self.is_busy() && self.privacy_acknowledged).then_some(Message::CreateLibrary),
-            )
-        } else {
-            button("Checking location…")
-        };
-
         let path_message = match &self.path_status {
             PathStatus::Checking => "Checking this location…".to_owned(),
             PathStatus::ExistingLibrary => {
-                "An existing WikiSyncer library was found at this location.".to_owned()
+                "An existing WikiSyncer library was found here.".to_owned()
             }
-            PathStatus::NewLibrary => {
-                "A new library will be initialized at this location.".to_owned()
-            }
+            PathStatus::NewLibrary => "Your offline files will be stored here.".to_owned(),
             PathStatus::Unavailable(error) => format!("This location is unavailable: {error}"),
         };
-
-        let content = column![
-            text("WikiSyncer").size(38),
-            text("Your selective, offline Wikipedia library").size(20),
-            Space::new(Length::Shrink, 18),
-            text("Choose where WikiSyncer should keep its database and content objects."),
-            text_input("/path/to/library", &self.library_path)
-                .on_input(Message::LibraryPathChanged)
-                .padding(12),
-            text(path_message),
-            Space::new(Length::Shrink, 12),
-            container(
+        let choose_storage = button(if self.onboarding.storage_dialog_open {
+            "Choosing…"
+        } else {
+            "Choose storage location"
+        })
+        .on_press_maybe(
+            (!self.is_busy() && !self.onboarding.storage_dialog_open)
+                .then_some(Message::ChooseOnboardingStorage),
+        );
+        let storage_path = container(
+            text(&self.onboarding.storage_path)
+                .size(13)
+                .width(Length::Fill),
+        )
+        .padding(11)
+        .width(Length::Fill);
+        let storage_control: Element<'_, Message> = if self.is_compact() {
+            column![storage_path, choose_storage].spacing(8).into()
+        } else {
+            row![storage_path, choose_storage]
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .into()
+        };
+        let can_start = WHOLE_EDITION_SYNC_AVAILABLE
+            && !self.is_busy()
+            && self.path_status == PathStatus::NewLibrary
+            && !self.onboarding.storage_path.trim().is_empty();
+        let start = button("Start syncing")
+            .padding([12, 18])
+            .on_press_maybe(can_start.then_some(Message::StartEditionSync));
+        let existing_library: Element<'_, Message> =
+            if self.path_status == PathStatus::ExistingLibrary {
+                row![
+                    button("Open existing library")
+                        .on_press_maybe((!self.is_busy()).then_some(Message::OpenLibrary)),
+                    text(if self.is_busy() { "Opening…" } else { "" }),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .into()
+            } else {
+                Space::new(Length::Shrink, 0).into()
+            };
+        let advanced_create: Element<'_, Message> = if self.path_status == PathStatus::NewLibrary {
+            let details: Element<'_, Message> = if self.setup_advanced_expanded {
                 column![
-                    text("Privacy and storage").size(20),
-                    text("Articles, revision history, edit comments, and public editor names or IP addresses can be stored locally. Content that is later deleted or suppressed upstream may remain in a local library; retaining or sharing it can carry privacy or legal responsibilities. WikiSyncer does not hide or encrypt the chosen directory. Synchronization may use significant disk space and network bandwidth."),
+                    text("Create a smaller library using the currently available selective sync."),
                     checkbox(
-                        "I understand this library may contain public editor metadata and is readable by local users with access to the directory.",
+                        "I understand that saved articles may include public editor metadata and that the folder is not encrypted.",
                         self.privacy_acknowledged,
                     )
                     .on_toggle(Message::PrivacyAcknowledged),
+                    button("Create selected-page library").on_press_maybe(
+                        (!self.is_busy() && self.privacy_acknowledged)
+                            .then_some(Message::CreateLibrary),
+                    ),
                 ]
-                .spacing(10),
+                .spacing(9)
+                .into()
+            } else {
+                Space::new(Length::Shrink, 0).into()
+            };
+            column![
+                button(if self.setup_advanced_expanded {
+                    "Hide selected-page setup"
+                } else {
+                    "Advanced: selected pages and categories"
+                })
+                .on_press(Message::ToggleSetupAdvanced),
+                details,
+            ]
+            .spacing(9)
+            .into()
+        } else {
+            Space::new(Length::Shrink, 0).into()
+        };
+
+        let content = column![
+            text("Set up offline Wikipedia").size(36),
+            text("Choose a Wikipedia edition, then keep it available without an internet connection."),
+            Space::new(Length::Shrink, 8),
+            text("Wikipedia edition").size(17),
+            pick_list(
+                WIKIPEDIA_EDITIONS,
+                Some(self.onboarding.edition),
+                Message::OnboardingEditionChanged,
             )
-            .padding(16),
-            row![primary, text(if self.is_busy() { "Opening…" } else { "" })]
-                .spacing(12)
-                .align_y(Alignment::Center),
+            .padding(11)
+            .width(Length::Fill),
+            checkbox(
+                "Download article images (uses considerably more storage)",
+                self.onboarding.download_images,
+            )
+            .on_toggle(Message::OnboardingImagesChanged),
+            text("Storage location").size(17),
+            storage_control,
+            text(path_message).size(13),
+            Space::new(Length::Shrink, 6),
+            start,
+            text("Whole-edition download is not enabled in this test build yet. The button will become available when durable dump import and change discovery are complete.").size(13),
+            horizontal_rule(1),
+            existing_library,
+            advanced_create,
             notice_view(self.notice.as_ref()),
         ]
-        .spacing(14)
-        .max_width(720);
+        .spacing(12)
+        .max_width(680);
 
         container(content)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
-            .padding(if self.is_compact() { 14 } else { 28 })
+            .padding(if self.is_compact() { 18 } else { 32 })
             .into()
     }
 
     fn dashboard_view(&self) -> Element<'_, Message> {
+        if self.tab == Tab::Overview
+            && self
+                .snapshot
+                .as_ref()
+                .is_some_and(DashboardSnapshot::needs_onboarding)
+        {
+            return self.onboarding_view();
+        }
+
         let tabs = row![
             nav_button("Overview", Tab::Overview, self.tab),
             nav_button("Collections", Tab::Collections, self.tab),
@@ -1564,6 +1674,82 @@ impl App {
             .into()
     }
 
+    fn onboarding_view(&self) -> Element<'_, Message> {
+        let choose_storage = button(if self.onboarding.storage_dialog_open {
+            "Choosing…"
+        } else {
+            "Choose storage location"
+        })
+        .on_press_maybe(
+            (!self.is_busy() && !self.onboarding.storage_dialog_open)
+                .then_some(Message::ChooseOnboardingStorage),
+        );
+        let storage_path = container(
+            text(&self.onboarding.storage_path)
+                .size(13)
+                .width(Length::Fill),
+        )
+        .padding(11)
+        .width(Length::Fill);
+        let storage_control: Element<'_, Message> = if self.is_compact() {
+            column![storage_path, choose_storage].spacing(8).into()
+        } else {
+            row![storage_path, choose_storage]
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .into()
+        };
+        let can_start = WHOLE_EDITION_SYNC_AVAILABLE
+            && !self.is_busy()
+            && !self.onboarding.storage_path.trim().is_empty();
+        let start = button("Start syncing")
+            .padding([12, 18])
+            .on_press_maybe(can_start.then_some(Message::StartEditionSync));
+        let sync_status = if WHOLE_EDITION_SYNC_AVAILABLE {
+            "WikiSyncer will download the selected current language edition and keep it updated."
+        } else {
+            "Whole-edition download is not enabled in this test build yet. The storage layer is ready; durable dump import and change discovery are the remaining backend work."
+        };
+
+        let content = column![
+            text("Set up offline Wikipedia").size(36),
+            text("Choose what to keep available when you have no internet connection."),
+            Space::new(Length::Shrink, 8),
+            text("Wikipedia edition").size(17),
+            pick_list(
+                WIKIPEDIA_EDITIONS,
+                Some(self.onboarding.edition),
+                Message::OnboardingEditionChanged,
+            )
+            .padding(11)
+            .width(Length::Fill),
+            checkbox(
+                "Download article images (uses considerably more storage)",
+                self.onboarding.download_images,
+            )
+            .on_toggle(Message::OnboardingImagesChanged),
+            text("Storage location").size(17),
+            storage_control,
+            Space::new(Length::Shrink, 6),
+            start,
+            text(sync_status).size(13),
+            horizontal_rule(1),
+            button("Advanced: selected pages and categories")
+                .on_press(Message::SelectTab(Tab::Collections)),
+            notice_view(self.notice.as_ref()),
+        ]
+        .spacing(12)
+        .max_width(680);
+
+        container(content)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .padding(if self.is_compact() { 18 } else { 32 })
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
     fn overview_view<'a>(&self, snapshot: &'a DashboardSnapshot) -> Element<'a, Message> {
         let metrics: Element<'_, Message> = if self.is_compact() {
             column![
@@ -1601,23 +1787,23 @@ impl App {
         };
 
         let first_use: Element<'_, Message> = if snapshot.collections.is_empty() {
-            let action = button("Create your first offline collection")
-                .on_press(Message::SelectTab(Tab::Collections));
+            let action =
+                button("Create offline collection").on_press(Message::SelectTab(Tab::Collections));
             let guidance = text(
-                "Nothing has been downloaded yet. Choose a language and either a focused set of pages or, once whole-edition import is configured, an entire current language edition.",
-            );
-            let content: Element<'_, Message> = if self.is_compact() {
-                column![guidance, action].spacing(10).into()
-            } else {
-                row![guidance, Space::new(Length::Fill, Length::Shrink), action]
-                    .spacing(14)
-                    .align_y(Alignment::Center)
-                    .into()
-            };
-            container(column![text("Build your offline library").size(23), content].spacing(8))
-                .padding(16)
-                .width(Length::Fill)
-                .into()
+                "Nothing has been downloaded yet. Create a collection to save selected pages or categories for offline reading.",
+            )
+            .width(Length::Fill);
+            container(
+                column![
+                    text("Build your offline library").size(23),
+                    guidance,
+                    action,
+                ]
+                .spacing(10),
+            )
+            .padding(16)
+            .width(Length::Fill)
+            .into()
         } else {
             Space::new(Length::Shrink, 0).into()
         };
@@ -2422,6 +2608,64 @@ impl App {
     }
 }
 
+const WIKIPEDIA_EDITIONS: &[WikipediaEdition] = &[
+    WikipediaEdition::English,
+    WikipediaEdition::NorwegianBokmal,
+    WikipediaEdition::NorwegianNynorsk,
+    WikipediaEdition::Swedish,
+    WikipediaEdition::Danish,
+    WikipediaEdition::German,
+    WikipediaEdition::French,
+    WikipediaEdition::Spanish,
+];
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum WikipediaEdition {
+    #[default]
+    English,
+    NorwegianBokmal,
+    NorwegianNynorsk,
+    Swedish,
+    Danish,
+    German,
+    French,
+    Spanish,
+}
+
+impl fmt::Display for WikipediaEdition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::English => "English Wikipedia",
+            Self::NorwegianBokmal => "Norwegian Wikipedia (Bokmål)",
+            Self::NorwegianNynorsk => "Norwegian Wikipedia (Nynorsk)",
+            Self::Swedish => "Swedish Wikipedia",
+            Self::Danish => "Danish Wikipedia",
+            Self::German => "German Wikipedia",
+            Self::French => "French Wikipedia",
+            Self::Spanish => "Spanish Wikipedia",
+        })
+    }
+}
+
+#[derive(Debug)]
+struct OnboardingForm {
+    edition: WikipediaEdition,
+    download_images: bool,
+    storage_path: String,
+    storage_dialog_open: bool,
+}
+
+impl OnboardingForm {
+    fn new(storage_path: String) -> Self {
+        Self {
+            edition: WikipediaEdition::default(),
+            download_images: false,
+            storage_path,
+            storage_dialog_open: false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Screen {
     Setup,
@@ -2438,7 +2682,6 @@ enum Tab {
 
 #[derive(Clone, Debug)]
 enum Message {
-    LibraryPathChanged(String),
     PathProbed(ScopedResult<bool>),
     PrivacyAcknowledged(bool),
     OpenLibrary,
@@ -2447,6 +2690,12 @@ enum Message {
     SelectTab(Tab),
     WindowResized(Size),
     ToggleCollectionOptions,
+    ToggleSetupAdvanced,
+    OnboardingEditionChanged(WikipediaEdition),
+    OnboardingImagesChanged(bool),
+    ChooseOnboardingStorage,
+    OnboardingStorageChosen(Option<PathBuf>),
+    StartEditionSync,
     Refresh,
     ChooseAnotherLibrary,
     CollectionNameChanged(String),
@@ -2593,6 +2842,16 @@ struct DashboardSnapshot {
     recent_unique_object_count: usize,
     storage_usage: Result<StorageUsage, String>,
     schema_version: u32,
+}
+
+impl DashboardSnapshot {
+    fn needs_onboarding(&self) -> bool {
+        needs_initial_onboarding(
+            self.collections.len(),
+            self.unique_page_count,
+            self.dump_imports.len(),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4435,9 +4694,44 @@ fn directory_usage(root: &Path) -> std::io::Result<(u64, u64)> {
     Ok((bytes, files))
 }
 
+async fn choose_storage_location(current: PathBuf) -> Option<PathBuf> {
+    let initial_directory = if current.is_dir() {
+        Some(current)
+    } else {
+        current
+            .parent()
+            .filter(|parent| parent.is_dir())
+            .map(Path::to_path_buf)
+    };
+    let mut dialog = rfd::AsyncFileDialog::new()
+        .set_title("Choose WikiSyncer storage location")
+        .set_can_create_directories(true);
+    if let Some(initial_directory) = initial_directory {
+        dialog = dialog.set_directory(initial_directory);
+    }
+    dialog
+        .pick_folder()
+        .await
+        .map(|folder| folder.path().to_path_buf())
+}
+
+fn needs_initial_onboarding(
+    active_collection_count: usize,
+    captured_page_count: usize,
+    dump_import_count: usize,
+) -> bool {
+    active_collection_count == 0 && captured_page_count == 0 && dump_import_count == 0
+}
+
 fn suggested_library_path() -> String {
     if let Some(path) = env::var_os("WIKISYNC_LIBRARY") {
         return PathBuf::from(path).display().to_string();
+    }
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join("WikiSyncer Library")
+            .display()
+            .to_string();
     }
     env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
@@ -5203,6 +5497,87 @@ mod tests {
         ]
       }
     }"#;
+
+    #[test]
+    fn onboarding_defaults_to_english_without_images() {
+        let (app, initial_task) = App::new();
+        drop(initial_task);
+
+        assert_eq!(app.onboarding.edition, WikipediaEdition::English);
+        assert!(!app.onboarding.download_images);
+        assert!(!app.onboarding.storage_path.is_empty());
+    }
+
+    #[test]
+    fn onboarding_edition_and_images_are_isolated_from_advanced_collection_state() {
+        let (mut app, initial_task) = App::new();
+        drop(initial_task);
+        let advanced_language = app.collection_form.language_code.clone();
+        let advanced_endpoint = app.collection_form.api_endpoint.clone();
+
+        drop(app.update(Message::OnboardingEditionChanged(
+            WikipediaEdition::NorwegianBokmal,
+        )));
+        drop(app.update(Message::OnboardingImagesChanged(true)));
+
+        assert_eq!(
+            app.onboarding.edition.to_string(),
+            "Norwegian Wikipedia (Bokmål)"
+        );
+        assert!(app.onboarding.download_images);
+        assert_eq!(app.collection_form.language_code, advanced_language);
+        assert_eq!(app.collection_form.api_endpoint, advanced_endpoint);
+        assert_eq!(WIKIPEDIA_EDITIONS.len(), 8);
+        assert_eq!(
+            WIKIPEDIA_EDITIONS
+                .iter()
+                .map(ToString::to_string)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            WIKIPEDIA_EDITIONS.len()
+        );
+    }
+
+    #[test]
+    fn onboarding_storage_cancel_preserves_the_path_and_selection_replaces_it() {
+        let (mut app, initial_task) = App::new();
+        drop(initial_task);
+        let original = app.onboarding.storage_path.clone();
+        app.onboarding.storage_dialog_open = true;
+
+        drop(app.update(Message::OnboardingStorageChosen(None)));
+        assert_eq!(app.onboarding.storage_path, original);
+        assert!(!app.onboarding.storage_dialog_open);
+
+        let selected = PathBuf::from("/tmp/wikisync-onboarding-library");
+        app.onboarding.storage_dialog_open = true;
+        drop(app.update(Message::OnboardingStorageChosen(Some(selected.clone()))));
+        assert_eq!(app.onboarding.storage_path, selected.display().to_string());
+        assert!(!app.onboarding.storage_dialog_open);
+    }
+
+    #[test]
+    fn onboarding_is_only_for_a_completely_empty_inactive_library() {
+        assert!(needs_initial_onboarding(0, 0, 0));
+        assert!(!needs_initial_onboarding(1, 0, 0));
+        assert!(!needs_initial_onboarding(0, 1, 0));
+        assert!(!needs_initial_onboarding(0, 0, 1));
+    }
+
+    #[test]
+    fn forged_whole_edition_start_fails_closed_without_beginning_work() {
+        let (mut app, initial_task) = App::new();
+        drop(initial_task);
+
+        drop(app.update(Message::StartEditionSync));
+
+        assert!(app.active_request.is_none());
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|notice| notice.message.contains("not enabled yet"))
+        );
+    }
     const NORWEGIAN_UNCHANGED_HEAD: &str = r#"{
       "batchcomplete": true,
       "query": {
@@ -6194,18 +6569,17 @@ mod tests {
     }
 
     #[test]
-    fn library_path_cannot_change_during_active_work() {
+    fn busy_app_does_not_open_the_storage_picker() {
         let (mut app, initial_task) = App::new();
         drop(initial_task);
-        app.library_path = "/active/library".to_owned();
         app.active_request = Some(RequestKey {
             id: 7,
             path: PathBuf::from("/active/library"),
         });
 
-        drop(app.update(Message::LibraryPathChanged("/different/library".to_owned())));
+        drop(app.update(Message::ChooseOnboardingStorage));
 
-        assert_eq!(app.library_path, "/active/library");
+        assert!(!app.onboarding.storage_dialog_open);
     }
 
     #[test]
