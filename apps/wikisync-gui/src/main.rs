@@ -14,7 +14,7 @@ use iced::widget::{
     Space, button, checkbox, column, container, horizontal_rule, progress_bar, row, scrollable,
     text, text_input,
 };
-use iced::{Alignment, Element, Length, Task, Theme};
+use iced::{Alignment, Element, Length, Size, Subscription, Task, Theme, window};
 use wikisync_core::{
     CollectionBudget, CollectionId, CollectionRemovalPolicy, CollectionRule, HistoryPolicy,
     ImagePolicy, PageTitle, ThumbnailPolicy, UnixTimestamp, WikiId,
@@ -54,6 +54,7 @@ const MAX_SIGNING_KEY_BYTES: u64 = 16 * 1024;
 fn main() -> iced::Result {
     iced::application("WikiSyncer", App::update, App::view)
         .theme(|_| Theme::Dark)
+        .subscription(App::subscription)
         .window_size((1120.0, 760.0))
         .run_with(App::new)
 }
@@ -83,6 +84,8 @@ struct App {
     signing_key_path: String,
     trusted_head_path: String,
     reader: Option<Arc<ReaderHandle>>,
+    window_size: Size,
+    collection_options_expanded: bool,
 }
 
 impl App {
@@ -116,6 +119,8 @@ impl App {
             signing_key_path: String::new(),
             trusted_head_path: String::new(),
             reader: None,
+            window_size: Size::new(1120.0, 760.0),
+            collection_options_expanded: false,
         };
         (app, probe_task(probe_key))
     }
@@ -184,6 +189,10 @@ impl App {
                 }
             }
             Message::SelectTab(tab) => self.tab = tab,
+            Message::WindowResized(size) => self.window_size = size,
+            Message::ToggleCollectionOptions => {
+                self.collection_options_expanded = !self.collection_options_expanded;
+            }
             Message::Refresh => {
                 if self.is_busy() {
                     return Task::none();
@@ -473,10 +482,17 @@ impl App {
                     .iter()
                     .find(|schedule| schedule.collection_id == collection_id)
                     .copied();
+                let Ok(form) = CollectionForm::from_configuration(configuration, wiki, schedule)
+                else {
+                    self.notice = Some(Notice::error(
+                        "Whole-edition settings are managed by the dedicated edition workflow.",
+                    ));
+                    return Task::none();
+                };
                 self.collection_editor = Some(CollectionEditor {
                     collection_id,
                     expected_generation: configuration.generation,
-                    form: CollectionForm::from_configuration(configuration, wiki, schedule),
+                    form,
                     preview: None,
                 });
                 self.schedule_editor = None;
@@ -1390,6 +1406,14 @@ impl App {
         }
     }
 
+    fn subscription(&self) -> Subscription<Message> {
+        window::resize_events().map(|(_id, size)| Message::WindowResized(size))
+    }
+
+    fn is_compact(&self) -> bool {
+        is_compact_width(self.window_size.width)
+    }
+
     fn setup_view(&self) -> Element<'_, Message> {
         let primary = if self.path_status == PathStatus::ExistingLibrary {
             button("Open library").on_press_maybe((!self.is_busy()).then_some(Message::OpenLibrary))
@@ -1446,17 +1470,20 @@ impl App {
         container(content)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
-            .padding(28)
+            .padding(if self.is_compact() { 14 } else { 28 })
             .into()
     }
 
     fn dashboard_view(&self) -> Element<'_, Message> {
-        let nav = row![
+        let tabs = row![
             nav_button("Overview", Tab::Overview, self.tab),
             nav_button("Collections", Tab::Collections, self.tab),
             nav_button("Sync", Tab::Sync, self.tab),
             nav_button("Integrity", Tab::Integrity, self.tab),
-            Space::new(Length::Fill, Length::Shrink),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        let actions = row![
             button(if self.reader.is_some() {
                 "Open reader"
             } else {
@@ -1469,6 +1496,13 @@ impl App {
         ]
         .spacing(8)
         .align_y(Alignment::Center);
+        let nav: Element<'_, Message> = if self.is_compact() {
+            column![tabs, actions].spacing(8).into()
+        } else {
+            row![tabs, Space::new(Length::Fill, Length::Shrink), actions]
+                .align_y(Alignment::Center)
+                .into()
+        };
 
         let body: Element<'_, Message> = match (&self.snapshot, self.tab) {
             (Some(snapshot), Tab::Overview) => self.overview_view(snapshot),
@@ -1478,44 +1512,115 @@ impl App {
             (None, _) => text("Loading library…").into(),
         };
 
-        column![
+        let availability = if self.is_busy() {
+            "Working…"
+        } else if self
+            .snapshot
+            .as_ref()
+            .is_none_or(|snapshot| snapshot.unique_page_count == 0)
+        {
+            "No offline content yet"
+        } else {
+            "Available offline"
+        };
+        let header: Element<'_, Message> = if self.is_compact() {
+            column![
+                column![
+                    text("WikiSyncer").size(28),
+                    text(&self.library_path).size(13),
+                ],
+                text(availability),
+            ]
+            .spacing(5)
+            .into()
+        } else {
             row![
                 column![
                     text("WikiSyncer").size(28),
                     text(&self.library_path).size(13),
                 ],
                 Space::new(Length::Fill, Length::Shrink),
-                text(if self.is_busy() {
-                    "Working…"
-                } else {
-                    "Offline library"
-                }),
+                text(availability),
             ]
-            .align_y(Alignment::Center),
+            .align_y(Alignment::Center)
+            .into()
+        };
+        let content = column![
+            header,
             horizontal_rule(1),
             nav,
             notice_view(self.notice.as_ref()),
-            scrollable(body).height(Length::Fill),
+            scrollable(body).height(Length::Fill).width(Length::Fill),
         ]
         .spacing(14)
-        .padding(22)
-        .into()
+        .height(Length::Fill)
+        .width(Length::Fill);
+
+        container(content)
+            .max_width(1360)
+            .center_x(Length::Fill)
+            .height(Length::Fill)
+            .padding(if self.is_compact() { 12 } else { 22 })
+            .into()
     }
 
     fn overview_view<'a>(&self, snapshot: &'a DashboardSnapshot) -> Element<'a, Message> {
-        let metrics = row![
-            metric("Collections", snapshot.collections.len().to_string()),
-            metric(
-                "Unique captured pages",
-                snapshot.unique_page_count.to_string()
-            ),
-            metric(
-                "Recent revisions shown",
-                snapshot.recent_revisions.len().to_string()
-            ),
-            metric("Library size", storage_bytes_label(&snapshot.storage_usage)),
-        ]
-        .spacing(12);
+        let metrics: Element<'_, Message> = if self.is_compact() {
+            column![
+                row![
+                    metric("Collections", snapshot.collections.len().to_string()),
+                    metric("Captured pages", snapshot.unique_page_count.to_string()),
+                ]
+                .spacing(8),
+                row![
+                    metric(
+                        "Recent revisions",
+                        snapshot.recent_revisions.len().to_string()
+                    ),
+                    metric("Library size", storage_bytes_label(&snapshot.storage_usage)),
+                ]
+                .spacing(8),
+            ]
+            .spacing(8)
+            .into()
+        } else {
+            row![
+                metric("Collections", snapshot.collections.len().to_string()),
+                metric(
+                    "Unique captured pages",
+                    snapshot.unique_page_count.to_string()
+                ),
+                metric(
+                    "Recent revisions shown",
+                    snapshot.recent_revisions.len().to_string()
+                ),
+                metric("Library size", storage_bytes_label(&snapshot.storage_usage)),
+            ]
+            .spacing(12)
+            .into()
+        };
+
+        let first_use: Element<'_, Message> = if snapshot.collections.is_empty() {
+            let action = button("Create your first offline collection")
+                .on_press(Message::SelectTab(Tab::Collections));
+            let guidance = text(
+                "Nothing has been downloaded yet. Choose a language and either a focused set of pages or, once whole-edition import is configured, an entire current language edition.",
+            );
+            let content: Element<'_, Message> = if self.is_compact() {
+                column![guidance, action].spacing(10).into()
+            } else {
+                row![guidance, Space::new(Length::Fill, Length::Shrink), action]
+                    .spacing(14)
+                    .align_y(Alignment::Center)
+                    .into()
+            };
+            container(column![text("Build your offline library").size(23), content].spacing(8))
+                .padding(16)
+                .width(Length::Fill)
+                .into()
+        } else {
+            Space::new(Length::Shrink, 0).into()
+        };
 
         let mut recent = column![text("Recent captured revisions").size(23)].spacing(9);
         if snapshot.recent_revisions.is_empty() {
@@ -1548,6 +1653,7 @@ impl App {
 
         column![
             text("Library overview").size(30),
+            first_use,
             metrics,
             storage_warning,
             horizontal_rule(1),
@@ -1770,12 +1876,21 @@ impl App {
                 )).into()
             },
         );
-        let form = column![
-            text("Create and synchronize a collection").size(23),
-            text("Preview scope and expected size first. Nothing is committed or downloaded until you choose Create and sync."),
-            text_input("Collection name", &self.collection_form.name)
-                .on_input(Message::CollectionNameChanged)
+        let source_fields: Element<'_, Message> = if self.is_compact() {
+            column![
+                text_input(
+                    "Language code (for example: en)",
+                    &self.collection_form.language_code
+                )
+                .on_input(Message::LanguageChanged)
                 .padding(10),
+                text_input("MediaWiki API endpoint", &self.collection_form.api_endpoint)
+                    .on_input(Message::EndpointChanged)
+                    .padding(10),
+            ]
+            .spacing(8)
+            .into()
+        } else {
             row![
                 text_input(
                     "Language code (for example: en)",
@@ -1783,94 +1898,137 @@ impl App {
                 )
                 .on_input(Message::LanguageChanged)
                 .padding(10),
-                text_input(
-                    "MediaWiki API endpoint",
-                    &self.collection_form.api_endpoint
-                )
-                .on_input(Message::EndpointChanged)
-                .padding(10),
+                text_input("MediaWiki API endpoint", &self.collection_form.api_endpoint)
+                    .on_input(Message::EndpointChanged)
+                    .padding(10),
             ]
-            .spacing(10),
+            .spacing(10)
+            .into()
+        };
+        let category_depth: Element<'_, Message> =
+            if self.collection_form.selection_mode == SelectionMode::Category {
+                text_input(
+                    "Category recursion depth (0–16)",
+                    &self.collection_form.category_depth,
+                )
+                .on_input(Message::CategoryDepthChanged)
+                .padding(10)
+                .into()
+            } else {
+                Space::new(Length::Shrink, 0).into()
+            };
+        let advanced_options: Element<'_, Message> = if self.collection_options_expanded {
+            column![
+                text("History retention").size(17),
+                history_buttons,
+                text_input(
+                    "Last-N count or Since Unix timestamp",
+                    &self.collection_form.history_value
+                )
+                .on_input(Message::HistoryValueChanged)
+                .padding(10),
+                row![
+                    text_input(
+                        "Hard maximum pages (blank = unlimited)",
+                        &self.collection_form.maximum_pages
+                    )
+                    .on_input(Message::MaximumPagesChanged)
+                    .padding(10),
+                    text_input(
+                        "Hard maximum canonical bytes (blank = unlimited)",
+                        &self.collection_form.maximum_bytes
+                    )
+                    .on_input(Message::MaximumBytesChanged)
+                    .padding(10),
+                ]
+                .spacing(10),
+                text("When a dynamic rule no longer selects a page").size(17),
+                row![
+                    removal_policy_button(
+                        "Stop tracking; retain captured history",
+                        CollectionRemovalPolicy::StopTrackingRetainHistory,
+                        self.collection_form.removal_policy,
+                        Message::CreateRemovalPolicyChanged,
+                    ),
+                    removal_policy_button(
+                        "Keep tracking",
+                        CollectionRemovalPolicy::KeepTracking,
+                        self.collection_form.removal_policy,
+                        Message::CreateRemovalPolicyChanged,
+                    ),
+                ]
+                .spacing(8),
+                text("Referenced image capture").size(17),
+                image_buttons,
+                row![
+                    text_input(
+                        "Maximum thumbnail edge (pixels)",
+                        &self.collection_form.thumbnail_max_edge_pixels,
+                    )
+                    .on_input(Message::CreateThumbnailEdgeChanged)
+                    .padding(10),
+                    text_input(
+                        "Maximum images per revision",
+                        &self.collection_form.thumbnail_max_images_per_revision,
+                    )
+                    .on_input(Message::CreateThumbnailCountChanged)
+                    .padding(10),
+                    text_input(
+                        "Maximum bytes per thumbnail",
+                        &self.collection_form.thumbnail_max_bytes_per_image,
+                    )
+                    .on_input(Message::CreateThumbnailBytesChanged)
+                    .padding(10),
+                ]
+                .spacing(8),
+                text(image_policy_form_summary(&self.collection_form)),
+                text("Automatic synchronization schedule").size(17),
+                schedule_buttons,
+                text_input(
+                    schedule_value_hint(self.collection_form.schedule_mode),
+                    &self.collection_form.schedule_value,
+                )
+                .on_input(Message::CreateScheduleValueChanged)
+                .padding(10),
+                text_input(
+                    "Maximum jitter in minutes",
+                    &self.collection_form.schedule_jitter_minutes,
+                )
+                .on_input(Message::CreateScheduleJitterChanged)
+                .padding(10),
+                checkbox(
+                    "Create schedule paused",
+                    self.collection_form.schedule_paused,
+                )
+                .on_toggle(Message::CreateSchedulePaused),
+                text("Stopping tracking never deletes already captured revisions. Keep tracking leaves departed dynamic members active until explicitly changed."),
+            ]
+            .spacing(10)
+            .into()
+        } else {
+            text("Defaults: current revision plus future changes · manual updates · no images · retain captured history when scope changes.")
+                .size(13)
+                .into()
+        };
+        let form = column![
+            text("Create and synchronize a collection").size(23),
+            text("1. Choose what should be available offline.  2. Preview the exact scope.  3. Create and download it."),
+            text_input("Collection name", &self.collection_form.name)
+                .on_input(Message::CollectionNameChanged)
+                .padding(10),
+            source_fields,
             mode_buttons,
             text_input(selection_hint, &self.collection_form.selection)
                 .on_input(Message::SelectionChanged)
                 .padding(10),
-            text_input("Category recursion depth (0–16)", &self.collection_form.category_depth)
-                .on_input(Message::CategoryDepthChanged)
-                .padding(10),
-            text("History retention").size(17),
-            history_buttons,
-            text_input("Last-N count or Since Unix timestamp", &self.collection_form.history_value)
-                .on_input(Message::HistoryValueChanged)
-                .padding(10),
-            row![
-                text_input("Hard maximum pages (blank = unlimited)", &self.collection_form.maximum_pages)
-                    .on_input(Message::MaximumPagesChanged)
-                    .padding(10),
-                text_input("Hard maximum canonical bytes (blank = unlimited)", &self.collection_form.maximum_bytes)
-                    .on_input(Message::MaximumBytesChanged)
-                    .padding(10),
-            ].spacing(10),
-            text("When a dynamic rule no longer selects a page").size(17),
-            row![
-                removal_policy_button(
-                    "Stop tracking; retain captured history",
-                    CollectionRemovalPolicy::StopTrackingRetainHistory,
-                    self.collection_form.removal_policy,
-                    Message::CreateRemovalPolicyChanged,
-                ),
-                removal_policy_button(
-                    "Keep tracking",
-                    CollectionRemovalPolicy::KeepTracking,
-                    self.collection_form.removal_policy,
-                    Message::CreateRemovalPolicyChanged,
-                ),
-            ]
-            .spacing(8),
-            text("Referenced image capture").size(17),
-            image_buttons,
-            row![
-                text_input(
-                    "Maximum thumbnail edge (pixels)",
-                    &self.collection_form.thumbnail_max_edge_pixels,
-                )
-                .on_input(Message::CreateThumbnailEdgeChanged)
-                .padding(10),
-                text_input(
-                    "Maximum images per revision",
-                    &self.collection_form.thumbnail_max_images_per_revision,
-                )
-                .on_input(Message::CreateThumbnailCountChanged)
-                .padding(10),
-                text_input(
-                    "Maximum bytes per thumbnail",
-                    &self.collection_form.thumbnail_max_bytes_per_image,
-                )
-                .on_input(Message::CreateThumbnailBytesChanged)
-                .padding(10),
-            ]
-            .spacing(8),
-            text(image_policy_form_summary(&self.collection_form)),
-            text("Automatic synchronization schedule").size(17),
-            schedule_buttons,
-            text_input(
-                schedule_value_hint(self.collection_form.schedule_mode),
-                &self.collection_form.schedule_value,
-            )
-            .on_input(Message::CreateScheduleValueChanged)
-            .padding(10),
-            text_input(
-                "Maximum jitter in minutes",
-                &self.collection_form.schedule_jitter_minutes,
-            )
-            .on_input(Message::CreateScheduleJitterChanged)
-            .padding(10),
-            checkbox(
-                "Create schedule paused",
-                self.collection_form.schedule_paused,
-            )
-            .on_toggle(Message::CreateSchedulePaused),
-            text("Stopping tracking never deletes already captured revisions. Keep tracking leaves departed dynamic members active until explicitly changed."),
+            category_depth,
+            button(if self.collection_options_expanded {
+                "Hide advanced options"
+            } else {
+                "Show history, images, limits, and schedule"
+            })
+            .on_press(Message::ToggleCollectionOptions),
+            advanced_options,
             row![
                 button("Preview selection")
                     .on_press_maybe(preview_enabled.then_some(Message::PreviewCollection)),
@@ -2287,6 +2445,8 @@ enum Message {
     CreateLibrary,
     Loaded(ScopedResult<DashboardSnapshot>),
     SelectTab(Tab),
+    WindowResized(Size),
+    ToggleCollectionOptions,
     Refresh,
     ChooseAnotherLibrary,
     CollectionNameChanged(String),
@@ -2572,8 +2732,11 @@ impl CollectionForm {
         configuration: &StoredCollectionConfiguration,
         wiki: &StoredWiki,
         schedule: Option<CollectionSchedule>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let (selection_mode, selection, category_depth) = match &configuration.rule {
+            CollectionRule::WholeMainNamespace => {
+                return Err("whole-edition collections use a dedicated editor".to_owned());
+            }
             CollectionRule::ExplicitTitles(titles) => (
                 SelectionMode::Titles,
                 titles
@@ -2622,7 +2785,7 @@ impl CollectionForm {
             ImagePolicy::None => (ImageMode::None, ThumbnailPolicy::default()),
             ImagePolicy::Thumbnails(policy) => (ImageMode::Thumbnails, policy),
         };
-        Self {
+        Ok(Self {
             name: configuration.name.clone(),
             language_code: wiki.language_code.clone(),
             api_endpoint: wiki.api_endpoint.clone(),
@@ -2654,7 +2817,7 @@ impl CollectionForm {
             schedule_value: schedule_editor.value,
             schedule_jitter_minutes: schedule_editor.jitter_minutes,
             schedule_paused: schedule_editor.paused,
-        }
+        })
     }
 
     fn rule(&self) -> Result<CollectionRule, String> {
@@ -4283,6 +4446,10 @@ fn suggested_library_path() -> String {
         .to_string()
 }
 
+fn is_compact_width(width: f32) -> bool {
+    width < 860.0
+}
+
 fn nav_button(label: &str, tab: Tab, selected: Tab) -> Element<'static, Message> {
     let label = if tab == selected {
         format!("• {label}")
@@ -5343,7 +5510,7 @@ mod tests {
 
         let created = load_library_snapshot(&root, true).expect("create library");
         assert_eq!(created.path, root);
-        assert_eq!(created.schema_version, 15);
+        assert_eq!(created.schema_version, 16);
         assert!(root.join(DATABASE_NAME).is_file());
 
         let reopened = load_library_snapshot(&root, false).expect("reopen library");

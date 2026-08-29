@@ -11,7 +11,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-iced = { version = "0.13", default-features = false, features = ["tiny-skia", "tokio"] }
+iced = { version = "0.13", default-features = false, features = ["wgpu", "tokio"] }
 wikisync-core = { version = "=0.1.0", path = "../../crates/wikisync-core" }
 wikisync-integrity = { version = "=0.1.0", path = "../../crates/wikisync-integrity" }
 wikisync-mediawiki = { version = "=0.1.0", path = "../../crates/wikisync-mediawiki" }

@@ -274,6 +274,14 @@ impl Error for InvalidTitleList {
 /// The rule used to resolve membership in a collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CollectionRule {
+    /// Every current article in the source's main namespace, followed by all future
+    /// public revisions of those articles.
+    ///
+    /// This rule describes a current-edition snapshot, not the source's complete
+    /// historical revision archive. Implementations are expected to bootstrap it
+    /// from an authenticated current-page dump and close the dump race window with
+    /// RecentChanges.
+    WholeMainNamespace,
     /// A fixed set of titles entered directly by the user.
     ExplicitTitles(TitleSelection),
     /// A fixed set of titles imported from a newline-delimited list.
@@ -293,7 +301,7 @@ impl CollectionRule {
     pub fn titles(&self) -> Option<&TitleSelection> {
         match self {
             Self::ExplicitTitles(titles) | Self::TitleList(titles) => Some(titles),
-            Self::Category { .. } => None,
+            Self::WholeMainNamespace | Self::Category { .. } => None,
         }
     }
 }
@@ -301,6 +309,8 @@ impl CollectionRule {
 /// Why one page was included in a resolved collection preview.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InclusionReason {
+    /// The page is an article in a whole-main-namespace current-edition snapshot.
+    WholeMainNamespace,
     /// The title was entered directly.
     ExplicitTitle(PageTitle),
     /// The title came from a newline-delimited import.
@@ -628,6 +638,16 @@ mod tests {
         assert_eq!(
             TitleSelection::from_newline_delimited("\n \n"),
             Err(InvalidTitleList::Empty)
+        );
+    }
+
+    #[test]
+    fn whole_main_namespace_is_a_titleless_current_edition_rule() {
+        let rule = CollectionRule::WholeMainNamespace;
+        assert!(rule.titles().is_none());
+        assert_eq!(
+            InclusionReason::WholeMainNamespace,
+            InclusionReason::WholeMainNamespace
         );
     }
 

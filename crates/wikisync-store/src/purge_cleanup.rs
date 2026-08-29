@@ -2493,14 +2493,14 @@ mod tests {
                  DROP TABLE purge_file_work;
                  DROP TABLE purge_authorized_absences;
                  ALTER TABLE purge_operations DROP COLUMN catalog_fingerprint;
-                 DELETE FROM schema_migrations WHERE version = 15;
+                 DELETE FROM schema_migrations WHERE version IN (15, 16);
                  PRAGMA user_version = 14;",
             )
             .expect("restore version-fourteen schema shape");
         drop(library);
 
         let mut upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 15);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 16);
         assert_eq!(
             upgraded
                 .installed_purge_event(receipt.purge_id)

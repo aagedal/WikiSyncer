@@ -1005,6 +1005,9 @@ fn configuration_json(configuration: &StoredCollectionConfiguration) -> Value {
 
 fn rule_json(rule: &CollectionRule) -> Value {
     match rule {
+        CollectionRule::WholeMainNamespace => json!({
+            "kind": "whole-main-namespace",
+        }),
         CollectionRule::ExplicitTitles(titles) => json!({
             "kind": "explicit-titles",
             "titles": titles.iter().map(PageTitle::as_str).collect::<Vec<_>>(),
@@ -1086,6 +1089,9 @@ fn member_json(member: &ResolvedCollectionMember) -> Value {
 
 fn inclusion_reason_json(reason: &InclusionReason) -> Value {
     match reason {
+        InclusionReason::WholeMainNamespace => {
+            json!({"kind": "whole-main-namespace"})
+        }
         InclusionReason::ExplicitTitle(title) => {
             json!({"kind": "explicit-title", "title": title.as_str()})
         }

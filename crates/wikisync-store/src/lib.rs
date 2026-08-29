@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use wikisync_content::{ThumbnailLimits, validate_thumbnail};
 use wikisync_core::{
     CollectionBudget, CollectionId, CollectionRemovalPolicy, CollectionRule, HistoryPolicy,
-    ImagePolicy, InclusionReason, MAX_THUMBNAILS_PER_REVISION, MediaId, PageId, PageTitle,
-    RevisionId, ThumbnailPolicy, TitleSelection, UnixTimestamp, WikiId,
+    ImagePolicy, InclusionReason, MAIN_NAMESPACE, MAX_THUMBNAILS_PER_REVISION, MediaId, PageId,
+    PageTitle, RevisionId, ThumbnailPolicy, TitleSelection, UnixTimestamp, WikiId,
 };
 
 mod purge_cleanup;
@@ -50,6 +50,7 @@ const MIGRATION_12: &str = include_str!("../migrations/0012_thumbnail_media.sql"
 const MIGRATION_13: &str = include_str!("../migrations/0013_dump_imports.sql");
 const MIGRATION_14: &str = include_str!("../migrations/0014_purge_journal.sql");
 const MIGRATION_15: &str = include_str!("../migrations/0015_purge_cleanup.sql");
+const MIGRATION_16: &str = include_str!("../migrations/0016_whole_main_namespace.sql");
 const OBJECT_DOMAIN: &[u8] = b"wikisync-object-v1\0";
 const DATABASE_NAME: &str = "library.sqlite3";
 const MANIFEST_DOMAIN: &[u8] = b"wikisync-manifest-v1\0";
@@ -3075,6 +3076,7 @@ impl Library {
         budget: CollectionBudget,
         removal_policy: CollectionRemovalPolicy,
     ) -> Result<(), StoreError> {
+        validate_rule_history_policy(rule, history_policy)?;
         let now = unix_time()?;
         let raw_collection_id = to_sql_integer(collection_id.get())?;
         let (rule_kind, category_title, category_depth) = collection_rule_values(rule);
@@ -3294,6 +3296,14 @@ impl Library {
         category_depth: Option<i64>,
     ) -> Result<Option<CollectionRule>, StoreError> {
         match kind {
+            "whole-main-namespace" => {
+                if category_title.is_some() || category_depth.is_some() {
+                    return Err(StoreError::CorruptMetadata(
+                        "whole-main-namespace rule has category configuration",
+                    ));
+                }
+                Ok(Some(CollectionRule::WholeMainNamespace))
+            }
             "explicit-titles" | "title-list" => {
                 let mut statement = self.connection.prepare(
                     "SELECT title FROM collection_rule_titles
@@ -5498,18 +5508,145 @@ impl Library {
         validate_mediawiki_timestamp(capture.timestamp)?;
         let raw_wiki_id = to_sql_integer(wiki_id.get())?;
         let raw_collection_id = to_sql_integer(collection_id.get())?;
-        let collection_wiki_id: Option<i64> = self
+        let collection_configuration: Option<(i64, String, Option<i64>, Option<i64>)> = self
             .connection
             .query_row(
-                "SELECT wiki_id FROM collections WHERE collection_id = ?1",
+                "SELECT collections.wiki_id, config.rule_kind,
+                        config.maximum_pages, config.maximum_bytes
+                 FROM collections
+                 JOIN collection_configuration AS config USING (collection_id)
+                 WHERE collection_id = ?1",
                 [raw_collection_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        if collection_wiki_id != Some(raw_wiki_id) {
+        let Some((collection_wiki_id, rule_kind, maximum_pages, maximum_bytes)) =
+            collection_configuration
+        else {
+            return Err(StoreError::CollectionWikiMismatch);
+        };
+        if collection_wiki_id != raw_wiki_id {
             return Err(StoreError::CollectionWikiMismatch);
         }
+        let whole_main_namespace = rule_kind == "whole-main-namespace";
+        if whole_main_namespace && capture.namespace != MAIN_NAMESPACE {
+            return Err(StoreError::WholeMainNamespaceRequired {
+                namespace: capture.namespace,
+            });
+        }
         ensure_collection_active(&self.connection, collection_id, raw_collection_id)?;
+        if whole_main_namespace {
+            let raw_page_id = to_sql_integer(capture.page_id.get())?;
+            let membership_state: Option<String> = self
+                .connection
+                .query_row(
+                    "SELECT membership_state FROM collection_resolved_members
+                     WHERE collection_id = ?1 AND page_id = ?2",
+                    params![raw_collection_id, raw_page_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if membership_state.as_deref() == Some("removed") {
+                return Err(StoreError::CollectionMemberNotActive {
+                    collection_id,
+                    page_id: capture.page_id,
+                });
+            }
+            if membership_state.is_none() {
+                let current_pages: i64 = self.connection.query_row(
+                    "SELECT COUNT(*) FROM collection_resolved_members
+                     WHERE collection_id = ?1 AND membership_state = 'active'",
+                    [raw_collection_id],
+                    |row| row.get(0),
+                )?;
+                let estimated = sql_u64(current_pages, "negative collection page count")?
+                    .checked_add(1)
+                    .ok_or(StoreError::DumpImportProgressOverflow)?;
+                let page_limit = maximum_pages
+                    .map(|limit| sql_u64(limit, "invalid collection page budget"))
+                    .transpose()?;
+                if page_limit.is_some_and(|limit| estimated > limit) {
+                    return Err(StoreError::CollectionBudgetExceeded {
+                        resource: "pages",
+                        limit: page_limit.expect("checked page limit"),
+                        estimated,
+                    });
+                }
+            }
+            if let Some(raw_limit) = maximum_bytes {
+                let candidate_id = ObjectId::for_bytes(ObjectKind::Wikitext, capture.source);
+                let current_bytes: i64 = self.connection.query_row(
+                    "SELECT COALESCE(SUM(uncompressed_length), 0)
+                     FROM content_objects
+                     WHERE object_id IN (
+                        SELECT DISTINCT revisions.content_object_id
+                        FROM collection_resolved_members AS members
+                        JOIN revisions
+                          ON revisions.wiki_id = members.wiki_id
+                         AND revisions.page_id = members.page_id
+                        WHERE members.collection_id = ?1
+                          AND members.membership_state = 'active'
+                        UNION
+                        SELECT placements.content_object_id
+                        FROM collection_resolved_members AS members
+                        JOIN revisions
+                          ON revisions.wiki_id = members.wiki_id
+                         AND revisions.page_id = members.page_id
+                        JOIN page_media AS placements
+                          ON placements.wiki_id = revisions.wiki_id
+                         AND placements.revision_id = revisions.revision_id
+                        WHERE members.collection_id = ?1
+                          AND members.membership_state = 'active'
+                     )",
+                    [raw_collection_id],
+                    |row| row.get(0),
+                )?;
+                let already_reachable: bool = self.connection.query_row(
+                    "SELECT EXISTS (
+                        SELECT 1
+                        FROM collection_resolved_members AS members
+                        JOIN revisions
+                          ON revisions.wiki_id = members.wiki_id
+                         AND revisions.page_id = members.page_id
+                        WHERE members.collection_id = ?1
+                          AND members.membership_state = 'active'
+                          AND revisions.content_object_id = ?2
+                        UNION ALL
+                        SELECT 1
+                        FROM collection_resolved_members AS members
+                        JOIN revisions
+                          ON revisions.wiki_id = members.wiki_id
+                         AND revisions.page_id = members.page_id
+                        JOIN page_media AS placements
+                          ON placements.wiki_id = revisions.wiki_id
+                         AND placements.revision_id = revisions.revision_id
+                        WHERE members.collection_id = ?1
+                          AND members.membership_state = 'active'
+                          AND placements.content_object_id = ?2
+                    )",
+                    params![raw_collection_id, candidate_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                let candidate_bytes = if already_reachable {
+                    0
+                } else {
+                    u64::try_from(capture.source.len()).map_err(|_| {
+                        StoreError::InvalidConfig("capture source length is too large")
+                    })?
+                };
+                let estimated = sql_u64(current_bytes, "negative collection canonical byte count")?
+                    .checked_add(candidate_bytes)
+                    .ok_or(StoreError::DumpImportProgressOverflow)?;
+                let limit = sql_u64(raw_limit, "invalid collection byte budget")?;
+                if estimated > limit {
+                    return Err(StoreError::CollectionBudgetExceeded {
+                        resource: "bytes",
+                        limit,
+                        estimated,
+                    });
+                }
+            }
+        }
         let object = self.put_bytes(ObjectKind::Wikitext, capture.source)?;
         let now = unix_time()?;
         let wiki_id = raw_wiki_id;
@@ -5560,19 +5697,31 @@ impl Library {
         }
         let membership_added = membership_state.is_none();
         if membership_added {
+            let inclusion_kind = if whole_main_namespace {
+                "whole-main-namespace"
+            } else {
+                "explicit-title"
+            };
+            let inclusion_title = if whole_main_namespace {
+                "main namespace"
+            } else {
+                capture.title.as_str()
+            };
             transaction.execute(
                 "INSERT INTO collection_resolved_members (
                     collection_id, wiki_id, page_id, namespace, title,
                     inclusion_kind, inclusion_title, inclusion_depth,
                     membership_state, first_resolved_at, last_resolved_at, removed_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5,
-                           'explicit-title', ?5, NULL, 'active', ?6, ?6, NULL)",
+                           ?6, ?7, NULL, 'active', ?8, ?8, NULL)",
                 params![
                     collection_id,
                     wiki_id,
                     page_id,
                     capture.namespace,
                     capture.title.as_str(),
+                    inclusion_kind,
+                    inclusion_title,
                     now,
                 ],
             )?;
@@ -5614,14 +5763,24 @@ impl Library {
         transaction.execute(
             "INSERT OR IGNORE INTO collection_pages (
                 collection_id, wiki_id, page_id, inclusion_reason, added_at
-             ) VALUES (?1, ?2, ?3, 'explicit-title', ?4)",
-            params![collection_id, wiki_id, page_id, now],
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                collection_id,
+                wiki_id,
+                page_id,
+                if whole_main_namespace {
+                    "whole-main-namespace"
+                } else {
+                    "explicit-title"
+                },
+                now
+            ],
         )?;
         let unresolved_removed = transaction.execute(
             "DELETE FROM unresolved_titles WHERE collection_id = ?1 AND title = ?2",
             params![collection_id, capture.title.as_str()],
         )?;
-        if membership_added || unresolved_removed != 0 {
+        if (!whole_main_namespace && membership_added) || unresolved_removed != 0 {
             let changed = transaction.execute(
                 "UPDATE collections SET generation = generation + 1
                  WHERE collection_id = ?1 AND status = 'active'",
@@ -9620,6 +9779,7 @@ fn validate_collection_name(name: &str) -> Result<(), StoreError> {
 }
 
 fn validate_preview_commit(preview: CollectionPreviewCommit<'_>) -> Result<(), StoreError> {
+    validate_rule_history_policy(preview.rule, preview.history_policy)?;
     let page_count = u64::try_from(preview.members.len())
         .map_err(|_| StoreError::InvalidConfig("collection preview is too large"))?;
     if preview
@@ -9912,6 +10072,7 @@ fn commit_preview_transaction(
 
 fn collection_rule_values(rule: &CollectionRule) -> (&'static str, Option<&str>, Option<i64>) {
     match rule {
+        CollectionRule::WholeMainNamespace => ("whole-main-namespace", None, None),
         CollectionRule::ExplicitTitles(_) => ("explicit-titles", None, None),
         CollectionRule::TitleList(_) => ("title-list", None, None),
         CollectionRule::Category {
@@ -10056,6 +10217,7 @@ fn stored_removal_policy(value: &str) -> Result<CollectionRemovalPolicy, StoreEr
 
 fn inclusion_reason_values(reason: &InclusionReason) -> (&'static str, &str, Option<i64>) {
     match reason {
+        InclusionReason::WholeMainNamespace => ("whole-main-namespace", "main namespace", None),
         InclusionReason::ExplicitTitle(title) => ("explicit-title", title.as_str(), None),
         InclusionReason::TitleList(title) => ("title-list", title.as_str(), None),
         InclusionReason::Category { category, depth } => {
@@ -10072,6 +10234,7 @@ fn stored_inclusion_reason(
     let title = PageTitle::new(title)
         .map_err(|_| StoreError::CorruptMetadata("invalid inclusion reason title"))?;
     match kind {
+        "whole-main-namespace" if depth.is_none() => Ok(InclusionReason::WholeMainNamespace),
         "explicit-title" if depth.is_none() => Ok(InclusionReason::ExplicitTitle(title)),
         "title-list" if depth.is_none() => Ok(InclusionReason::TitleList(title)),
         "category" => Ok(InclusionReason::Category {
@@ -10090,6 +10253,9 @@ fn validate_inclusion_reason(
     member: &ResolvedCollectionMember,
 ) -> Result<(), StoreError> {
     let valid = match (rule, &member.inclusion_reason) {
+        (CollectionRule::WholeMainNamespace, InclusionReason::WholeMainNamespace) => {
+            member.namespace == MAIN_NAMESPACE
+        }
         // MediaWiki may normalize or redirect a configured title before returning
         // the stable page identity. The configured titles remain persisted in the
         // rule while the inclusion reason records the canonical resolved title.
@@ -10109,6 +10275,20 @@ fn validate_inclusion_reason(
     } else {
         Err(StoreError::InvalidInclusionReason(member.page_id))
     }
+}
+
+fn validate_rule_history_policy(
+    rule: &CollectionRule,
+    history_policy: HistoryPolicy,
+) -> Result<(), StoreError> {
+    if matches!(rule, CollectionRule::WholeMainNamespace)
+        && history_policy != HistoryPolicy::CurrentAndFuture
+    {
+        return Err(StoreError::InvalidConfig(
+            "a whole-main-namespace collection supports only current and future revisions",
+        ));
+    }
+    Ok(())
 }
 
 fn schedule_cadence_values(cadence: ScheduleCadence) -> (&'static str, Option<u32>) {
@@ -10202,7 +10382,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
          ) STRICT;",
     )?;
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > 15 {
+    if version > 16 {
         return Err(StoreError::UnsupportedSchemaVersion(version));
     }
     if version == 0 {
@@ -10382,6 +10562,18 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
             [unix_time()?],
         )?;
         transaction.pragma_update(None, "user_version", 15)?;
+        transaction.commit()?;
+    }
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 15 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(MIGRATION_16)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (16, 'whole-main-namespace', ?1)",
+            [unix_time()?],
+        )?;
+        transaction.pragma_update(None, "user_version", 16)?;
         transaction.commit()?;
     }
     Ok(())
@@ -12563,6 +12755,11 @@ pub enum StoreError {
     CollectionNotConfigured(CollectionId),
     /// A resolved member reason did not match the committed rule.
     InvalidInclusionReason(PageId),
+    /// A whole-main-namespace snapshot attempted to admit a non-article page.
+    WholeMainNamespaceRequired {
+        /// Namespace supplied by the source record.
+        namespace: i32,
+    },
     /// A capture was attempted for membership removed by reconciliation.
     CollectionMemberNotActive {
         /// Local collection identity.
@@ -12854,6 +13051,10 @@ impl fmt::Display for StoreError {
                     "page {page_id} inclusion reason does not match the collection rule"
                 )
             }
+            Self::WholeMainNamespaceRequired { namespace } => write!(
+                formatter,
+                "whole-main-namespace collections accept only namespace 0; observed namespace {namespace}"
+            ),
             Self::CollectionMemberNotActive {
                 collection_id,
                 page_id,
@@ -13335,7 +13536,7 @@ mod tests {
         let before = filesystem_snapshot(directory.path());
 
         let mut library = Library::open_read_only(directory.path()).expect("read-only library");
-        assert_eq!(library.schema_version().expect("schema version"), 15);
+        assert_eq!(library.schema_version().expect("schema version"), 16);
         assert_eq!(library.wikis().expect("wikis")[0].wiki_id, wiki_id);
         assert_eq!(library.logical_object_count().expect("object count"), 1);
         assert_eq!(
@@ -13437,13 +13638,13 @@ mod tests {
     #[test]
     fn migration_is_applied_once_and_keeps_locations_separate() {
         let (directory, library) = test_library();
-        assert_eq!(library.schema_version().expect("schema version"), 15);
-        assert_eq!(migration_count(&library), 15);
+        assert_eq!(library.schema_version().expect("schema version"), 16);
+        assert_eq!(migration_count(&library), 16);
 
         drop(library);
         let reopened = Library::open(directory.path()).expect("reopen library");
-        assert_eq!(reopened.schema_version().expect("schema version"), 15);
-        assert_eq!(migration_count(&reopened), 15);
+        assert_eq!(reopened.schema_version().expect("schema version"), 16);
+        assert_eq!(migration_count(&reopened), 16);
 
         let logical_columns: Vec<String> = reopened
             .connection()
@@ -13501,15 +13702,15 @@ mod tests {
                  DROP TABLE purge_objects;
                  DROP INDEX one_unfinished_purge_per_collection;
                  DROP TABLE purge_operations;
-                 DELETE FROM schema_migrations WHERE version IN (14, 15);
+                 DELETE FROM schema_migrations WHERE version IN (14, 15, 16);
                  PRAGMA user_version = 13;",
             )
             .expect("downgrade purge fixture");
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade v13 library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 15);
-        assert_eq!(migration_count(&upgraded), 15);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 16);
+        assert_eq!(migration_count(&upgraded), 16);
         assert_eq!(table_count(&upgraded, "purge_operations"), 0);
         assert_eq!(table_count(&upgraded, "purge_objects"), 0);
         assert_eq!(table_count(&upgraded, "purge_pack_work"), 0);
@@ -13703,15 +13904,15 @@ mod tests {
                  ALTER TABLE collections DROP COLUMN status;
                  ALTER TABLE collections DROP COLUMN generation;
                  ALTER TABLE collections DROP COLUMN tombstoned_at;
-                 DELETE FROM schema_migrations WHERE version IN (9, 10, 11, 12, 13, 14, 15);
+                 DELETE FROM schema_migrations WHERE version IN (9, 10, 11, 12, 13, 14, 15, 16);
                  PRAGMA user_version = 8;",
             )
             .expect("downgrade fixture metadata");
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade version eight library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 15);
-        assert_eq!(migration_count(&upgraded), 15);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 16);
+        assert_eq!(migration_count(&upgraded), 16);
         assert_eq!(
             upgraded
                 .network_transfer_policy()
@@ -13771,15 +13972,15 @@ mod tests {
                  ALTER TABLE collections DROP COLUMN status;
                  ALTER TABLE collections DROP COLUMN generation;
                  ALTER TABLE collections DROP COLUMN tombstoned_at;
-                 DELETE FROM schema_migrations WHERE version IN (10, 11, 12, 13, 14, 15);
+                 DELETE FROM schema_migrations WHERE version IN (10, 11, 12, 13, 14, 15, 16);
                  PRAGMA user_version = 9;",
             )
             .expect("downgrade fixture metadata");
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade version nine fixture");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 15);
-        assert_eq!(migration_count(&upgraded), 15);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 16);
+        assert_eq!(migration_count(&upgraded), 16);
         let collection = upgraded
             .collection(collection_id)
             .expect("collection lookup")
@@ -13851,15 +14052,15 @@ mod tests {
                  ALTER TABLE collection_configuration DROP COLUMN thumbnail_max_images_per_revision;
                  ALTER TABLE collection_configuration DROP COLUMN thumbnail_max_edge_pixels;
                  ALTER TABLE collection_configuration DROP COLUMN image_policy;
-                 DELETE FROM schema_migrations WHERE version IN (12, 13, 14, 15);
+                 DELETE FROM schema_migrations WHERE version IN (12, 13, 14, 15, 16);
                  PRAGMA user_version = 11;",
             )
             .expect("downgrade fixture metadata");
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade version eleven library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 15);
-        assert_eq!(migration_count(&upgraded), 15);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 16);
+        assert_eq!(migration_count(&upgraded), 16);
         assert_eq!(
             upgraded
                 .collection_configuration(collection_id)
@@ -13919,8 +14120,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 15);
-        assert_eq!(migration_count(&upgraded), 15);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 16);
+        assert_eq!(migration_count(&upgraded), 16);
         assert_eq!(table_count(&upgraded, "revisions"), 0);
     }
 
@@ -13956,8 +14157,8 @@ mod tests {
         drop(connection);
 
         let upgraded = Library::open(directory.path()).expect("upgrade library");
-        assert_eq!(upgraded.schema_version().expect("schema version"), 15);
-        assert_eq!(migration_count(&upgraded), 15);
+        assert_eq!(upgraded.schema_version().expect("schema version"), 16);
+        assert_eq!(migration_count(&upgraded), 16);
         assert_eq!(table_count(&upgraded, "search_documents"), 0);
         let fts_definition: String = upgraded
             .connection()
@@ -18211,6 +18412,212 @@ mod tests {
                 .expect("present"),
             completed
         );
+    }
+
+    #[test]
+    fn whole_main_namespace_round_trips_and_streaming_capture_honors_hard_bounds() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        let budget = CollectionBudget::unlimited()
+            .with_maximum_pages(1)
+            .expect("page budget")
+            .with_maximum_bytes(4)
+            .expect("byte budget");
+        let collection_id = library
+            .create_collection(
+                wiki_id,
+                "Whole current edition",
+                &CollectionRule::WholeMainNamespace,
+                HistoryPolicy::CurrentAndFuture,
+                budget,
+                CollectionRemovalPolicy::StopTrackingRetainHistory,
+            )
+            .expect("whole-edition collection");
+        let configuration = library
+            .collection_configuration(collection_id)
+            .expect("configuration")
+            .expect("configured");
+        assert_eq!(configuration.rule, CollectionRule::WholeMainNamespace);
+        assert_eq!(
+            configuration.history_policy,
+            HistoryPolicy::CurrentAndFuture
+        );
+        assert_eq!(configuration.budget, budget);
+
+        let article = PageTitle::new("Alpha").expect("title");
+        library
+            .capture_current_revision(
+                wiki_id,
+                collection_id,
+                &CurrentRevisionCapture {
+                    page_id: PageId::new(101).expect("page ID"),
+                    namespace: MAIN_NAMESPACE,
+                    title: &article,
+                    revision_id: RevisionId::new(1_001).expect("revision ID"),
+                    parent_id: None,
+                    timestamp: "2026-08-29T10:00:00Z",
+                    author: None,
+                    author_id: None,
+                    comment: None,
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: b"four",
+                },
+            )
+            .expect("capture article");
+        let members = library
+            .resolved_collection_members(collection_id)
+            .expect("members");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].namespace, MAIN_NAMESPACE);
+        assert_eq!(
+            members[0].inclusion_reason,
+            InclusionReason::WholeMainNamespace
+        );
+
+        let before_rejected_capture = library.logical_object_count().expect("object count");
+        assert!(matches!(
+            library.capture_current_revision(
+                wiki_id,
+                collection_id,
+                &CurrentRevisionCapture {
+                    page_id: PageId::new(101).expect("page ID"),
+                    namespace: MAIN_NAMESPACE,
+                    title: &article,
+                    revision_id: RevisionId::new(1_005).expect("revision ID"),
+                    parent_id: Some(RevisionId::new(1_001).expect("parent ID")),
+                    timestamp: "2026-08-29T10:00:30Z",
+                    author: None,
+                    author_id: None,
+                    comment: None,
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: b"five!",
+                },
+            ),
+            Err(StoreError::CollectionBudgetExceeded {
+                resource: "bytes",
+                limit: 4,
+                estimated: 9,
+            })
+        ));
+        assert_eq!(
+            library.logical_object_count().expect("object count"),
+            before_rejected_capture
+        );
+        let second = PageTitle::new("Beta").expect("title");
+        assert!(matches!(
+            library.capture_current_revision(
+                wiki_id,
+                collection_id,
+                &CurrentRevisionCapture {
+                    page_id: PageId::new(102).expect("page ID"),
+                    namespace: MAIN_NAMESPACE,
+                    title: &second,
+                    revision_id: RevisionId::new(1_002).expect("revision ID"),
+                    parent_id: None,
+                    timestamp: "2026-08-29T10:01:00Z",
+                    author: None,
+                    author_id: None,
+                    comment: None,
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: b"new bytes",
+                },
+            ),
+            Err(StoreError::CollectionBudgetExceeded {
+                resource: "pages",
+                limit: 1,
+                estimated: 2,
+            })
+        ));
+        assert_eq!(
+            library.logical_object_count().expect("object count"),
+            before_rejected_capture
+        );
+
+        let talk = PageTitle::new("Talk:Alpha").expect("title");
+        assert!(matches!(
+            library.capture_current_revision(
+                wiki_id,
+                collection_id,
+                &CurrentRevisionCapture {
+                    page_id: PageId::new(103).expect("page ID"),
+                    namespace: 1,
+                    title: &talk,
+                    revision_id: RevisionId::new(1_003).expect("revision ID"),
+                    parent_id: None,
+                    timestamp: "2026-08-29T10:02:00Z",
+                    author: None,
+                    author_id: None,
+                    comment: None,
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: b"talk",
+                },
+            ),
+            Err(StoreError::WholeMainNamespaceRequired { namespace: 1 })
+        ));
+
+        library
+            .tombstone_collection(collection_id)
+            .expect("tombstone collection");
+        assert!(matches!(
+            library.capture_current_revision(
+                wiki_id,
+                collection_id,
+                &CurrentRevisionCapture {
+                    page_id: PageId::new(104).expect("page ID"),
+                    namespace: MAIN_NAMESPACE,
+                    title: &second,
+                    revision_id: RevisionId::new(1_004).expect("revision ID"),
+                    parent_id: None,
+                    timestamp: "2026-08-29T10:03:00Z",
+                    author: None,
+                    author_id: None,
+                    comment: None,
+                    minor: false,
+                    upstream_sha1: None,
+                    content_model: "wikitext",
+                    source: b"beta",
+                },
+            ),
+            Err(StoreError::CollectionTombstoned(id)) if id == collection_id
+        ));
+        assert_eq!(
+            library
+                .collection_configuration(collection_id)
+                .expect("tombstoned configuration")
+                .expect("retained configuration")
+                .rule,
+            CollectionRule::WholeMainNamespace
+        );
+    }
+
+    #[test]
+    fn whole_main_namespace_rejects_historical_bootstrap_policy() {
+        let (_directory, mut library) = test_library();
+        let wiki_id = library
+            .register_wiki("https://en.wikipedia.org/w/api.php", "en")
+            .expect("register wiki");
+        assert!(matches!(
+            library.create_collection(
+                wiki_id,
+                "Unsupported complete history",
+                &CollectionRule::WholeMainNamespace,
+                HistoryPolicy::Complete,
+                CollectionBudget::unlimited(),
+                CollectionRemovalPolicy::StopTrackingRetainHistory,
+            ),
+            Err(StoreError::InvalidConfig(_))
+        ));
+        assert!(library.collections().expect("collections").is_empty());
     }
 
     #[test]

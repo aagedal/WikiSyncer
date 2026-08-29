@@ -364,6 +364,11 @@ fn encoded_collection_draft_size(
         add_size(
             &mut size,
             match &member.inclusion_reason {
+                InclusionReason::WholeMainNamespace => {
+                    return Err(OperationError::failed(
+                        "whole-edition collections require the dedicated dump bootstrap operation",
+                    ));
+                }
                 InclusionReason::ExplicitTitle(title) | InclusionReason::TitleList(title) => {
                     1_usize
                         .checked_add(encoded_string_size(title.as_str())?)
@@ -428,6 +433,9 @@ fn encoded_collection_draft_size(
 
 fn encoded_rule_size(rule: &CollectionRule) -> Result<usize, OperationError> {
     match rule {
+        CollectionRule::WholeMainNamespace => Err(OperationError::failed(
+            "whole-edition collections require the dedicated dump bootstrap operation",
+        )),
         CollectionRule::ExplicitTitles(titles) | CollectionRule::TitleList(titles) => {
             let mut size = 1_usize + 4;
             for title in titles.iter() {
@@ -706,6 +714,11 @@ fn estimate(draft: &CollectionDraft) -> Result<CollectionDraftEstimate, Operatio
 
 fn encode_rule(bytes: &mut Vec<u8>, rule: &CollectionRule) -> Result<(), OperationError> {
     match rule {
+        CollectionRule::WholeMainNamespace => {
+            return Err(OperationError::failed(
+                "whole-edition collections require the dedicated dump bootstrap operation",
+            ));
+        }
         CollectionRule::ExplicitTitles(titles) | CollectionRule::TitleList(titles) => {
             put_u8(
                 bytes,
@@ -768,6 +781,11 @@ fn encode_inclusion_reason(
     reason: &InclusionReason,
 ) -> Result<(), OperationError> {
     match reason {
+        InclusionReason::WholeMainNamespace => {
+            return Err(OperationError::failed(
+                "whole-edition collections require the dedicated dump bootstrap operation",
+            ));
+        }
         InclusionReason::ExplicitTitle(title) => {
             put_u8(bytes, 1);
             put_title(bytes, title)?;

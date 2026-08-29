@@ -13,7 +13,7 @@ use wikisync_store::{
 };
 
 const LEGACY_SCHEMA_VERSION: u32 = 11;
-const CURRENT_SCHEMA_VERSION: u32 = 15;
+const CURRENT_SCHEMA_VERSION: u32 = 16;
 const FIRST_SOURCE: &[u8] = b"= Alpha =\nAn older beta revision.\n";
 const SECOND_SOURCE: &[u8] =
     b"= Alpha =\nThe retained current revision after an offline migration.\n";

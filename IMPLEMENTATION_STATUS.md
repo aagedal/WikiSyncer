@@ -567,6 +567,37 @@ signing/notarization, production Linux/macOS identities and independent trust
 distribution, credentialed native validation, clean-system Gatekeeper assessment,
 and signed artifact publication remain.
 
+## Whole-edition and GUI responsiveness checkpoint
+
+The storage foundation for a current Wikipedia language-edition snapshot is
+implemented and validated, but the end-user workflow is intentionally not exposed as
+complete yet:
+
+- `WholeMainNamespace` is a first-class titleless collection rule with a matching
+  inclusion reason. It is limited to namespace 0 and current-and-future history, so it
+  means all current articles from an accepted snapshot plus later public changes, not
+  the complete historical revision archive;
+- schema migration 16 preserves existing configuration, membership, collection-page
+  rows, indexes, triggers, and foreign keys while allowing streamed whole-edition
+  membership;
+- streamed current-revision admission leaves the configuration generation stable,
+  rejects non-main namespaces and tombstones, and checks page/canonical-byte budgets
+  before persisting new object bytes; and
+- the Iced GUI now adapts its header, navigation, metrics, and source fields at compact
+  widths, provides a first-use offline-library action, collapses advanced collection
+  policy by default, and uses the hardware-accelerated `wgpu` renderer instead of the
+  `tiny-skia` software renderer. A release GUI binary builds successfully.
+
+Whole-edition synchronization remains partial. The existing dump bootstrap still
+filters an already resolved selective collection, ordinary updates still poll known
+pages, and there is no bounded MediaWiki RecentChanges discovery client. Before an
+“All current articles” control can be truthful, the implementation still needs a
+metadata-only edition-bootstrap protocol, streaming dump admission, a source-bound
+dump race-window boundary and RecentChanges closure, long-gap fresh-dump recovery,
+bounded member access and progress reporting, and sharded integrity evidence beyond
+the current 100,000-entry manifest ceiling. The GUI currently fails visibly instead
+of routing this rule through the selective preview/draft path.
+
 ## Plan audit notes
 
 The ordered first implementation backlog (items 1–13) is complete. The broader
@@ -594,6 +625,12 @@ whole-archive verification, authenticated media history, or external rollback
 protection when the anchor is kept with and can be replaced alongside the library.
 
 ## Next checkpoint
+
+For the newly requested whole-edition product scope, the next safe checkpoint is the
+bounded RecentChanges client and durable discovery state, followed by sharded
+manifest evidence and a streaming dump-bootstrap branch. Only after fixture-backed
+restart, new-page/move/delete/restore, race-window, budget, and long-gap tests pass
+should the GUI expose “All current articles” as an available first-use choice.
 
 The initial robustness checkpoint and its next local evidence slice are complete:
 maintained fuzz targets and seed corpora, a native release-mode offline/outbound audit,

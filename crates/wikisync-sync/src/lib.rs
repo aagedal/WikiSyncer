@@ -207,6 +207,9 @@ pub async fn preview_collection_rule(
     limits: CategoryPreviewLimits,
 ) -> Result<CollectionSelectionPreview, CollectionPreviewError> {
     match rule {
+        CollectionRule::WholeMainNamespace => {
+            Err(CollectionPreviewError::WholeEditionBootstrapRequired)
+        }
         CollectionRule::Category {
             title,
             recursion_depth,
@@ -256,6 +259,9 @@ pub async fn preview_collection_rule(
                             }
                             CollectionRule::TitleList(_) => {
                                 InclusionReason::TitleList(page.title.clone())
+                            }
+                            CollectionRule::WholeMainNamespace => {
+                                unreachable!("matched title rule")
                             }
                             CollectionRule::Category { .. } => unreachable!("matched title rule"),
                         };
@@ -403,6 +409,9 @@ impl From<CollectionPreviewError> for DynamicMembershipReconciliationError {
 /// A source or category-preview failure while resolving a collection rule.
 #[derive(Debug)]
 pub enum CollectionPreviewError {
+    /// Whole-edition membership must be streamed from a dump instead of previewed
+    /// through the bounded selected-page API.
+    WholeEditionBootstrapRequired,
     /// Title resolution failed.
     Source(ClientError),
     /// Category traversal failed.
@@ -412,6 +421,9 @@ pub enum CollectionPreviewError {
 impl fmt::Display for CollectionPreviewError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::WholeEditionBootstrapRequired => formatter.write_str(
+                "a whole-edition collection must be bootstrapped from a current-page dump",
+            ),
             Self::Source(error) => error.fmt(formatter),
             Self::Category(error) => error.fmt(formatter),
         }
@@ -421,6 +433,7 @@ impl fmt::Display for CollectionPreviewError {
 impl Error for CollectionPreviewError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::WholeEditionBootstrapRequired => None,
             Self::Source(error) => Some(error),
             Self::Category(error) => Some(error),
         }
